@@ -172,6 +172,8 @@ class LoginSecretSetupFlow:
         recent_email_code: str = "",
         recent_email_code_at: float = 0.0,
         force_access_token_refresh: bool = False,
+        on_credential_saved: Callable[[str, str], None] | None = None,
+        on_session_saved: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.account = account
         self.session = dict(session or {})
@@ -185,9 +187,18 @@ class LoginSecretSetupFlow:
         self.recent_email_code_at = float(recent_email_code_at or 0.0)
         self.recent_email_code_attempted = False
         self.force_access_token_refresh = bool(force_access_token_refresh)
+        self.on_credential_saved = on_credential_saved or (lambda _kind, _value: None)
+        self.on_session_saved = on_session_saved or (lambda _session: None)
         self.last_access_token_probe_error = ""
         self.traffic_optimizer = BrowserTrafficOptimizer(traffic_meter) if traffic_meter is not None else None
         self.reader: Any | None = None
+
+    def _persist_credential(self, kind: str, value: str) -> None:
+        value = str(value or "").strip()
+        if value:
+            # Persist each completed security step before the next step starts.
+            # A later 2FA/AT failure must not roll back a password already set.
+            self.on_credential_saved(kind, value)
 
     def _check_cancelled(self) -> None:
         if self.should_cancel():
@@ -1300,6 +1311,7 @@ class LoginSecretSetupFlow:
             try:
                 password = self._add_password(page)
                 self.account.chatgpt_password = password
+                self._persist_credential("password", password)
                 result.update({"password": password, "password_added": True})
                 self.log("[登录密钥] ChatGPT 密码添加成功，继续复用当前认证状态添加 2FA")
             except Exception as exc:
@@ -1316,6 +1328,7 @@ class LoginSecretSetupFlow:
                 self.log("[登录密钥] 开始添加 ChatGPT 2FA（复用密码添加成功后的当前认证状态）")
                 try:
                     secret, current_session = self._setup_2fa(page, self.account.chatgpt_password)
+                    self._persist_credential("totp_secret", secret)
                     result.update({"totp_secret": secret, "totp_added": True})
                     self.log("[登录密钥] ChatGPT 2FA 添加成功")
                 except Exception as exc:
@@ -1341,6 +1354,7 @@ class LoginSecretSetupFlow:
                             "密码与 2FA 重新登录后获取的 Access Token 未通过有效性检测"
                             f"：{self.last_access_token_probe_error}"
                         )
+                    self.on_session_saved(current_session)
                 result["access_token_refreshed"] = True
                 self.log("[登录密钥] 已确认有效的 ChatGPT Access Token，将替换旧 AT 存储")
             except Exception as exc:
@@ -1442,6 +1456,8 @@ class ProtocolLoginSecretSetupFlow:
         on_progress: Callable[[str], None] | None = None,
         recent_email_code: str = "",
         recent_email_code_at: float = 0.0,
+        on_credential_saved: Callable[[str, str], None] | None = None,
+        on_session_saved: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.account = account
         self.session = dict(session or {})
@@ -1453,8 +1469,15 @@ class ProtocolLoginSecretSetupFlow:
         self.recent_email_code = str(recent_email_code or "").strip()
         self.recent_email_code_at = float(recent_email_code_at or 0.0)
         self.recent_email_code_attempted = False
+        self.on_credential_saved = on_credential_saved or (lambda _kind, _value: None)
+        self.on_session_saved = on_session_saved or (lambda _session: None)
         self.last_access_token_probe_error = ""
         self.reader: Any | None = None
+
+    def _persist_credential(self, kind: str, value: str) -> None:
+        value = str(value or "").strip()
+        if value:
+            self.on_credential_saved(kind, value)
 
     def _check_cancelled(self) -> None:
         if self.should_cancel():
@@ -1913,6 +1936,7 @@ class ProtocolLoginSecretSetupFlow:
                     password = generate_chatgpt_password()
                     current_session = self._add_password(password)
                     self.account.chatgpt_password = password
+                    self._persist_credential("password", password)
                     result.update({"password": password, "password_added": True})
                     self.log("[登录密钥] ChatGPT 密码添加成功，继续复用当前认证状态添加 2FA")
                 except Exception as exc:
@@ -1936,6 +1960,7 @@ class ProtocolLoginSecretSetupFlow:
                         # browser takeover for AT refresh reuses this object
                         # to decide whether security setup is still required.
                         self.account.totp_secret = secret
+                        self._persist_credential("totp_secret", secret)
                         result.update({"totp_secret": secret, "totp_added": True})
                         self.log("[登录密钥] ChatGPT 2FA 添加成功")
                     except Exception as exc:
@@ -1963,6 +1988,7 @@ class ProtocolLoginSecretSetupFlow:
                                 "密码与 2FA 重新登录后获取的 Access Token 未通过有效性检测"
                                 f"：{self.last_access_token_probe_error}"
                             )
+                        self.on_session_saved(current_session)
                     result["access_token_refreshed"] = True
                     self.log("[登录密钥] 已确认有效的 ChatGPT Access Token，将替换旧 AT 存储")
                 except Exception as exc:
@@ -2019,6 +2045,8 @@ def setup_login_secret(
     force_access_token_refresh: bool = False,
     browser_page=None,
     browser_context=None,
+    on_credential_saved: Callable[[str, str], None] | None = None,
+    on_session_saved: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     return LoginSecretSetupFlow(
         account,
@@ -2032,6 +2060,8 @@ def setup_login_secret(
         recent_email_code=recent_email_code,
         recent_email_code_at=recent_email_code_at,
         force_access_token_refresh=force_access_token_refresh,
+        on_credential_saved=on_credential_saved,
+        on_session_saved=on_session_saved,
     ).run(browser_page=browser_page, browser_context=browser_context)
 
 
@@ -2046,6 +2076,8 @@ def setup_login_secret_protocol(
     on_progress: Callable[[str], None] | None = None,
     recent_email_code: str = "",
     recent_email_code_at: float = 0.0,
+    on_credential_saved: Callable[[str, str], None] | None = None,
+    on_session_saved: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     return ProtocolLoginSecretSetupFlow(
         account,
@@ -2057,4 +2089,6 @@ def setup_login_secret_protocol(
         on_progress=on_progress,
         recent_email_code=recent_email_code,
         recent_email_code_at=recent_email_code_at,
+        on_credential_saved=on_credential_saved,
+        on_session_saved=on_session_saved,
     ).run()

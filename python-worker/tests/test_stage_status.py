@@ -21,6 +21,7 @@ class FakeDB:
         self.mailbox_updates: list[dict] = []
         self.account_updates: list[dict] = []
         self.sessions: list[dict] = []
+        self.password_updates: list[dict] = []
         self.events: list[tuple] = []
         self.sub2api_updates: list[dict] = []
 
@@ -59,7 +60,7 @@ class FakeDB:
         self.sessions.append({"email": email, "account_id": account_id, "session": session, "raw": raw})
 
     def save_chatgpt_password(self, mailbox_id, password) -> None:
-        return None
+        self.password_updates.append({"mailbox_id": mailbox_id, "password": password})
 
     def record_proxy_traffic(self, *args, **kwargs) -> None:
         return None
@@ -883,6 +884,7 @@ class StageStatusTests(unittest.TestCase):
             client_id="client-id",
             refresh_token="outlook-refresh-token",
             raw="user@example.com----password----client-id----outlook-refresh-token",
+            chatgpt_password="generated-password",
         )
         worker._persist_registration_checkpoint(
             db,
@@ -895,6 +897,7 @@ class StageStatusTests(unittest.TestCase):
         self.assertEqual(db.mailbox_updates[-1]["status"], "已注册")
         self.assertEqual(db.account_updates[-1]["status"], "registered")
         self.assertEqual(len(db.sessions), 1)
+        self.assertEqual(db.password_updates, [{"mailbox_id": 1, "password": "generated-password"}])
 
     def test_login_secret_flow_persists_first_at_then_replaces_it_with_second_at(self):
         db = FakeDB()

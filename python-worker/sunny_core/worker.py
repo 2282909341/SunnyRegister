@@ -1564,6 +1564,12 @@ def _persist_registration_checkpoint(
     if snapshot.get("phone_number"):
         fields["phone_number"] = str(snapshot.get("phone_number") or "")
     account_id = db.upsert_account(email, **fields)
+    # Registration flows generate/set the ChatGPT password before the first
+    # durable session checkpoint. Persist it here as well so an interruption
+    # between password submission and the next stage cannot lose the secret.
+    chatgpt_password = str(getattr(account, "chatgpt_password", "") or "").strip()
+    if chatgpt_password:
+        db.save_chatgpt_password(mailbox_id, chatgpt_password)
     if access_token or snapshot.get("session_json"):
         db.upsert_session(email, account_id, snapshot, account.raw)
     db.mark_mailbox(mailbox_id, completed_status, openai_rt=refresh_token)
@@ -1771,6 +1777,43 @@ def _run_one_impl(
                 original_mailbox_status,
             )
 
+    def save_login_secret_credential(kind: str, value: str) -> None:
+        if kind == "password":
+            db.save_chatgpt_password(mailbox_id, value)
+            db.event(
+                f"[{email}] [登录密钥] ChatGPT 密码已立即保存",
+                detail={"email": email, "scope": "selected", "credential": "chatgpt_password", "checkpoint_persisted": True},
+            )
+        elif kind == "totp_secret":
+            db.save_totp_secret(mailbox_id, value)
+            db.event(
+                f"[{email}] [登录密钥] ChatGPT 2FA 已立即保存",
+                detail={"email": email, "scope": "selected", "credential": "totp_secret", "checkpoint_persisted": True},
+            )
+
+    def save_login_secret_session(session_snapshot: dict[str, Any]) -> None:
+        if not isinstance(session_snapshot, dict):
+            return
+        # /api/auth/session returns accessToken while the persistence layer
+        # stores the normalized access_token field. Keep the source response
+        # as session_json so it remains authoritative and cannot be mistaken
+        # for a missing token during an interruption-safe checkpoint.
+        normalized_session = dict(session_snapshot)
+        access_token = str(
+            normalized_session.get("access_token")
+            or normalized_session.get("accessToken")
+            or ""
+        ).strip()
+        if not access_token:
+            return
+        normalized_session["access_token"] = access_token
+        normalized_session.setdefault("session_json", dict(session_snapshot))
+        _persist_authenticated_login(db, identity_email, mailbox_id, normalized_session, account.raw)
+        db.event(
+            f"[{email}] [登录密钥] AT 刷新成功后已立即保存最新 Session",
+            detail={"email": email, "scope": "selected", "credential": "access_token", "checkpoint_persisted": True},
+        )
+
     def setup_login_secret_in_browser(context, page, base_session: dict[str, Any]) -> dict[str, Any]:
         """Run optional LS setup inside the registration browser session.
 
@@ -1796,6 +1839,8 @@ def _run_one_impl(
             recent_email_code_at=float(base_session.get("recent_email_code_at") or 0.0),
             browser_page=page,
             browser_context=context,
+            on_credential_saved=save_login_secret_credential,
+            on_session_saved=save_login_secret_session,
             on_progress=lambda checkpoint: _emit_registration_progress(
                 db, str(email), stage, checkpoint, setup_login_secret=True,
             ),
@@ -1816,6 +1861,8 @@ def _run_one_impl(
             lambda m: db.event(m, detail={"email": email, "scope": "selected"}),
             should_cancel=db.cancel_requested,
             mailbox_proxy_url=mailbox_proxy_url,
+            on_credential_saved=save_login_secret_credential,
+            on_session_saved=save_login_secret_session,
             recent_email_code=str(base_session.get("recent_email_code") or ""),
             recent_email_code_at=float(base_session.get("recent_email_code_at") or 0.0),
             on_progress=lambda checkpoint: _emit_registration_progress(
@@ -2107,6 +2154,8 @@ def _run_one_impl(
                     recent_email_code=recent_email_code,
                     recent_email_code_at=recent_email_code_at,
                     force_access_token_refresh=True,
+                    on_credential_saved=save_login_secret_credential,
+                    on_session_saved=save_login_secret_session,
                     on_progress=lambda checkpoint: _emit_registration_progress(
                         db, str(email), stage, checkpoint, setup_login_secret=True,
                     ),
@@ -2146,6 +2195,8 @@ def _run_one_impl(
                     traffic_meter=traffic_meter,
                     recent_email_code=recent_email_code,
                     recent_email_code_at=recent_email_code_at,
+                    on_credential_saved=save_login_secret_credential,
+                    on_session_saved=save_login_secret_session,
                     on_progress=lambda checkpoint: _emit_registration_progress(
                         db, str(email), stage, checkpoint, setup_login_secret=True,
                     ),

@@ -370,6 +370,31 @@ class LoginSecretTests(unittest.TestCase):
         self.assertFalse(result["access_token_refreshed"])
         self.assertTrue(any("添加2FA失败" in error for error in result["errors"]))
 
+    def test_browser_persists_password_before_two_factor_step(self):
+        class Flow(LoginSecretSetupFlow):
+            def _session_json(self, _page):
+                return {"accessToken": "current-token"}
+
+            def _add_password(self, _page):
+                return "new-password"
+
+            def _setup_2fa(self, _page, _password):
+                raise TimeoutError("邮箱验证码等待超时")
+
+        account = self._account()
+        account.chatgpt_password = ""
+        account.totp_secret = ""
+        saved = []
+        result = Flow(
+            account,
+            {"access_token": "current-token"},
+            "",
+            on_credential_saved=lambda kind, value: saved.append((kind, value)),
+        )._run_on_page(Mock(), Mock(storage_state=lambda: {"cookies": []}))
+
+        self.assertFalse(result["complete"])
+        self.assertIn(("password", "new-password"), saved)
+
     def test_protocol_partial_security_change_skips_access_token_refresh(self):
         class Flow(ProtocolLoginSecretSetupFlow):
             def _session_json(self):
@@ -943,17 +968,20 @@ class LoginSecretTests(unittest.TestCase):
         account = self._account()
         account.chatgpt_password = "ChatGPT-password"
         account.totp_secret = "JBSWY3DPEHPK3PXP"
+        saved_sessions = []
         result = Flow(
             account,
             {"access_token": "old-token", "expires_at": 1},
             "",
             force_access_token_refresh=True,
+            on_session_saved=lambda session: saved_sessions.append(session),
         )._run_on_page(Mock(), Context())
 
         self.assertTrue(result["complete"])
         self.assertTrue(result["access_token_refreshed"])
         self.assertEqual(result["session"]["access_token"], "new-token")
         self.assertNotIn("expires_at", result["session"])
+        self.assertEqual(saved_sessions, [{"accessToken": "new-token"}])
 
     @staticmethod
     def _account():
