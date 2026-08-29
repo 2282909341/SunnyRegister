@@ -29,6 +29,7 @@ PROVIDER_DEFAULTS = {
 }
 
 GOPAY_PROMO_AMOUNT_LIMIT_IDR = 50
+MOMO_PROMO_AMOUNT_LIMIT_VND = 50
 
 
 def is_gopay_promo_amount(amount: Any, currency: str) -> bool:
@@ -40,6 +41,17 @@ def is_gopay_promo_amount(amount: Any, currency: str) -> bool:
     except (InvalidOperation, ValueError):
         return False
     return parsed.is_finite() and Decimal(0) <= parsed < Decimal(GOPAY_PROMO_AMOUNT_LIMIT_IDR)
+
+
+def is_momo_promo_amount(amount: Any, currency: str) -> bool:
+    """Accept the low-value VND total used by native OAICS MoMo SetupIntents."""
+    if str(currency or "").strip().upper() != "VND" or amount is None or isinstance(amount, bool):
+        return False
+    try:
+        parsed = Decimal(str(amount).strip())
+    except (InvalidOperation, ValueError):
+        return False
+    return parsed.is_finite() and Decimal(0) <= parsed <= Decimal(MOMO_PROMO_AMOUNT_LIMIT_VND)
 
 
 def _provider_method_aliases(provider: str) -> set[str]:
@@ -1291,6 +1303,8 @@ def stripe_to_provider(
         original_checkout_amount = ctx.get("checkout_amount")
         if provider == "gopay":
             already_discounted = is_gopay_promo_amount(original_checkout_amount, ctx.get("currency") or "")
+        elif provider == "momo":
+            already_discounted = is_momo_promo_amount(original_checkout_amount, ctx.get("currency") or "")
         else:
             try:
                 already_discounted = int(str(original_checkout_amount or 0)) == 0
@@ -1366,6 +1380,8 @@ def stripe_to_provider(
                 raise RuntimeError("优惠金额校验失败：Stripe 未返回今日应付金额")
             if provider == "gopay":
                 promo_applied = is_gopay_promo_amount(checkout_amount, ctx.get("currency") or "")
+            elif provider == "momo":
+                promo_applied = is_momo_promo_amount(checkout_amount, ctx.get("currency") or "")
             else:
                 try:
                     promo_applied = int(str(checkout_amount)) == 0
@@ -1375,6 +1391,11 @@ def stripe_to_provider(
                 if provider == "gopay":
                     raise RuntimeError(
                         "GOPAY_PROMO_AMOUNT_REQUIRED: GoPay 优惠金额必须小于 50 IDR："
+                        f"amount={checkout_amount} currency={str(ctx.get('currency') or '').upper() or '?'}"
+                    )
+                if provider == "momo":
+                    raise RuntimeError(
+                        "MOMO_PROMO_AMOUNT_REQUIRED: MoMo 优惠金额必须在 0..50 VND："
                         f"amount={checkout_amount} currency={str(ctx.get('currency') or '').upper() or '?'}"
                     )
                 raise RuntimeError(f"Plus 首月免费优惠未生效：Stripe 今日应付 amount={checkout_amount}")
@@ -1391,6 +1412,8 @@ def stripe_to_provider(
                     )
             if provider == "gopay":
                 log(f"[promo] GoPay 优惠金额校验通过：Stripe 今日应付 amount={checkout_amount} IDR（<50）")
+            elif provider == "momo":
+                log(f"[promo] MoMo 优惠金额校验通过：Stripe 今日应付 amount={checkout_amount} VND（<=50）")
             elif provider == "pix":
                 log("[promo] 第 5/7 步：返回 BR 主链路并校验通过，Stripe 今日应付 amount=0")
             else:
@@ -1482,14 +1505,22 @@ def stripe_to_provider(
                 apply_promo_callback(processor)
                 promo_init, _promo_version, promo_ctx = sc.init_checkout(http, session_id, pk, profile, log)
                 promo_amount = promo_ctx.get("checkout_amount")
-                try:
-                    promo_applied = int(str(promo_amount or 0)) == 0
-                except (TypeError, ValueError):
-                    promo_applied = str(promo_amount).strip() in {"0", "0.0", "0.00"}
+                if provider == "momo":
+                    promo_applied = is_momo_promo_amount(promo_amount, promo_ctx.get("currency") or "")
+                else:
+                    try:
+                        promo_applied = int(str(promo_amount or 0)) == 0
+                    except (TypeError, ValueError):
+                        promo_applied = str(promo_amount).strip() in {"0", "0.0", "0.00"}
                 if not promo_applied:
+                    if provider == "momo":
+                        raise RuntimeError(f"延后应用优惠未进入 0..50 VND：Stripe 今日应付 amount={promo_amount}")
                     raise RuntimeError(f"延后应用优惠未归零：Stripe 今日应付 amount={promo_amount}")
                 checkout_amount = promo_amount
-                log(f"[{provider}] 延后优惠金额校验通过：Stripe 今日应付 amount=0")
+                if provider == "momo":
+                    log(f"[{provider}] 延后优惠金额校验通过：Stripe 今日应付 amount={promo_amount} VND（<=50）")
+                else:
+                    log(f"[{provider}] 延后优惠金额校验通过：Stripe 今日应付 amount=0")
             approve_callback(processor)
             # The first confirm has already attached the local PaymentMethod.
             # Re-confirming with inline payment_method_data creates a second

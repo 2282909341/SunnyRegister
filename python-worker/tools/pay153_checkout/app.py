@@ -30,7 +30,9 @@ from provider_checkout import (
     default_billing,
     enrich_ideal_redirect,
     generate_payment_qr_images,
+    create_provider_payment_method,
     is_gopay_promo_amount,
+    is_momo_promo_amount,
     is_valid_ideal_payment_url,
     stripe_to_provider,
 )
@@ -1492,6 +1494,330 @@ def submit_custom_checkout_taxes(
     return checkout if isinstance(checkout, dict) else {}
 
 
+def oaics_native_payment_method_types(*payloads: Any) -> list[str]:
+    """Collect native Stripe method types published by an OAICS response."""
+    container_keys = {
+        "payment_method_types",
+        "available_payment_methods",
+        "payment_method_specs",
+        "payment_methods",
+    }
+    type_keys = {
+        "type", "name", "payment_method_type", "paymentMethodType", "method_type",
+    }
+    found: list[str] = []
+
+    def add(value: Any) -> None:
+        normalized = str(value or "").strip().lower().replace("-", "_")
+        if normalized and normalized not in found and not normalized.startswith("cpmt_"):
+            found.append(normalized)
+
+    def collect_methods(value: Any, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, str):
+            add(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect_methods(item, depth + 1)
+        elif isinstance(value, dict):
+            for key in type_keys:
+                if key in value:
+                    candidate = value.get(key)
+                    if isinstance(candidate, (str, int, float)):
+                        add(candidate)
+            for key, nested in value.items():
+                if key in container_keys:
+                    collect_methods(nested, depth + 1)
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key in container_keys:
+                    collect_methods(nested, depth + 1)
+                elif isinstance(nested, (dict, list, tuple)):
+                    walk(nested, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                walk(nested, depth + 1)
+
+    for payload in payloads:
+        walk(payload)
+    return found
+
+
+def fetch_oaics_native_checkout_with_retry(
+    http,
+    token: str,
+    session_id: str,
+    processor_entity: str,
+    device_id: str,
+    provider: str,
+    *,
+    preserve_from: dict[str, Any] | None = None,
+    attempts: int = 6,
+    delay_seconds: float = 0.8,
+    log=lambda _message: None,
+) -> dict[str, Any]:
+    """Poll OAICS until a native method such as ``momo`` is published."""
+    wanted = str(provider or "").strip().lower().replace("-", "_")
+    last: dict[str, Any] = {}
+    total = max(1, int(attempts))
+    for attempt in range(total):
+        last = fetch_custom_checkout_session(
+            http, token, session_id, processor_entity, device_id,
+        )
+        methods = oaics_native_payment_method_types(preserve_from or {}, last)
+        if wanted in methods:
+            if attempt:
+                log(f"OAICS 原生 {provider} 延迟就绪（第 {attempt + 1} 次读取）")
+            return last
+        if attempt + 1 < total:
+            log(
+                f"OAICS 原生 {provider} 尚未就绪（第 {attempt + 1} 次读取）；"
+                f"available={methods or []}"
+            )
+            time.sleep(max(0.0, float(delay_seconds)) * (attempt + 1))
+    return last
+
+
+def _nested_scalar(payload: Any, keys: tuple[str, ...], depth: int = 0) -> str:
+    if depth > 8:
+        return ""
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return str(value).strip()
+        for value in payload.values():
+            found = _nested_scalar(value, keys, depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            found = _nested_scalar(value, keys, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def _redact_oaics_payment_error(value: Any) -> str:
+    return re.sub(
+        r"\b(?:ctoken|seti|pi)_[A-Za-z0-9_\-]+",
+        "[PAYMENT_SECRET]",
+        str(value or ""),
+    )[:300]
+
+
+def create_oaics_confirmation_token(
+    stripe_http,
+    publishable_key: str,
+    payment_method_id: str,
+) -> str:
+    """Create the short-lived Stripe token consumed by OAICS checkout/confirm."""
+    if not str(publishable_key or "").startswith("pk_"):
+        raise RuntimeError("MOMO_OAICS_PUBLISHABLE_KEY_MISSING: OAICS 未返回 Stripe publishable key")
+    if not str(payment_method_id or "").startswith("pm_"):
+        raise RuntimeError("MOMO_OAICS_PAYMENT_METHOD_INVALID: MoMo 未返回 Stripe pm_* id")
+    response = stripe_http.post(
+        f"{sc.STRIPE_API}/v1/confirmation_tokens",
+        data={
+            "payment_method": payment_method_id,
+            "key": publishable_key,
+            "_stripe_version": sc.STRIPE_VERSION_FULL,
+        },
+        headers=sc._stripe_headers(),
+        timeout=40,
+    )
+    text = response.text or ""
+    if getattr(response, "status_code", 0) != 200:
+        raise RuntimeError(
+            f"创建 OAICS MoMo confirmation_token 失败：HTTP "
+            f"{getattr(response, 'status_code', '?')} {_redact_oaics_payment_error(text)}"
+        )
+    try:
+        token_id = str((response.json() or {}).get("id") or "")
+    except Exception as exc:
+        raise RuntimeError("创建 OAICS MoMo confirmation_token 返回非 JSON") from exc
+    if not token_id.startswith("ctoken_"):
+        raise RuntimeError("创建 OAICS MoMo confirmation_token 未返回 ctoken_* id")
+    return token_id
+
+
+def confirm_oaics_native_payment_method(
+    http,
+    token: str,
+    session_id: str,
+    processor_entity: str,
+    provider: str,
+    confirmation_token_id: str,
+    proxy: str,
+    device_id: str,
+    did: str,
+    *,
+    use_sen: bool = True,
+    use_so: bool = True,
+    allow_sentinel_fallback: bool = False,
+    log=lambda _message: None,
+) -> dict[str, Any]:
+    """Confirm a native OAICS method using Stripe's ConfirmationToken contract."""
+    sentinel = resolve_payment_sentinel_headers(
+        sentinel_headers, proxy, "checkout_session_approval", device_id, did,
+        use_sen=use_sen, use_so=use_so,
+        allow_fallback=allow_sentinel_fallback, log=log,
+    )
+    common_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://chatgpt.com",
+        "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+        "User-Agent": sc.CHROME_UA,
+        "OAI-Device-Id": device_id,
+        **sentinel,
+    }
+    if sentinel:
+        ping_response = http.post(
+            "https://chatgpt.com/backend-api/sentinel/ping",
+            json={},
+            headers={
+                **common_headers,
+                "x-openai-target-path": "/backend-api/sentinel/ping",
+                "x-openai-target-route": "/backend-api/sentinel/ping",
+            },
+            timeout=40,
+        )
+        if getattr(ping_response, "status_code", 0) >= 400:
+            raise RuntimeError(
+                "MOMO_OAICS_SENTINEL_PING_FAILED: 原生 MoMo confirm 前的 Sentinel ping 失败；"
+                f"HTTP {getattr(ping_response, 'status_code', '?')}"
+            )
+    response = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/confirm",
+        json={
+            "checkout_session_id": session_id,
+            "selected_payment_method_type": str(provider or "").lower(),
+            "confirm_token": confirmation_token_id,
+        },
+        headers={
+            **common_headers,
+            "x-openai-target-path": "/backend-api/payments/checkout/confirm",
+            "x-openai-target-route": "/backend-api/payments/checkout/confirm",
+        },
+        timeout=60,
+    )
+    text = response.text or ""
+    if getattr(response, "status_code", 0) != 200:
+        raise RuntimeError(
+            f"OAICS {provider} checkout/confirm 失败：HTTP "
+            f"{getattr(response, 'status_code', '?')} {_redact_oaics_payment_error(text)}"
+        )
+    try:
+        payload = response.json() or {}
+    except Exception as exc:
+        raise RuntimeError(f"OAICS {provider} checkout/confirm 返回非 JSON") from exc
+    status = str(payload.get("status") or payload.get("result") or "").lower()
+    if status == "blocked":
+        raise RuntimeError(
+            f"MOMO_OAICS_CONFIRM_BLOCKED: 当前 {session_id} 的原生 MoMo confirm 被 blocked；"
+            "需要重建完整 Checkout"
+        )
+    return payload if isinstance(payload, dict) else {}
+
+
+def confirm_oaics_momo_intent(
+    stripe_http,
+    publishable_key: str,
+    payment_method_id: str,
+    confirm_payload: dict[str, Any],
+    session_id: str,
+    processor_entity: str,
+) -> dict[str, Any]:
+    """Advance a returned OAICS SetupIntent when checkout/confirm has no action yet."""
+    client_secret = _nested_scalar(confirm_payload, ("client_secret", "clientSecret"))
+    if "_secret_" not in client_secret:
+        return {}
+    intent_id = client_secret.split("_secret_", 1)[0]
+    if not intent_id.startswith(("seti_", "pi_")):
+        return {}
+    endpoint = "setup_intents" if intent_id.startswith("seti_") else "payment_intents"
+    return_url = (
+        "https://chatgpt.com/checkout/verify"
+        f"?stripe_session_id={quote(session_id)}&processor_entity={quote(processor_entity)}&plan_type=plus"
+    )
+    response = stripe_http.post(
+        f"{sc.STRIPE_API}/v1/{endpoint}/{intent_id}/confirm",
+        data={
+            "client_secret": client_secret,
+            "payment_method": payment_method_id,
+            "return_url": return_url,
+            "use_stripe_sdk": "true",
+            "key": publishable_key,
+            "_stripe_version": sc.STRIPE_VERSION_FULL,
+        },
+        headers=sc._stripe_headers(),
+        timeout=60,
+    )
+    text = response.text or ""
+    if getattr(response, "status_code", 0) != 200:
+        raise RuntimeError(
+            f"确认 OAICS MoMo {endpoint} 失败：HTTP "
+            f"{getattr(response, 'status_code', '?')} {_redact_oaics_payment_error(text)}"
+        )
+    try:
+        payload = response.json() or {}
+    except Exception as exc:
+        raise RuntimeError(f"确认 OAICS MoMo {endpoint} 返回非 JSON") from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def poll_oaics_momo_intent(
+    stripe_http,
+    publishable_key: str,
+    *payloads: dict[str, Any],
+    attempts: int = 6,
+    delay_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Poll the same OAICS MoMo Intent after an OpenAI approval response."""
+    client_secret = ""
+    for payload in payloads:
+        client_secret = _nested_scalar(payload, ("client_secret", "clientSecret"))
+        if client_secret:
+            break
+    if "_secret_" not in client_secret:
+        return {}
+    intent_id = client_secret.split("_secret_", 1)[0]
+    if not intent_id.startswith(("seti_", "pi_")):
+        return {}
+    endpoint = "setup_intents" if intent_id.startswith("seti_") else "payment_intents"
+    last: dict[str, Any] = {}
+    for attempt in range(max(1, int(attempts))):
+        response = stripe_http.get(
+            f"{sc.STRIPE_API}/v1/{endpoint}/{intent_id}",
+            params={
+                "client_secret": client_secret,
+                "key": publishable_key,
+                "_stripe_version": sc.STRIPE_VERSION_FULL,
+            },
+            headers=sc._stripe_headers(),
+            timeout=40,
+        )
+        if getattr(response, "status_code", 0) != 200:
+            return last
+        try:
+            value = response.json() or {}
+        except Exception:
+            value = {}
+        last = value if isinstance(value, dict) else {}
+        if momo_authorization_url(last):
+            return last
+        if attempt + 1 < max(1, int(attempts)):
+            time.sleep(max(0.0, float(delay_seconds)))
+    return last
+
+
 def confirm_custom_checkout_method(
     http,
     token: str,
@@ -2878,11 +3204,10 @@ class JobStore:
                     and bool(current.get("use_promo"))
                 )
             if current.get("link_type") == "momo":
-                # Ask for the redirect-capable checkout shape. The service may
-                # still return an OAICS container; that OAICS must be advanced
-                # instead of discarded because its start response can return
-                # the final Stripe pm-redirects authorization URL.
-                current["checkout_ui_mode"] = "redirect"
+                # Successful MoMo sessions use OAICS native momo with a Stripe
+                # ConfirmationToken. A cs_live_* response remains supported by
+                # the generic provider path as a compatibility fallback.
+                current["checkout_ui_mode"] = "custom"
                 current["promo_on_create"] = False
             if current.get("link_type") == "gopay":
                 # Midtrans GoPay is exposed by the CS Live/Stripe Checkout.
@@ -4552,16 +4877,68 @@ class JobStore:
                     self.update(job_id, percent=100, text="OAICS iDEAL 签名支付链接生成完成", status="done", result=result)
                     return
                 if provider == "momo":
-                    self.update(job_id, percent=58, text="正在读取 OAICS MoMo 支付方式")
-                    custom_state = fetch_custom_checkout_session_with_retry(
-                        chatgpt_http, token, session_id, custom_processor, device_id,
+                    self.update(job_id, percent=58, text="正在读取 OAICS 原生 MoMo 支付方式")
+                    custom_state = fetch_oaics_native_checkout_with_retry(
+                        chatgpt_http, token, session_id, custom_processor, device_id, "momo",
+                        preserve_from=checkout_data,
                         log=lambda message: self.log(job_id, message), attempts=6,
-                        required_provider="momo",
-                        preserve_payment_methods_from=checkout_data,
                     )
+                    native_methods = oaics_native_payment_method_types(checkout_data, custom_state)
                     custom_method_id = custom_payment_method_id_for(custom_state, "momo")
                     custom_amount = custom_checkout_amount_minor(custom_state)
-                    custom_currency = custom_checkout_currency(custom_state) or "VND"
+                    if custom_amount is None:
+                        custom_amount = custom_checkout_amount_minor(checkout_data)
+                    custom_currency = (
+                        custom_checkout_currency(custom_state)
+                        or custom_checkout_currency(checkout_data)
+                        or "VND"
+                    )
+                    promo_state: dict[str, Any] = {}
+                    if promo_requested:
+                        self.update(job_id, percent=66, text="正在刷新 OAICS MoMo 优惠与支付资格")
+                        try:
+                            promo_state = update_checkout_promo(
+                                promo_chatgpt_http, token, session_id, custom_processor,
+                                options.get("promo_campaign") or "plus-1-month-free",
+                                lambda message: self.log(job_id, message), device_id=device_id,
+                            )
+                        except RuntimeError:
+                            if not (
+                                is_momo_promo_amount(custom_amount, custom_currency)
+                                and ("momo" in native_methods or bool(custom_method_id))
+                            ):
+                                raise
+                            self.log(
+                                job_id,
+                                "MoMo 当前已满足 0..50 VND 且支付方式已发布；优惠刷新失败不覆盖可用 Checkout",
+                            )
+                        custom_state = fetch_oaics_native_checkout_with_retry(
+                            chatgpt_http, token, session_id, custom_processor, device_id, "momo",
+                            preserve_from=promo_state or custom_state,
+                            log=lambda message: self.log(job_id, message), attempts=6,
+                        )
+                        promo_amount = custom_checkout_amount_minor(custom_state)
+                        if promo_amount is None:
+                            promo_amount = custom_checkout_amount_minor(promo_state)
+                        if promo_amount is not None:
+                            custom_amount = promo_amount
+                        custom_currency = (
+                            custom_checkout_currency(custom_state)
+                            or custom_checkout_currency(promo_state)
+                            or custom_currency
+                        )
+                        native_methods = oaics_native_payment_method_types(
+                            checkout_data, promo_state, custom_state,
+                        )
+                        custom_method_id = custom_payment_method_id_for(custom_state, "momo") or custom_method_id
+                        self.log(
+                            job_id,
+                            "MoMo Promotion refresh：available={}，amount={} {}（允许 0..50 VND）".format(
+                                native_methods or custom_payment_methods_diagnostic(custom_state),
+                                custom_amount if custom_amount is not None else "?",
+                                custom_currency,
+                            ),
+                        )
                     momo_billing = default_billing("VN", meta.get("email") or "")
                     momo_address = momo_billing.get("address") or {}
                     self.update(job_id, percent=72, text="正在提交 VN MoMo 账单地址")
@@ -4580,12 +4957,11 @@ class JobStore:
                         chatgpt_http, token, session_id, custom_processor,
                         momo_billing, custom_currency, device_id,
                     )
-                    self.log(job_id, "MoMo taxes 已提交，正在通过同一 VN Checkout 刷新支付方式")
-                    custom_state = fetch_custom_checkout_session_with_retry(
-                        chatgpt_http, token, session_id, custom_processor, device_id,
+                    self.log(job_id, "MoMo taxes 已提交，正在通过同一 VN Checkout 刷新原生支付方式")
+                    custom_state = fetch_oaics_native_checkout_with_retry(
+                        chatgpt_http, token, session_id, custom_processor, device_id, "momo",
+                        preserve_from=tax_checkout or custom_state,
                         log=lambda message: self.log(job_id, message), attempts=6,
-                        required_provider="momo",
-                        preserve_payment_methods_from=custom_state,
                     )
                     refreshed_amount = custom_checkout_amount_minor(custom_state)
                     if refreshed_amount is None and tax_checkout:
@@ -4593,82 +4969,126 @@ class JobStore:
                     if refreshed_amount is not None:
                         custom_amount = refreshed_amount
                     custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    native_methods = oaics_native_payment_method_types(
+                        checkout_data, promo_state, tax_checkout, custom_state,
+                    )
                     custom_method_id = custom_payment_method_id_for(custom_state, "momo") or custom_method_id
-                    promo_attempted = False
-                    if not custom_method_id and promo_requested:
-                        self.update(job_id, percent=76, text="VN taxes 后尚无 MoMo，正在挂载优惠并再次刷新")
-                        try:
-                            update_checkout_promo(
-                                promo_chatgpt_http, token, session_id, custom_processor,
-                                options.get("promo_campaign") or "plus-1-month-free",
-                                lambda message: self.log(job_id, message), device_id=device_id,
-                            )
-                        except RuntimeError as exc:
-                            raise RuntimeError(
-                                "MOMO_METHOD_UNAVAILABLE: VN taxes 后未发布 MoMo，且优惠更新无法启用该支付方式："
-                                f"{str(exc)[:300]}"
-                            ) from exc
-                        promo_attempted = True
-                        custom_state = fetch_custom_checkout_session_with_retry(
-                            chatgpt_http, token, session_id, custom_processor, device_id,
-                            log=lambda message: self.log(job_id, message), attempts=6,
-                            required_provider="momo",
-                            preserve_payment_methods_from=custom_state,
-                        )
-                        custom_amount = custom_checkout_amount_minor(custom_state)
-                        custom_currency = custom_checkout_currency(custom_state) or custom_currency
-                        custom_method_id = custom_payment_method_id_for(custom_state, "momo") or custom_method_id
-                    if not custom_method_id:
+                    if "momo" not in native_methods and not custom_method_id:
                         raise RuntimeError(
-                            "MOMO_METHOD_UNAVAILABLE: VN taxes 与优惠更新后 OAICS 仍未发布 MoMo 支付方式"
-                            f"；实际返回={custom_payment_methods_diagnostic(custom_state)}"
+                            "MOMO_METHOD_UNAVAILABLE: VN Promotion refresh 与 taxes 后 OAICS "
+                            "仍未发布原生 MoMo 支付方式；available={}；custom={}".format(
+                                native_methods or [], custom_payment_methods_diagnostic(custom_state),
+                            )
                         )
-                    if promo_requested and custom_amount != 0 and not promo_attempted:
-                        self.update(job_id, percent=76, text="MoMo 已就绪，正在应用优惠并刷新 Checkout")
-                        update_checkout_promo(
-                            promo_chatgpt_http, token, session_id, custom_processor,
-                            options.get("promo_campaign") or "plus-1-month-free",
-                            lambda message: self.log(job_id, message), device_id=device_id,
-                        )
-                        custom_state = fetch_custom_checkout_session_with_retry(
-                            chatgpt_http, token, session_id, custom_processor, device_id,
-                            log=lambda message: self.log(job_id, message), attempts=6,
-                            required_provider="momo",
-                            preserve_payment_methods_from=custom_state,
-                        )
-                        custom_amount = custom_checkout_amount_minor(custom_state)
-                        custom_currency = custom_checkout_currency(custom_state) or custom_currency
-                        custom_method_id = custom_payment_method_id_for(custom_state, "momo") or custom_method_id
                     self.log(
                         job_id,
-                        f"MoMo taxes 后 Checkout 应付金额：{custom_amount if custom_amount is not None else '?'} {custom_currency}",
+                        "MoMo tax refresh：available={}，amount={} {}（允许 0..50 VND）".format(
+                            native_methods or custom_payment_methods_diagnostic(custom_state),
+                            custom_amount if custom_amount is not None else "?",
+                            custom_currency,
+                        ),
                     )
-                    if promo_requested and custom_amount != 0:
+                    momo_discounted = is_momo_promo_amount(custom_amount, custom_currency)
+                    if promo_requested and not momo_discounted:
                         raise RuntimeError(
-                            f"MOMO_ZERO_DUE_REQUIRED: MoMo 优惠未生效或金额未知：amount={custom_amount} {custom_currency}"
+                            "MOMO_PROMO_AMOUNT_REQUIRED: MoMo 优惠未生效或金额未知；"
+                            f"要求 0 <= amount <= 50 VND，实际 amount={custom_amount} {custom_currency}"
                         )
 
-                    self.update(job_id, percent=80, text="正在确认 MoMo 支付方式")
-                    confirmed = confirm_custom_checkout_method_with_retry(
-                        chatgpt_http, token, session_id, custom_processor,
-                        custom_method_id, checkout_proxy, device_id, did,
-                        use_sen=bool(options.get("use_sen", True)),
-                        use_so=bool(options.get("use_so", True)),
-                        method_name="MoMo",
-                        allow_sentinel_fallback=True,
-                        max_retries=int(options.get("momo_confirm_retries") or 2),
-                        log=lambda message: self.log(job_id, message),
-                    )
-                    self.update(job_id, percent=90, text="正在生成 MoMo Stripe 授权链接")
-                    started = start_custom_checkout_method(
-                        chatgpt_http, token, session_id, custom_processor,
-                        custom_method_id, device_id, method_name="MoMo",
-                    )
-                    action = started.get("next_action") or {}
-                    redirect_url = momo_authorization_url(confirmed, started)
+                    payment_method_id = ""
+                    confirmation_kind = "custom_payment_method"
+                    intent_result: dict[str, Any] = {}
+                    approved: dict[str, Any] = {}
+                    if "momo" in native_methods:
+                        self.update(job_id, percent=80, text="正在创建 OAICS 原生 MoMo confirmation_token")
+                        publishable_key = (
+                            _nested_scalar(custom_state, ("publishable_key", "stripe_publishable_key", "public_key"))
+                            or _nested_scalar(tax_checkout, ("publishable_key", "stripe_publishable_key", "public_key"))
+                            or _nested_scalar(promo_state, ("publishable_key", "stripe_publishable_key", "public_key"))
+                            or _nested_scalar(checkout_data, ("publishable_key", "stripe_publishable_key", "public_key"))
+                        )
+                        stripe_http = sc.build_http(checkout_proxy)
+                        momo_ctx = {
+                            "checkout_amount": custom_amount,
+                            "currency": str(custom_currency or "VND").lower(),
+                            "payment_method_types": native_methods,
+                            "runtime_version": _nested_scalar(
+                                custom_state, ("runtime_version", "stripe_js_version"),
+                            ) or sc.DEFAULT_STRIPE_RUNTIME_VERSION,
+                            "config_id": _nested_scalar(custom_state, ("config_id", "checkout_config_id")),
+                            "elements_session_id": _nested_scalar(
+                                custom_state, ("elements_session_id", "elementsSessionId"),
+                            ),
+                            "elements_session_config_id": _nested_scalar(
+                                custom_state,
+                                ("elements_session_config_id", "elementsSessionConfigId"),
+                            ),
+                        }
+                        payment_method_id = create_provider_payment_method(
+                            stripe_http, publishable_key, session_id, "momo",
+                            sc.STRIPE_VERSION_FULL, momo_ctx, momo_billing,
+                            lambda message: self.log(job_id, message),
+                        )
+                        confirmation_token_id = create_oaics_confirmation_token(
+                            stripe_http, publishable_key, payment_method_id,
+                        )
+                        self.log(job_id, "OAICS 原生 MoMo PaymentMethod 与 confirmation_token 已创建")
+                        self.update(job_id, percent=88, text="正在提交 OAICS 原生 MoMo checkout/confirm")
+                        confirmed = confirm_oaics_native_payment_method(
+                            chatgpt_http, token, session_id, custom_processor, "momo",
+                            confirmation_token_id, checkout_proxy, device_id, did,
+                            use_sen=bool(options.get("use_sen", True)),
+                            use_so=bool(options.get("use_so", True)),
+                            allow_sentinel_fallback=True,
+                            log=lambda message: self.log(job_id, message),
+                        )
+                        confirmation_kind = "momo_oaics_checkout"
+                        redirect_url = momo_authorization_url(confirmed)
+                        if not redirect_url:
+                            self.log(job_id, "OAICS MoMo confirm 尚无 redirect action，继续确认返回的 Stripe Intent")
+                            intent_result = confirm_oaics_momo_intent(
+                                stripe_http, publishable_key, payment_method_id,
+                                confirmed, session_id, custom_processor,
+                            )
+                            redirect_url = momo_authorization_url(intent_result, confirmed)
+                        if not redirect_url:
+                            self.log(job_id, "OAICS MoMo Intent 尚无 redirect action，提交 approval 后轮询")
+                            approved = approve_checkout(
+                                token, session_id, custom_processor, checkout_proxy, device_id, did,
+                                http=chatgpt_http,
+                                log=lambda message: self.log(job_id, message),
+                                allow_sentinel_fallback=True,
+                            )
+                            redirect_url = momo_authorization_url(approved, intent_result, confirmed)
+                            if not redirect_url:
+                                polled_intent = poll_oaics_momo_intent(
+                                    stripe_http, publishable_key,
+                                    approved, intent_result, confirmed,
+                                )
+                                redirect_url = momo_authorization_url(
+                                    polled_intent, approved, intent_result, confirmed,
+                                )
+                    else:
+                        self.log(job_id, "OAICS 未发布原生 momo，回退已有 cpmt_* MoMo 协议")
+                        self.update(job_id, percent=80, text="正在确认 OAICS 自定义 MoMo 支付方式")
+                        confirmed = confirm_custom_checkout_method_with_retry(
+                            chatgpt_http, token, session_id, custom_processor,
+                            custom_method_id, checkout_proxy, device_id, did,
+                            use_sen=bool(options.get("use_sen", True)),
+                            use_so=bool(options.get("use_so", True)),
+                            method_name="MoMo",
+                            allow_sentinel_fallback=True,
+                            max_retries=int(options.get("momo_confirm_retries") or 2),
+                            log=lambda message: self.log(job_id, message),
+                        )
+                        started = start_custom_checkout_method(
+                            chatgpt_http, token, session_id, custom_processor,
+                            custom_method_id, device_id, method_name="MoMo",
+                        )
+                        redirect_url = momo_authorization_url(confirmed, started)
                     if not redirect_url:
                         raise RuntimeError(
-                            "MOMO_REDIRECT_MISSING: MoMo confirm/start 未返回有效的 "
+                            "MOMO_REDIRECT_MISSING: MoMo OAICS confirmation_token/confirm 未返回有效的 "
                             "pm-redirects.stripe.com 授权链接"
                         )
                     result.update({
@@ -4677,18 +5097,23 @@ class JobStore:
                         "checkout_ui_mode": "custom",
                         "processor_entity": custom_processor,
                         "custom_payment_method_id": custom_method_id,
-                        "payment_method_type": str(action.get("paymentMethodType") or "momo"),
+                        "payment_method_id": payment_method_id,
+                        "payment_method_type": "momo",
+                        "generation_kind": confirmation_kind,
+                        "cs_count": 1,
+                        "stripe_redirect_url": redirect_url,
                         "provider_redirect_url": redirect_url,
+                        "long_url": redirect_url,
                         "short_link": redirect_url,
                         "checkout_url": redirect_url,
                         "verification_url": str(confirmed.get("confirm_return_url") or ""),
                         "checkout_amount": custom_amount,
                         "amount_currency": custom_currency,
-                        "amount_verification": "verified_zero" if custom_amount == 0 else "nonzero",
-                        "promo_applied": (custom_amount == 0) if promo_requested else None,
-                        "expires_at": int(time.time()) + 1800,
+                        "amount_verification": "verified_discounted" if momo_discounted else "nonzero",
+                        "promo_applied": momo_discounted if promo_requested else None,
+                        "expires_at": int(time.time()) + 600,
                     })
-                    self.log(job_id, "OAICS MoMo 已返回 Stripe 授权长链；打开该页面后由上游展示支付二维码")
+                    self.log(job_id, "OAICS 原生 MoMo 已返回 Stripe 授权长链；打开该页面后由上游展示支付二维码")
                     self.update(job_id, percent=100, text="MoMo Stripe 授权链接生成完成", status="done", result=result)
                     return
                 if provider != "hosted":
