@@ -70,6 +70,103 @@ def _has_provider_method(methods: list[Any], provider: str) -> bool:
             return True
     return False
 
+
+def _merge_payment_method_types(*sources: Any) -> list[str]:
+    """Merge payment method names without losing source ordering."""
+    merged: list[str] = []
+    for source in sources:
+        if not isinstance(source, (list, tuple, set)):
+            continue
+        for item in source:
+            normalized = str(item or "").strip().lower().replace("-", "_")
+            if normalized and normalized not in merged and not normalized.startswith("cpmt_"):
+                merged.append(normalized)
+    return merged
+
+
+def _published_payment_method_types(payload: Any) -> list[str]:
+    """Collect method types from Checkout method containers only."""
+    container_keys = {
+        "custom_payment_methods",
+        "payment_methods",
+        "payment_method_types",
+        "available_payment_methods",
+        "payment_method_specs",
+    }
+    type_keys = {
+        "type", "name", "label", "payment_method_type", "paymentMethodType", "method_type",
+    }
+    found: list[str] = []
+
+    def add(value: Any) -> None:
+        normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized.startswith("gopay"):
+            normalized = "gopay"
+        if normalized and normalized not in found and not normalized.startswith("cpmt_"):
+            found.append(normalized)
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, str):
+            add(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item, depth + 1)
+        elif isinstance(value, dict):
+            for key in type_keys:
+                candidate = value.get(key)
+                if isinstance(candidate, (str, int, float)):
+                    add(candidate)
+            for key, nested in value.items():
+                if key in container_keys:
+                    collect(nested, depth + 1)
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key in container_keys:
+                    collect(nested, depth + 1)
+                elif isinstance(nested, (dict, list, tuple)):
+                    walk(nested, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                walk(nested, depth + 1)
+
+    walk(payload)
+    return found
+
+
+def _prepare_gopay_payment_methods(
+    http,
+    pk: str,
+    session_id: str,
+    stage1: dict,
+    ctx: dict,
+    version: str,
+    profile: dict,
+    log,
+    *,
+    phase: str,
+) -> list[str]:
+    stage1_methods = _published_payment_method_types(stage1)
+    init_methods = _merge_payment_method_types(ctx.get("payment_method_types") or [])
+    # Seed Elements with every method published during Checkout creation/init.
+    # Otherwise a card-only init request can make Elements echo only card.
+    ctx["payment_method_types"] = _merge_payment_method_types(stage1_methods, init_methods)
+    sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+    elements_methods = _merge_payment_method_types(ctx.get("elements_payment_method_types") or [])
+    merged = _merge_payment_method_types(stage1_methods, init_methods, elements_methods)
+    ctx["payment_method_types"] = merged
+    log(
+        f"[gopay] 支付方式来源（{phase}）："
+        f"checkout={stage1_methods or []}，stripe_init={init_methods or []}，"
+        f"elements={elements_methods or []}，merged={merged or []}"
+    )
+    return merged
+
 # PIX Automático / UPI AutoPay mandate_options were added after the Checkout
 # Payment Page version currently returned by this merchant.  Use the current
 # Stripe API train only for the direct SetupIntent fallback.
@@ -1294,10 +1391,21 @@ def stripe_to_provider(
     profile = sc._profile(country)
     pk = str(stage1.get("publishable_key") or "") or sc.verify_pk(http, session_id, log)
     init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
-    methods = ctx.get("payment_method_types") or []
+    if provider == "gopay":
+        methods = _prepare_gopay_payment_methods(
+            http, pk, session_id, stage1, ctx, version, profile, log, phase="initial",
+        )
+    else:
+        methods = ctx.get("payment_method_types") or []
     if not _has_provider_method(methods, provider):
+        if provider == "gopay":
+            raise RuntimeError(
+                "GOPAY_METHOD_UNAVAILABLE: CS Live 的 Checkout 创建响应、Stripe init 与 "
+                f"Elements 均未发布 GoPay；merged={methods or []}"
+            )
         raise RuntimeError(f"当前 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
-    sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+    if provider != "gopay":
+        sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
     processor = str(stage1.get("processor_entity") or "") or sc._entity_from_return_url(ctx.get("return_url") or init_data.get("return_url") or "") or "openai_llc"
     if apply_promo_callback and not late_promo:
         original_checkout_amount = ctx.get("checkout_amount")
@@ -1324,10 +1432,21 @@ def stripe_to_provider(
             log("[promo] 优惠更新完成，重新初始化 Stripe 并获取新鲜 elements_session_id")
             init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
             ctx["original_checkout_amount"] = original_checkout_amount
-            methods = ctx.get("payment_method_types") or []
+            if provider == "gopay":
+                methods = _prepare_gopay_payment_methods(
+                    http, pk, session_id, stage1, ctx, version, profile, log, phase="post_promo",
+                )
+            else:
+                methods = ctx.get("payment_method_types") or []
             if not _has_provider_method(methods, provider):
+                if provider == "gopay":
+                    raise RuntimeError(
+                        "GOPAY_PROMO_METHOD_INCOMPATIBLE: 应用优惠后 Stripe init 与 Elements "
+                        f"均未发布 GoPay；merged={methods or []}"
+                    )
                 raise RuntimeError(f"应用优惠后 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
-            sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+            if provider != "gopay":
+                sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
     if provider == "pix" and require_zero_due and not late_promo:
         original_checkout_amount = ctx.get("original_checkout_amount")
         init_data, version, ctx = _hosted_checkout_init(
@@ -1341,6 +1460,19 @@ def stripe_to_provider(
             )
     ctx["billing"] = billing
     sc.update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
+    if provider == "gopay":
+        original_checkout_amount = ctx.get("original_checkout_amount")
+        init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
+        ctx["billing"] = billing
+        ctx["original_checkout_amount"] = original_checkout_amount
+        methods = _prepare_gopay_payment_methods(
+            http, pk, session_id, stage1, ctx, version, profile, log, phase="post_taxes",
+        )
+        if not _has_provider_method(methods, "gopay"):
+            raise RuntimeError(
+                "GOPAY_METHOD_UNAVAILABLE_AFTER_TAXES: ID/IDR taxes 后 Stripe init 与 Elements "
+                f"均未发布 GoPay；merged={methods or []}"
+            )
     if provider == "blik":
         original_checkout_amount = ctx.get("original_checkout_amount")
         init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)

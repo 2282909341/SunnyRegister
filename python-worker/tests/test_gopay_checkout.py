@@ -13,6 +13,7 @@ if str(PAY153_DIR) not in sys.path:
     sys.path.insert(0, str(PAY153_DIR))
 
 import app as checkout_app  # noqa: E402
+import provider_checkout as provider_checkout_module  # noqa: E402
 from provider_checkout import (  # noqa: E402
     PROVIDER_DEFAULTS,
     default_billing,
@@ -261,7 +262,7 @@ def test_gopay_cs_live_creation_rebuilds_oaics_with_fresh_identity() -> None:
         calls.append((device_id, did, bool(kwargs.get("allow_sentinel_fallback"))))
         return responses.pop(0)
 
-    generated_ids = iter(["device-2", "did-2", "device-3", "did-3"])
+    generated_ids = iter(["identity-2", "identity-3"])
     with (
         patch.object(checkout_app, "create_checkout", side_effect=fake_create),
         patch.object(checkout_app.uuid, "uuid4", side_effect=lambda: next(generated_ids)),
@@ -272,13 +273,82 @@ def test_gopay_cs_live_creation_rebuilds_oaics_with_fresh_identity() -> None:
         )
 
     assert created["data"]["checkout_session_id"] == "cs_live_success"
-    assert (device_id, did) == ("device-3", "did-3")
+    assert (device_id, did) == ("identity-3", "identity-3")
     assert calls == [
-        ("device-1", "did-1", True),
-        ("device-2", "did-2", True),
-        ("device-3", "did-3", True),
+        ("device-1", "device-1", False),
+        ("identity-2", "identity-2", False),
+        ("identity-3", "identity-3", False),
     ]
     assert closed == ["first", "second"]
+
+
+def test_gopay_merges_checkout_init_and_elements_method_sources() -> None:
+    logs: list[str] = []
+    stage1 = {
+        "custom_payment_methods": [
+            {"id": "cpmt_gopay", "name": "GoPay wallet"},
+        ],
+    }
+    ctx = {"payment_method_types": ["card"]}
+
+    def fetch_elements(_http, _pk, _session_id, current, _version, _profile, _log):
+        assert current["payment_method_types"] == ["gopay", "card"]
+        current["elements_payment_method_types"] = ["card", "gopay"]
+        current["payment_method_types"] = ["card", "gopay"]
+        return {"payment_method_specs": [{"type": "card"}, {"type": "gopay"}]}
+
+    with patch.object(checkout_app.sc, "fetch_elements_session", side_effect=fetch_elements):
+        methods = provider_checkout_module._prepare_gopay_payment_methods(
+            object(), "pk_live", "cs_live_test", stage1, ctx, "2026-test", {}, logs.append,
+            phase="initial",
+        )
+
+    assert methods == ["gopay", "card"]
+    assert ctx["payment_method_types"] == ["gopay", "card"]
+    assert any("checkout=['gopay']" in message and "elements=['card', 'gopay']" in message for message in logs)
+
+
+@pytest.mark.parametrize(
+    ("response_text", "expected_code"),
+    [
+        ('{"error":"sentinel proof blocked"}', "SENTINEL_PROOF_REJECTED"),
+        ('{"error":"oai-did device mismatch"}', "DEVICE_SESSION_MISMATCH"),
+    ],
+)
+def test_gopay_checkout_classifies_proof_and_identity_rejections(
+    response_text: str,
+    expected_code: str,
+) -> None:
+    class FakeResponse:
+        status_code = 403
+        text = response_text
+
+    class FakeCookies:
+        def set(self, *_args, **_kwargs) -> None:
+            pass
+
+    class FakeHttp:
+        cookies = FakeCookies()
+
+        def get(self, *_args, **_kwargs) -> FakeResponse:
+            return FakeResponse()
+
+        def post(self, *_args, **_kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    with (
+        patch.object(checkout_app.sc, "build_http", return_value=FakeHttp()),
+        patch.object(
+            checkout_app,
+            "resolve_payment_sentinel_headers",
+            return_value={"OpenAI-Sentinel-Token": "proof"},
+        ),
+        pytest.raises(RuntimeError, match=expected_code),
+    ):
+        checkout_app.create_checkout(
+            "token", {}, "http://proxy", "identity", "identity", lambda _message: None,
+            diagnostic_label="GoPay",
+        )
 
 
 def test_gopay_cs_live_creation_stops_after_rebuild_budget() -> None:

@@ -752,6 +752,7 @@ def create_checkout(
     use_sen: bool = True,
     use_so: bool = True,
     allow_sentinel_fallback: bool = False,
+    diagnostic_label: str = "",
 ) -> dict:
     http = sc.build_http(proxy or None)
     try:
@@ -771,6 +772,14 @@ def create_checkout(
         use_sen=use_sen, use_so=use_so,
         allow_fallback=allow_sentinel_fallback, log=log,
     )
+    if diagnostic_label:
+        identity_hash = hashlib.sha256(str(device_id or "").encode("utf-8")).hexdigest()[:10]
+        log(
+            f"{diagnostic_label} 客户端证明：flow=chatgpt_checkout，"
+            f"SEN={'yes' if s_headers.get('OpenAI-Sentinel-Token') else 'no'}，"
+            f"SO={'yes' if s_headers.get('OpenAI-Sentinel-SO-Token') else 'no'}，"
+            f"identity={identity_hash}"
+        )
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -786,6 +795,19 @@ def create_checkout(
     resp = http.post(sc.OPENAI_CHECKOUT_URL, json=payload, headers=headers, timeout=60)
     text = resp.text or ""
     if resp.status_code != 200:
+        lowered = text.lower()
+        if resp.status_code in {400, 403} and any(
+            marker in lowered for marker in ("device", "oai-did", "oai_device", "device_id")
+        ):
+            raise RuntimeError(
+                f"DEVICE_SESSION_MISMATCH: OpenAI Checkout HTTP {resp.status_code}: {text[:500]}"
+            )
+        if resp.status_code in {400, 403} and any(
+            marker in lowered for marker in ("sentinel", "proof", "blocked", "challenge")
+        ):
+            raise RuntimeError(
+                f"SENTINEL_PROOF_REJECTED: OpenAI Checkout HTTP {resp.status_code}: {text[:500]}"
+            )
         raise RuntimeError(f"OpenAI Checkout HTTP {resp.status_code}: {text[:500]}")
     try:
         data = resp.json()
@@ -831,11 +853,14 @@ def create_local_method_cs_live_checkout(
     use_so: bool = True,
     method_name: str,
     error_prefix: str,
+    allow_sentinel_fallback: bool = True,
 ) -> tuple[dict, str, str]:
     """Rebuild redirect Checkouts until a local method receives CS Live."""
     max_attempts = max(1, min(int(attempts or 10), 10))
-    current_device_id = device_id
-    current_did = did
+    current_device_id = str(device_id or did or uuid.uuid4())
+    current_did = current_device_id if error_prefix == "GOPAY" else str(did or current_device_id)
+    if error_prefix == "GOPAY" and str(did or "") != current_device_id:
+        log("GoPay 设备身份已统一：oai-did 与 OAI-Device-Id 使用同一值")
     last_kind = "unknown"
     for attempt in range(1, max_attempts + 1):
         try:
@@ -848,15 +873,14 @@ def create_local_method_cs_live_checkout(
                 log,
                 use_sen=use_sen,
                 use_so=use_so,
-                # Local-payment discovery should survive transient Sentinel
-                # transport failures; payment API errors still propagate.
-                allow_sentinel_fallback=True,
+                allow_sentinel_fallback=allow_sentinel_fallback,
+                diagnostic_label=method_name if error_prefix == "GOPAY" else "",
             )
         except Exception as exc:
             message = str(exc)
             retryable = bool(_proxy_transport_error_kind(message)) or bool(
                 re.search(r"OpenAI Checkout HTTP (?:429|5\d\d)\b", message)
-            )
+            ) or message.startswith("Sentinel token generation failed")
             if not retryable:
                 raise
             log(
@@ -868,7 +892,9 @@ def create_local_method_cs_live_checkout(
                     f"{error_prefix}_CS_LIVE_CREATE_RETRY_EXHAUSTED: 连续 {max_attempts} 次创建均未完成；"
                     f"最后错误={message[:240]}"
                 ) from exc
-            current_device_id, current_did = str(uuid.uuid4()), str(uuid.uuid4())
+            next_identity = str(uuid.uuid4())
+            current_device_id = next_identity
+            current_did = next_identity if error_prefix == "GOPAY" else str(uuid.uuid4())
             continue
         checkout_data = created.get("data") or {}
         session_id = str(checkout_data.get("checkout_session_id") or "")
@@ -893,7 +919,9 @@ def create_local_method_cs_live_checkout(
             )
         if attempt < max_attempts:
             log(f"{method_name} 当前返回 OAICS；丢弃该会话并刷新设备标识，继续强制重建 CS Live")
-            current_device_id, current_did = str(uuid.uuid4()), str(uuid.uuid4())
+            next_identity = str(uuid.uuid4())
+            current_device_id = next_identity
+            current_did = next_identity if error_prefix == "GOPAY" else str(uuid.uuid4())
 
     raise RuntimeError(
         f"{error_prefix}_CS_LIVE_REBUILD_EXHAUSTED: 同一 Checkout 代理连续 {max_attempts} 次返回 "
@@ -917,6 +945,7 @@ def create_gopay_cs_live_checkout(
         token, payload, proxy, device_id, did, log,
         attempts=attempts, use_sen=use_sen, use_so=use_so,
         method_name="GoPay", error_prefix="GOPAY",
+        allow_sentinel_fallback=False,
     )
 
 
@@ -3755,6 +3784,15 @@ class JobStore:
             # use a fresh browser/device identity.  Within this single attempt
             # the same ids are kept for create -> update -> approve.
             device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
+            if provider == "gopay":
+                # Keep Sentinel proof, oai-did and every Checkout request on
+                # one device identity for the complete GoPay attempt.
+                did = device_id
+                identity_hash = hashlib.sha256(device_id.encode("utf-8")).hexdigest()[:10]
+                self.log(
+                    job_id,
+                    f"GoPay 会话身份已锁定：oai-did=OAI-Device-Id，identity={identity_hash}",
+                )
 
             if provider == "ph_short":
                 short_country = country if country in {"PH", "GB", "US"} else "PH"
