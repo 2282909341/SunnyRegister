@@ -572,17 +572,23 @@ func (s *Server) reconcilePythonTaskStatus(task *Task) {
 		workerURL = "http://127.0.0.1:8765"
 	}
 	healthOK, stillRunning := s.pythonWorkerTaskRunning(workerURL, task.ID)
-	if healthOK && stillRunning && silentFor < 20*time.Minute {
+	// A failed health request is a transport signal, not proof that the task
+	// stopped. The worker process owns the task and its watcher will finalize it
+	// if the child actually exits; interrupting here turns a temporary network
+	// hiccup between the Go backend and Worker into a false failure.
+	if !healthOK {
 		return
 	}
-	if !healthOK && !lastActivity.IsZero() && time.Since(lastActivity) < 5*time.Minute {
+	// The Worker can briefly omit a task while it is starting, restarting its
+	// health handler, or recovering its database connection. Keep the same
+	// 20-minute stale-task guard for both "still running" and "not listed"
+	// responses instead of interrupting after the first 90-second quiet period.
+	if silentFor < 20*time.Minute {
 		return
 	}
 
 	reason := "Python Worker 已不在执行该注册任务，已自动解除注册中状态"
-	if !healthOK {
-		reason = "无法连接 Python Worker，注册任务长时间无更新，已自动解除注册中状态"
-	} else if stillRunning {
+	if stillRunning {
 		reason = "Python Worker 注册任务超过 20 分钟无日志更新，已按卡死任务强制结束"
 	}
 	s.interruptStaleSunnyTask(task, reason)
