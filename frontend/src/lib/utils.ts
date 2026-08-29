@@ -8,6 +8,20 @@ export function cn(...inputs: ClassValue[]) {
 export const API = import.meta.env.VITE_API_BASE || '/api'
 export const API_BASE = API
 
+export class ApiRequestError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+  }
+}
+
+export function apiErrorStatus(error: unknown): number | null {
+  return error instanceof ApiRequestError ? error.status : null
+}
+
 async function responseError(res: Response) {
   const contentType = (res.headers.get('content-type') || '').toLowerCase()
   const raw = await res.text()
@@ -15,19 +29,19 @@ async function responseError(res: Response) {
     try {
       const payload = JSON.parse(raw)
       const message = payload?.detail || payload?.error || payload?.message
-      if (typeof message === 'string' && message.trim()) return new Error(message.trim())
+      if (typeof message === 'string' && message.trim()) return new ApiRequestError(message.trim(), res.status)
     } catch {
       // Fall through to the sanitized HTTP error below.
     }
   }
   const normalized = raw.toLowerCase()
   if (res.status === 502 || normalized.includes('bad gateway') || normalized.includes('error code 502')) {
-    return new Error('服务网关暂时不可用，请检查 SunnyRegister 后端与 Python Worker 状态')
+    return new ApiRequestError('服务网关暂时不可用，请检查 SunnyRegister 后端与 Python Worker 状态', res.status)
   }
   if (res.status === 504 || normalized.includes('gateway timeout') || normalized.includes('error code 504')) {
-    return new Error('服务响应超时，请稍后重试或检查邮箱网络链路')
+    return new ApiRequestError('服务响应超时，请稍后重试或检查邮箱网络链路', res.status)
   }
-  return new Error(`请求失败（HTTP ${res.status}），服务器返回了非 JSON 响应`)
+  return new ApiRequestError(`请求失败（HTTP ${res.status}），服务器返回了非 JSON 响应`, res.status)
 }
 
 export async function apiFetch(path: string, opts?: RequestInit) {

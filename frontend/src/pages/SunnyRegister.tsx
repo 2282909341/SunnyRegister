@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ConfirmBubble } from "@/components/ui/confirm-bubble";
-import { API_BASE, apiDownload, apiFetch, cn, triggerBrowserDownload } from "@/lib/utils";
+import { API_BASE, apiDownload, apiErrorStatus, apiFetch, cn, triggerBrowserDownload } from "@/lib/utils";
 import { useI18n } from "@/lib/i18n-context";
 import { useSunnyGsap } from "@/lib/useSunnyGsap";
 import { CachedPage, PagePortal } from "@/lib/page-cache";
@@ -397,8 +397,21 @@ type BatchTaskProgressValue = {
 type PersistentSessionTaskSnapshot = { tasks: PersistentSessionTask[] };
 
 const SESSION_TASK_STORAGE_KEY = "sunnyregister.active-session-tasks";
+const SESSION_TASK_POLL_INTERVAL_MS = 1200;
+const SESSION_TASK_RETRY_MAX_MS = 15000;
+const SESSION_TASK_STREAM_RECONNECT_MS = 2500;
 const sessionTaskListeners = new Set<() => void>();
 const sessionTaskPromises = new Map<string, Promise<AnyObj>>();
+
+function sessionTaskRetryDelay(failures: number) {
+  return Math.min(SESSION_TASK_RETRY_MAX_MS, SESSION_TASK_POLL_INTERVAL_MS * (2 ** Math.min(4, Math.max(0, failures - 1))));
+}
+
+function isRetryableSessionTaskReadError(error: unknown) {
+  if (error instanceof Error && error.message === "Unauthorized") return false;
+  const status = apiErrorStatus(error);
+  return status == null || status === 408 || status === 425 || status === 429 || status >= 500;
+}
 
 function readPersistentSessionTasks(): PersistentSessionTask[] {
   if (typeof window === "undefined") return [];
@@ -632,7 +645,10 @@ function ensureSessionTaskPolling(task: PersistentSessionTask, initial?: AnyObj)
     let since = 0;
     let stream: EventSource | null = null;
     let streamDone = false;
-    let current = initial || await apiFetch(`/tasks/${task.taskId}`);
+    let pollingDone = false;
+    let streamFailures = 0;
+    let streamReconnectTimer: number | null = null;
+    let statusFailures = 0;
     const applyEvents = (events: AnyObj[]) => {
       if (!events.length) return;
       since = Math.max(since, ...events.map((event: AnyObj) => Number(event.id || 0)));
@@ -644,6 +660,7 @@ function ensureSessionTaskPolling(task: PersistentSessionTask, initial?: AnyObj)
       const apiBase = String(API_BASE || "/api").replace(/\/$/, "");
       const source = new EventSource(`${apiBase}/tasks/${encodeURIComponent(task.taskId)}/logs/stream?since=${since}`, { withCredentials: true });
       stream = source;
+      source.onopen = () => { streamFailures = 0; };
       source.onmessage = (message) => {
         try {
           const payload = JSON.parse(message.data || "{}");
@@ -651,31 +668,66 @@ function ensureSessionTaskPolling(task: PersistentSessionTask, initial?: AnyObj)
           applyEvents([payload]);
         } catch { /* malformed SSE data is recovered by the incremental poll */ }
       };
-      source.onerror = () => { source.close(); if (stream === source) stream = null; };
+      source.onerror = () => {
+        source.close();
+        if (stream === source) stream = null;
+        if (streamDone || pollingDone || streamReconnectTimer !== null) return;
+        streamFailures += 1;
+        const delay = Math.min(SESSION_TASK_RETRY_MAX_MS, SESSION_TASK_STREAM_RECONNECT_MS * Math.max(1, streamFailures));
+        streamReconnectTimer = window.setTimeout(() => {
+          streamReconnectTimer = null;
+          openStream();
+        }, delay);
+      };
     };
     const syncTaskProgress = (payload: AnyObj) => {
       const progress = taskProgressFromPayload(payload, task.sessionIds.length);
       if (progress) updateSessionTask(task.clientId, (item) => ({ ...item, taskProgress: progress }));
     };
-    syncTaskProgress(current);
-    openStream();
-    if (!current.terminal && task.kind === "refresh-at" && task.renewalNeedsVerification) {
-      updateSessionTask(task.clientId, (item) => ({ ...item, renewalNeedsVerification: false }));
-    }
-    while (!current.terminal) {
-      const eventResult = await apiFetch(`/tasks/${task.taskId}/events?since=${since}`).catch(() => ({ items: [] }));
-      const events = Array.isArray(eventResult.items) ? eventResult.items : [];
-      applyEvents(events);
-      await new Promise((resolve) => window.setTimeout(resolve, 1200));
-      current = await apiFetch(`/tasks/${task.taskId}`);
+    const readTaskStatus = async (): Promise<AnyObj> => {
+      for (;;) {
+        try {
+          const current = await apiFetch(`/tasks/${task.taskId}`);
+          if (statusFailures > 0) {
+            appendAccountOperationLog(task.kind, "process", `任务状态连接已恢复，继续跟踪后台任务`, "info", task.email, { task_id: task.taskId });
+          }
+          statusFailures = 0;
+          return current;
+        } catch (error) {
+          if (!isRetryableSessionTaskReadError(error)) throw error;
+          statusFailures += 1;
+          if (statusFailures === 1) {
+            appendAccountOperationLog(task.kind, "process", `任务状态连接暂时中断，后台任务不受影响，正在自动重连`, "warning", task.email, { task_id: task.taskId });
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, sessionTaskRetryDelay(statusFailures)));
+        }
+      }
+    };
+    try {
+      let current = initial || await readTaskStatus();
       syncTaskProgress(current);
+      openStream();
+      if (!current.terminal && task.kind === "refresh-at" && task.renewalNeedsVerification) {
+        updateSessionTask(task.clientId, (item) => ({ ...item, renewalNeedsVerification: false }));
+      }
+      while (!current.terminal) {
+        const eventResult = await apiFetch(`/tasks/${task.taskId}/events?since=${since}`).catch(() => ({ items: [] }));
+        const events = Array.isArray(eventResult.items) ? eventResult.items : [];
+        applyEvents(events);
+        await new Promise((resolve) => window.setTimeout(resolve, SESSION_TASK_POLL_INTERVAL_MS));
+        current = await readTaskStatus();
+        syncTaskProgress(current);
+      }
+      const finalEvents = await apiFetch(`/tasks/${task.taskId}/events?since=${since}`).catch(() => ({ items: [] }));
+      applyEvents(Array.isArray(finalEvents.items) ? finalEvents.items : []);
+      appendAccountTaskResult(task.kind, current);
+      markSessionTaskTerminal(task.clientId, current);
+      return current;
+    } finally {
+      pollingDone = true;
+      if (streamReconnectTimer !== null) window.clearTimeout(streamReconnectTimer);
+      (stream as EventSource | null)?.close();
     }
-    const finalEvents = await apiFetch(`/tasks/${task.taskId}/events?since=${since}`).catch(() => ({ items: [] }));
-    applyEvents(Array.isArray(finalEvents.items) ? finalEvents.items : []);
-    appendAccountTaskResult(task.kind, current);
-    (stream as EventSource | null)?.close();
-    markSessionTaskTerminal(task.clientId, current);
-    return current;
   })().catch((error) => {
     appendAccountOperationLog(task.kind, "result", `任务失败：${error instanceof Error ? error.message : String(error)}`, "error", task.email);
     updateSessionTask(task.clientId, (item) => ({ ...item, state: "failed", error: error instanceof Error ? error.message : String(error) }));
