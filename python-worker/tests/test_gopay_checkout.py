@@ -241,6 +241,111 @@ def test_gopay_checkout_payload_delays_promo_until_method_is_published() -> None
     assert payload["checkout_ui_mode"] == "redirect"
 
 
+def test_gopay_checkout_payload_uses_verified_query_coupon_on_create() -> None:
+    options = {
+        "plan": "plus",
+        "link_type": "gopay",
+        "country": "ID",
+        "currency": "IDR",
+        "checkout_country": "ID",
+        "checkout_currency": "IDR",
+        "use_promo": True,
+        "promo_campaign": "plus-1-month-free",
+        "promo_on_create": True,
+        "promo_from_query_param": True,
+        "checkout_ui_mode": "redirect",
+    }
+
+    payload = checkout_app.checkout_payload(options, {})
+
+    assert payload["promo_campaign"] == {
+        "promo_campaign_id": "plus-1-month-free",
+        "is_coupon_from_query_param": True,
+    }
+
+
+def test_gopay_preflight_falls_back_to_account_management_coupon_protocol() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class FakeResponse:
+        def __init__(self, payload: dict) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict:
+            return self._payload
+
+    class FakeCookies:
+        def set(self, *_args, **_kwargs) -> None:
+            pass
+
+    class FakeHttp:
+        cookies = FakeCookies()
+        closed = False
+
+        def get(self, url: str, **kwargs):
+            calls.append((url, kwargs))
+            if "accounts/check" in url:
+                return FakeResponse({
+                    "accounts": {
+                        "account-1": {"eligible_promo_campaigns": {}},
+                    },
+                })
+            return FakeResponse({"state": "eligible"})
+
+        def close(self) -> None:
+            self.closed = True
+
+    http = FakeHttp()
+    logs: list[str] = []
+    with (
+        patch.dict("os.environ", {"PAY153_RUST_URL": ""}),
+        patch.object(checkout_app.sc, "build_http", return_value=http),
+    ):
+        result = checkout_app.preflight_trial_eligibility(
+            "token", "account-1", "http://id-proxy", "identity", "identity", logs.append,
+            coupon_fallback=True,
+        )
+
+    assert result["one_click_trial_eligible"] is True
+    assert result["promo_campaign_id"] == "plus-1-month-free"
+    assert result["promotion_source"] == "coupon_check"
+    assert result["is_coupon_from_query_param"] is True
+    assert calls[1][1]["params"]["is_coupon_from_query_param"] == "true"
+    assert calls[1][1]["headers"]["OAI-Device-Id"] == "identity"
+    assert http.closed is True
+    assert any("state=eligible" in message for message in logs)
+
+
+def test_gopay_promo_update_submits_query_coupon_semantics() -> None:
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"success":true}'
+
+        def json(self) -> dict:
+            return {"success": True}
+
+    class FakeHttp:
+        def post(self, _url: str, **kwargs) -> FakeResponse:
+            captured.update(kwargs)
+            return FakeResponse()
+
+    result = checkout_app.update_checkout_promo(
+        FakeHttp(), "token", "cs_live_test", "openai_llc", "plus-1-month-free",
+        lambda _message: None,
+        device_id="identity",
+        is_coupon_from_query_param=True,
+    )
+
+    assert result == {"success": True}
+    assert captured["json"]["promo_campaign"] == {
+        "promo_campaign_id": "plus-1-month-free",
+        "is_coupon_from_query_param": True,
+    }
+
+
 def test_gopay_cs_live_creation_rebuilds_oaics_with_fresh_identity() -> None:
     closed: list[str] = []
 
@@ -453,6 +558,49 @@ def test_gopay_blocked_approval_rebuilds_inside_one_outer_attempt() -> None:
     assert any("重建完整链路 2/10" in message for message in logs)
 
 
+def test_gopay_retries_unchanged_amount_with_coupon_on_checkout_create() -> None:
+    store = object.__new__(checkout_app.JobStore)
+    state = {"status": "running", "error": "", "result": None}
+    strategies: list[tuple[bool, bool]] = []
+    logs: list[str] = []
+    store.cancelled = lambda _job_id: False
+    store.get = lambda _job_id: dict(state)
+    store.update = lambda _job_id, **fields: state.update(fields)
+    store.log = lambda _job_id, message: logs.append(message)
+    store._record_success = lambda _job_id, _result: None
+
+    def run_single(_job_id: str, attempt_options: dict) -> None:
+        strategies.append((
+            bool(attempt_options["promo_on_create"]),
+            bool(attempt_options["promo_from_query_param"]),
+        ))
+        if len(strategies) == 1:
+            state.update(
+                status="error",
+                error="GOPAY_PROMO_AMOUNT_REQUIRED: amount=34900000 currency=IDR",
+            )
+        else:
+            state.update(status="done", result={})
+
+    store._run_single = run_single
+    with patch.object(checkout_app.time, "sleep"):
+        store._run_locked("job-gopay", {
+            "retry_count": 1,
+            "link_type": "gopay",
+            "use_promo": True,
+            "country": "ID",
+            "checkout_country": "ID",
+            "entry_proxies": ["http://promotion-1:8001", "http://promotion-2:8002"],
+            "exit_proxies": ["http://checkout-1:9001", "http://checkout-2:9002"],
+            "paired_proxy_rotation": True,
+        })
+
+    assert strategies == [(False, True), (True, True)]
+    assert state["result"] == {"attempt": 2, "max_attempts": 2}
+    assert any("确认 GoPay 后" in message for message in logs)
+    assert any("Checkout 创建时携带" in message for message in logs)
+
+
 def test_gopay_ten_blocked_chains_consume_one_outer_attempt() -> None:
     store = object.__new__(checkout_app.JobStore)
     state = {"status": "running", "error": "", "result": None}
@@ -576,7 +724,7 @@ def test_gopay_cs_live_rejects_fifty_idr_after_promo_refresh() -> None:
         patch.object(checkout_app.sc, "fetch_elements_session"),
         patch.object(checkout_app.sc, "update_tax_region"),
         patch.object(checkout_app.sc, "snapshot_billing"),
-        pytest.raises(RuntimeError, match="GOPAY_PROMO_AMOUNT_REQUIRED"),
+        pytest.raises(RuntimeError, match="GOPAY_PROMO_ACCEPTED_WITHOUT_DISCOUNT"),
     ):
         stripe_to_provider(
             object(),

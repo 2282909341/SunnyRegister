@@ -736,7 +736,7 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
     ):
         common["promo_campaign"] = {
             "promo_campaign_id": promo or "plus-1-month-free",
-            "is_coupon_from_query_param": False,
+            "is_coupon_from_query_param": bool(options.get("promo_from_query_param")),
         }
     return common
 
@@ -949,7 +949,16 @@ def create_gopay_cs_live_checkout(
     )
 
 
-def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_id: str, did: str, log) -> dict:
+def preflight_trial_eligibility(
+    token: str,
+    account_id: str,
+    proxy: str,
+    device_id: str,
+    did: str,
+    log,
+    *,
+    coupon_fallback: bool = False,
+) -> dict:
     rust_base = str(os.getenv("PAY153_RUST_URL") or "").strip().rstrip("/")
     if rust_base:
         try:
@@ -988,15 +997,25 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
                     f"Rust \u4f18\u60e0\u68c0\u6d4b\u5b8c\u6210\uff1a"
                     f"{campaign_id or '\u5f53\u524d\u65e0\u4f18\u60e0'}\uff08{normalized['promotion_transport']}\uff09"
                 )
-                return normalized
+                if normalized["one_click_trial_eligible"] or campaign_id or not coupon_fallback:
+                    return normalized
+                log("Rust 优惠检测未匹配活动，继续使用 GoPay 优惠券协议复核")
             log(f"Rust \u4f18\u60e0\u68c0\u6d4b HTTP {rust_response.status_code}\uff0c\u56de\u9000 Python")
         except Exception as rust_exc:
             log(f"Rust \u4f18\u60e0\u68c0\u6d4b\u5f02\u5e38\uff1a{type(rust_exc).__name__}\uff0c\u56de\u9000 Python")
 
-    """Read the account campaign catalog instead of the stale payment-method marker."""
-    if not account_id:
-        return {}
+    """Read the account catalog, with GoPay's explicit coupon protocol as fallback."""
     http = sc.build_http(proxy)
+
+    def finish(result: dict[str, Any]) -> dict[str, Any]:
+        close = getattr(http, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return result
+
     try:
         http.cookies.set("oai-did", did, domain="chatgpt.com")
     except Exception:
@@ -1008,52 +1027,94 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
         "Referer": "https://chatgpt.com/",
         "OAI-Language": "zh-CN",
         "OAI-Device-Id": device_id,
-        "ChatGPT-Account-ID": account_id,
     }
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+    account_result: dict[str, Any] = {}
     try:
-        resp = http.get(
-            "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        if account_id:
+            resp = http.get(
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+                headers=headers,
+                timeout=35,
+            )
+            if resp.status_code != 200:
+                log(f"账号活动目录返回 HTTP {resp.status_code}")
+                account_result = {
+                    "promotion_source": "accounts_check",
+                    "promotion_http_status": resp.status_code,
+                }
+            else:
+                data = resp.json() or {}
+                accounts = data.get("accounts") or {}
+                account = accounts.get(account_id) or accounts.get("default") or {}
+                campaigns = account.get("eligible_promo_campaigns") or {}
+                plus = campaigns.get("plus") or {}
+                metadata = plus.get("metadata") or {}
+                discount_data = metadata.get("discount") or {}
+                duration_data = metadata.get("duration") or {}
+                campaign_id = str(plus.get("id") or plus.get("campaign_id") or "").strip()
+                discount = discount_data.get("percentage")
+                duration = duration_data.get("num_periods")
+                duration_period = duration_data.get("period") or ""
+                label = metadata.get("promotion_type_label") or metadata.get("title") or metadata.get("summary") or ""
+                processor = metadata.get("processor") or ""
+                account_result = {
+                    "promotion_source": "accounts_check",
+                    "promotion_http_status": resp.status_code,
+                    "one_click_trial_eligible": bool(campaign_id),
+                    "promo_campaign_id": campaign_id,
+                    "promotion_label": label,
+                    "promotion_title": metadata.get("title") or "",
+                    "promotion_discount_percentage": discount,
+                    "promotion_duration_months": duration if duration_period == "month" else None,
+                    "promotion_duration_period": duration_period,
+                    "promotion_processor": processor,
+                    "eligible_offers": account.get("eligible_offers") or {},
+                }
+                if campaign_id:
+                    log(f"账号活动目录已匹配：{campaign_id}（{label or 'Plus 活动'}）")
+                    return finish(account_result)
+                log("账号活动目录未返回 Plus 优惠")
+    except Exception as exc:
+        log(f"账号活动目录读取失败：{type(exc).__name__}")
+
+    if not coupon_fallback:
+        return finish(account_result)
+
+    try:
+        coupon_resp = http.get(
+            "https://chatgpt.com/backend-api/promo_campaign/check_coupon",
+            params={
+                "coupon": "plus-1-month-free",
+                "is_coupon_from_query_param": "true",
+            },
             headers=headers,
             timeout=35,
         )
-        if resp.status_code != 200:
-            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u8fd4\u56de HTTP {resp.status_code}")
-            return {"promotion_source": "accounts_check", "promotion_http_status": resp.status_code}
-        data = resp.json() or {}
-        accounts = data.get("accounts") or {}
-        account = accounts.get(account_id) or accounts.get("default") or {}
-        campaigns = account.get("eligible_promo_campaigns") or {}
-        plus = campaigns.get("plus") or {}
-        metadata = plus.get("metadata") or {}
-        discount_data = metadata.get("discount") or {}
-        duration_data = metadata.get("duration") or {}
-        campaign_id = str(plus.get("id") or plus.get("campaign_id") or "").strip()
-        discount = discount_data.get("percentage")
-        duration = duration_data.get("num_periods")
-        duration_period = duration_data.get("period") or ""
-        label = metadata.get("promotion_type_label") or metadata.get("title") or metadata.get("summary") or ""
-        processor = metadata.get("processor") or ""
-        normalized = {
-            "promotion_source": "accounts_check",
-            "promotion_http_status": resp.status_code,
-            "one_click_trial_eligible": bool(campaign_id),
-            "promo_campaign_id": campaign_id,
-            "promotion_label": label,
-            "promotion_title": metadata.get("title") or "",
-            "promotion_discount_percentage": discount,
-            "promotion_duration_months": duration if duration_period == "month" else None,
-            "promotion_duration_period": duration_period,
-            "promotion_processor": processor,
-            "eligible_offers": account.get("eligible_offers") or {},
-        }
-        if campaign_id:
-            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u5df2\u5339\u914d\uff1a{campaign_id}\uff08{label or 'Plus \u6d3b\u52a8'}\uff09")
-        else:
-            log("\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u672a\u8fd4\u56de Plus \u4f18\u60e0")
-        return normalized
+        coupon_payload = coupon_resp.json() if coupon_resp.status_code == 200 else {}
+        coupon_payload = coupon_payload if isinstance(coupon_payload, dict) else {}
+        coupon_state = str(coupon_payload.get("state") or "").strip().lower()
+        coupon_eligible = coupon_resp.status_code == 200 and coupon_state == "eligible"
+        log(
+            "GoPay 优惠券复核：HTTP {}，state={}，flow=query_param".format(
+                coupon_resp.status_code,
+                coupon_state or "unknown",
+            )
+        )
+        return finish({
+            **account_result,
+            "promotion_source": "coupon_check",
+            "promotion_http_status": coupon_resp.status_code,
+            "one_click_trial_eligible": coupon_eligible,
+            "promo_campaign_id": "plus-1-month-free" if coupon_eligible else "",
+            "promotion_label": "Plus coupon trial" if coupon_eligible else "",
+            "coupon_state": coupon_state,
+            "is_coupon_from_query_param": True,
+        })
     except Exception as exc:
-        log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25\uff1a{type(exc).__name__}")
-        return {}
+        log(f"GoPay 优惠券复核失败：{type(exc).__name__}")
+        return finish(account_result)
 
 def promo_campaign_from_payload(payload: Any) -> str:
     """Extract the account-specific campaign id returned by OpenAI.
@@ -1232,6 +1293,7 @@ def update_checkout_promo(
     log,
     *,
     device_id: str = "",
+    is_coupon_from_query_param: bool = False,
 ) -> dict:
     body = {
         "checkout_session_id": session_id,
@@ -1242,7 +1304,7 @@ def update_checkout_promo(
         "discount_code": None,
         "promo_campaign": {
             "promo_campaign_id": campaign_id or "plus-1-month-free",
-            "is_coupon_from_query_param": False,
+            "is_coupon_from_query_param": bool(is_coupon_from_query_param),
         },
     }
     resp = http.post(
@@ -1272,9 +1334,20 @@ def update_checkout_promo(
             )
         raise RuntimeError(f"应用 Plus 优惠失败：HTTP {resp.status_code} {text[:300]}")
     try:
-        return resp.json() or {}
+        payload = resp.json() or {}
     except Exception:
         return {}
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise RuntimeError(f"应用 Plus 优惠失败：HTTP 200 success=false {text[:300]}")
+    returned_campaign = promo_campaign_from_payload(payload)
+    log(
+        "[promo] update accepted: requested={} returned={} query_param={}".format(
+            campaign_id or "plus-1-month-free",
+            returned_campaign or "not_echoed",
+            str(bool(is_coupon_from_query_param)).lower(),
+        )
+    )
+    return payload if isinstance(payload, dict) else {}
 
 
 def fetch_custom_checkout_session(
@@ -3245,7 +3318,14 @@ class JobStore:
                 # asks for OAICS and can hide Stripe's GoPay method even when
                 # the same account was just probed successfully.
                 current["checkout_ui_mode"] = "redirect"
-                current["promo_on_create"] = False
+                current["promo_from_query_param"] = bool(current.get("use_promo"))
+                # First use the late-update path so Stripe can publish GoPay.
+                # If the server accepts update but keeps the full amount, the
+                # next complete attempt creates Checkout with the verified
+                # coupon attached instead of repeating the same failed shape.
+                current["promo_on_create"] = bool(
+                    current.get("use_promo") and logical_attempt % 2 == 0
+                )
             if current.get("link_type") == "pix" and current.get("pix_tax_id_auto"):
                 auto_kind = current.get("pix_auto_kind") or "cpf"
                 kind = ("cpf" if attempt % 2 else "cnpj") if auto_kind == "mixed" else auto_kind
@@ -3262,6 +3342,13 @@ class JobStore:
                 self.log(job_id, f"PayPal 优惠策略：{strategy}")
                 if retry_same_strategy:
                     self.log(job_id, "上一轮为代理传输失败；本轮仅更换代理并沿用相同 PayPal 优惠策略")
+            if current.get("link_type") == "gopay" and current.get("use_promo"):
+                strategy = (
+                    "Checkout 创建时携带已验证优惠券"
+                    if current.get("promo_on_create")
+                    else "确认 GoPay 后通过 Promotion代理池更新优惠券"
+                )
+                self.log(job_id, f"GoPay 优惠策略：{strategy}（query_param=true）")
             retry_same_strategy = False
             gopay_chain_attempt = 0
             while True:
@@ -4018,6 +4105,7 @@ class JobStore:
                 preflight = preflight_trial_eligibility(
                     token, meta.get("account_id") or "", entry_proxy, device_id, did,
                     lambda m: self.log(job_id, m),
+                    coupon_fallback=provider == "gopay",
                 )
                 detected_campaign = promo_campaign_from_payload(preflight)
                 if provider == "ideal":
@@ -4031,6 +4119,8 @@ class JobStore:
                         )
                 if preflight.get("one_click_trial_eligible") is True:
                     options["promo_marker_eligible"] = True
+                if provider == "gopay" and preflight.get("is_coupon_from_query_param"):
+                    options["promo_from_query_param"] = True
                 if detected_campaign:
                     options["promo_campaign"] = detected_campaign
                     options["promo_campaign_verified"] = True
@@ -4272,6 +4362,9 @@ class JobStore:
                 "entry_one_click_marker": preflight.get("one_click_trial_eligible"),
                 "checkout_one_click_marker": checkout_data.get("one_click_trial_eligible"),
                 "promotion_eligibility_decided_by": "checkout_approve",
+                "promotion_source": str(preflight.get("promotion_source") or ""),
+                "promotion_coupon_state": str(preflight.get("coupon_state") or ""),
+                "promo_from_query_param": bool(options.get("promo_from_query_param")),
                 "entry_country": str(locals().get("main_country") or "").upper(),
                 "promo_country": str(options.get("promo_country") or "").upper(),
                 "payment_proxy_country": str(options.get("payment_proxy_country") or locals().get("payment_country") or "").upper(),
@@ -4413,6 +4506,7 @@ class JobStore:
                             promo_chatgpt_http, token, session_id, custom_processor,
                             options.get("promo_campaign") or "plus-1-month-free",
                             lambda message: self.log(job_id, message), device_id=device_id,
+                            is_coupon_from_query_param=bool(options.get("promo_from_query_param")),
                         )
                         custom_state = fetch_custom_checkout_session_with_retry(
                             chatgpt_http, token, session_id, custom_processor, device_id,
@@ -5523,6 +5617,9 @@ class JobStore:
                         campaign,
                         provider_log,
                         device_id=device_id,
+                        is_coupon_from_query_param=bool(
+                            provider == "gopay" and options.get("promo_from_query_param")
+                        ),
                     )
                 except RuntimeError as exc:
                     if provider == "paypal" and "promotion is not compatible with the checkout's payment methods" in str(exc).lower():

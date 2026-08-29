@@ -1521,9 +1521,18 @@ def stripe_to_provider(
                     promo_applied = str(checkout_amount).strip() in {"0", "0.0", "0.00"}
             if not promo_applied:
                 if provider == "gopay":
+                    unchanged = (
+                        ctx.get("original_checkout_amount") not in (None, "")
+                        and str(checkout_amount) == str(ctx.get("original_checkout_amount"))
+                    )
                     raise RuntimeError(
                         "GOPAY_PROMO_AMOUNT_REQUIRED: GoPay 优惠金额必须小于 50 IDR："
                         f"amount={checkout_amount} currency={str(ctx.get('currency') or '').upper() or '?'}"
+                        + (
+                            "；GOPAY_PROMO_ACCEPTED_WITHOUT_DISCOUNT: checkout/update 已接受，"
+                            "但 Stripe 金额未变化，下一轮将改为创建 Checkout 时携带优惠券"
+                            if unchanged else ""
+                        )
                     )
                 if provider == "momo":
                     raise RuntimeError(
