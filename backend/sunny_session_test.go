@@ -1015,22 +1015,6 @@ func TestSunnyScheduledHealthCandidatesIncludeRegisteredMailboxesAcrossGroups(t 
 	}
 }
 
-func TestSunnyHealthBatchSizeBounds(t *testing.T) {
-	s := &Server{}
-	t.Setenv("SUNNY_HEALTHCHECK_BATCH_SIZE", "100")
-	if got := s.sunnyHealthCheckBatchSize(); got != 100 {
-		t.Fatalf("batch size = %d, want 100", got)
-	}
-	t.Setenv("SUNNY_HEALTHCHECK_BATCH_SIZE", "1")
-	if got := s.sunnyHealthCheckBatchSize(); got != 10 {
-		t.Fatalf("minimum batch size = %d, want 10", got)
-	}
-	t.Setenv("SUNNY_HEALTHCHECK_BATCH_SIZE", "999")
-	if got := s.sunnyHealthCheckBatchSize(); got != 500 {
-		t.Fatalf("maximum batch size = %d, want 500", got)
-	}
-}
-
 func TestSunnyAccessTokenProbeClassifiesAuthenticationResponses(t *testing.T) {
 	originalEndpoint := sunnyProbeAccessTokenEndpoint
 	defer func() { sunnyProbeAccessTokenEndpoint = originalEndpoint }()

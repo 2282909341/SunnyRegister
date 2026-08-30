@@ -254,7 +254,7 @@ class RefreshSessionTests(unittest.TestCase):
         self.assertTrue(run_one.call_args_list[1].args[2]["renewal_retry_fresh_context"])
         self.assertEqual(sleep_mock.call_count, 2)
 
-    def test_batch_renewal_runs_accounts_with_bounded_concurrency(self):
+    def test_renewal_worker_pool_runs_accounts_with_bounded_concurrency(self):
         class ParallelDB:
             task_id = "renewal-task"
 
@@ -301,6 +301,68 @@ class RefreshSessionTests(unittest.TestCase):
         self.assertEqual(isolated.call_count, 4)
         self.assertEqual(peak, 3)
         self.assertEqual(db.updates[-1]["progress_current"], 4)
+
+    def test_renewal_worker_pool_refills_a_freed_slot_immediately(self):
+        class ParallelDB:
+            task_id = "renewal-refill-task"
+
+            def fetch_accounts(self, _ids=None):
+                return [{"id": index, "email": f"user{index}@example.com"} for index in range(1, 5)]
+
+            def event(self, *_args, **_kwargs):
+                return None
+
+            def cancel_requested(self):
+                return False
+
+            def update_task(self, **_fields):
+                return None
+
+        initial_started = threading.Event()
+        fourth_started = threading.Event()
+        release_slow = threading.Event()
+        fallback_released = threading.Event()
+        start_lock = threading.Lock()
+        started_count = 0
+
+        def release_on_timeout():
+            fallback_released.set()
+            release_slow.set()
+
+        fallback = threading.Timer(1.0, release_on_timeout)
+
+        def refresh_one(_task_id, _payload, account_id, index, _total):
+            nonlocal started_count
+            with start_lock:
+                started_count += 1
+                if started_count == 3:
+                    initial_started.set()
+            if account_id == 1:
+                self.assertTrue(initial_started.wait(0.5))
+            elif account_id in {2, 3}:
+                self.assertTrue(release_slow.wait(2.0))
+            else:
+                fourth_started.set()
+                release_slow.set()
+            return index, 1, [], [{"email": f"user{account_id}@example.com"}]
+
+        fallback.start()
+        try:
+            with (
+                patch.object(worker, "_refresh_sessions_isolated", side_effect=refresh_one),
+                patch.object(worker, "probe_access_token", return_value={"status": "invalid"}),
+            ):
+                ok, errors, items = worker._refresh_sessions(
+                    ParallelDB(),
+                    {"account_ids": [1, 2, 3, 4], "concurrency": 3},
+                )
+        finally:
+            fallback.cancel()
+            release_slow.set()
+
+        self.assertEqual((ok, errors, len(items)), (4, [], 4))
+        self.assertTrue(fourth_started.is_set())
+        self.assertFalse(fallback_released.is_set(), "next account waited for the entire concurrency group")
 
     def test_icloud_renewal_reuses_auth_proxy_when_auxiliary_route_is_direct(self):
         proxies = {"register": "http://proxy.example:8080"}

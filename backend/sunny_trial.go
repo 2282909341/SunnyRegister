@@ -655,10 +655,6 @@ func checkSunnyTrialWithRetry(ctx context.Context, accessToken string) (sunnyCom
 	return retried, true
 }
 
-func (s *Server) sunnyTrialBatchSize() int {
-	return sunnyDetectionBatchSize("SUNNY_TRIAL_BATCH_SIZE", 12, 100)
-}
-
 // sunnyCommerceProxyGroups returns the enabled account-detection proxies grouped
 // by their validated country code. The country list is intentionally derived
 // from the configured pool instead of being hard-coded in the UI or API.
@@ -977,122 +973,115 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 	for _, candidate := range candidates {
 		candidateBySession[candidate.SessionID] = candidate
 	}
-	batchSize := s.sunnyTrialBatchSize()
 	concurrency := s.sunnyTrialConcurrency()
-	for start := 0; start < len(candidates); start += batchSize {
-		end := start + batchSize
-		if end > len(candidates) {
-			end = len(candidates)
+	results := streamSunnyWorkerPool(candidates, concurrency, func(candidate sunnyTrialCandidate) sunnyTrialResult {
+		outcome := sunnyTrialResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, SkipReason: candidate.SkipReason, Error: candidate.Error}
+		if outcome.SkipReason == "" && outcome.Error == "" {
+			meter := &sunnyTrafficMeter{}
+			outcome.CountryResults = map[string]string{}
+			for _, country := range trialCountries {
+				trialCtx := withSunnyTrafficMeter(context.Background(), meter)
+				proxyURL := sunnyProxyURLFromCountryGroup(candidate.Email, trialProxyGroups[country])
+				trialCtx = context.WithValue(trialCtx, sunnyTrialProxyContextKey{}, proxyURL)
+				trial, retried := checkSunnyTrialWithRetry(trialCtx, candidate.AccessToken)
+				eligibility := normalizeSunnyTrialEligibility(trial.Eligibility)
+				if country != "" && eligibility != sunnyTrialUnknown {
+					outcome.CountryResults[country] = eligibility
+				}
+				if eligibility == sunnyTrialEligible || (outcome.Eligibility != sunnyTrialEligible && eligibility == sunnyTrialIneligible) {
+					outcome.Eligibility = eligibility
+				}
+				if outcome.TrialState == "" {
+					outcome.TrialState = trial.TrialState
+				}
+				if outcome.Message == "" {
+					outcome.Message = trial.TrialMessage
+				}
+				if outcome.TrialError == "" {
+					outcome.TrialError = trial.TrialError
+				}
+				outcome.InvalidToken = outcome.InvalidToken || trial.InvalidToken
+				outcome.Retried = outcome.Retried || retried
+				if trial.InvalidToken {
+					break
+				}
+			}
+			if outcome.Eligibility == "" {
+				outcome.Eligibility = sunnyTrialUnknown
+			}
+			if outcome.Eligibility != sunnyTrialUnknown {
+				outcome.TrialError = ""
+			}
+			outcome.TrafficBytes = meter.totalBytes()
 		}
-		results := streamSunnyDetectionBatch(candidates[start:end], concurrency, func(candidate sunnyTrialCandidate) sunnyTrialResult {
-			outcome := sunnyTrialResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, SkipReason: candidate.SkipReason, Error: candidate.Error}
-			if outcome.SkipReason == "" && outcome.Error == "" {
-				meter := &sunnyTrafficMeter{}
-				outcome.CountryResults = map[string]string{}
-				for _, country := range trialCountries {
-					trialCtx := withSunnyTrafficMeter(context.Background(), meter)
-					proxyURL := sunnyProxyURLFromCountryGroup(candidate.Email, trialProxyGroups[country])
-					trialCtx = context.WithValue(trialCtx, sunnyTrialProxyContextKey{}, proxyURL)
-					trial, retried := checkSunnyTrialWithRetry(trialCtx, candidate.AccessToken)
-					eligibility := normalizeSunnyTrialEligibility(trial.Eligibility)
-					if country != "" && eligibility != sunnyTrialUnknown {
-						outcome.CountryResults[country] = eligibility
-					}
-					if eligibility == sunnyTrialEligible || (outcome.Eligibility != sunnyTrialEligible && eligibility == sunnyTrialIneligible) {
-						outcome.Eligibility = eligibility
-					}
-					if outcome.TrialState == "" {
-						outcome.TrialState = trial.TrialState
-					}
-					if outcome.Message == "" {
-						outcome.Message = trial.TrialMessage
-					}
-					if outcome.TrialError == "" {
-						outcome.TrialError = trial.TrialError
-					}
-					outcome.InvalidToken = outcome.InvalidToken || trial.InvalidToken
-					outcome.Retried = outcome.Retried || retried
-					if trial.InvalidToken {
-						break
-					}
-				}
-				if outcome.Eligibility == "" {
-					outcome.Eligibility = sunnyTrialUnknown
-				}
-				if outcome.Eligibility != sunnyTrialUnknown {
-					outcome.TrialError = ""
-				}
-				outcome.TrafficBytes = meter.totalBytes()
+		return outcome
+	})
+	for outcome := range results {
+		item := map[string]any{"session_id": outcome.SessionID, "email": outcome.Email}
+		s.recordSunnyProxyTraffic(outcome.Email, outcome.TrafficBytes)
+		item["proxy_traffic_bytes"] = outcome.TrafficBytes
+		if outcome.Retried {
+			result["retried"] = result["retried"].(int) + 1
+			item["retried"] = true
+		}
+		now := time.Now()
+		switch {
+		case outcome.SkipReason != "":
+			result["skipped"] = result["skipped"].(int) + 1
+			item["status"], item["message"] = "skipped", outcome.SkipReason
+		case outcome.Error != "":
+			result["failed"] = result["failed"].(int) + 1
+			item["status"], item["error"] = "failed", outcome.Error
+			accountUpdates := map[string]any{"trial_eligibility": sunnyTrialUnknown, "trial_check_error": outcome.Error, "trial_checked_at": now}
+			mailboxUpdates := map[string]any{"trial_eligibility": sunnyTrialUnknown, "trial_check_error": outcome.Error, "trial_checked_at": now}
+			if _, _, persistErr := s.persistSunnyTrialSidecars(candidateBySession[outcome.SessionID], outcome.CountryResults, accountUpdates, mailboxUpdates); persistErr != nil {
+				item["status"], item["error"] = "failed", persistErr.Error()
 			}
-			return outcome
-		})
-		for outcome := range results {
-			item := map[string]any{"session_id": outcome.SessionID, "email": outcome.Email}
-			s.recordSunnyProxyTraffic(outcome.Email, outcome.TrafficBytes)
-			item["proxy_traffic_bytes"] = outcome.TrafficBytes
-			if outcome.Retried {
-				result["retried"] = result["retried"].(int) + 1
-				item["retried"] = true
+		default:
+			probeEligibility := normalizeSunnyTrialEligibility(outcome.Eligibility)
+			item["trial_state"] = outcome.TrialState
+			if outcome.TrialError != "" {
+				item["trial_error"] = outcome.TrialError
 			}
-			now := time.Now()
-			switch {
-			case outcome.SkipReason != "":
-				result["skipped"] = result["skipped"].(int) + 1
-				item["status"], item["message"] = "skipped", outcome.SkipReason
-			case outcome.Error != "":
+			accountUpdates := map[string]any{
+				"trial_eligibility": probeEligibility, "trial_check_error": outcome.TrialError, "trial_checked_at": now,
+			}
+			mailboxUpdates := map[string]any{"trial_eligibility": probeEligibility, "trial_check_error": outcome.TrialError, "trial_checked_at": now}
+			countryResults, eligibility, updateErr := s.persistSunnyTrialSidecars(candidateBySession[outcome.SessionID], outcome.CountryResults, accountUpdates, mailboxUpdates)
+			if updateErr != nil {
 				result["failed"] = result["failed"].(int) + 1
-				item["status"], item["error"] = "failed", outcome.Error
-				accountUpdates := map[string]any{"trial_eligibility": sunnyTrialUnknown, "trial_check_error": outcome.Error, "trial_checked_at": now}
-				mailboxUpdates := map[string]any{"trial_eligibility": sunnyTrialUnknown, "trial_check_error": outcome.Error, "trial_checked_at": now}
-				if _, _, persistErr := s.persistSunnyTrialSidecars(candidateBySession[outcome.SessionID], outcome.CountryResults, accountUpdates, mailboxUpdates); persistErr != nil {
-					item["status"], item["error"] = "failed", persistErr.Error()
+				item["status"], item["error"] = "failed", updateErr.Error()
+			} else {
+				item["trial_eligibility"] = eligibility
+				if len(countryResults) > 0 {
+					item["trial_country_results"] = countryResults
 				}
-			default:
-				probeEligibility := normalizeSunnyTrialEligibility(outcome.Eligibility)
-				item["trial_state"] = outcome.TrialState
-				if outcome.TrialError != "" {
-					item["trial_error"] = outcome.TrialError
-				}
-				accountUpdates := map[string]any{
-					"trial_eligibility": probeEligibility, "trial_check_error": outcome.TrialError, "trial_checked_at": now,
-				}
-				mailboxUpdates := map[string]any{"trial_eligibility": probeEligibility, "trial_check_error": outcome.TrialError, "trial_checked_at": now}
-				countryResults, eligibility, updateErr := s.persistSunnyTrialSidecars(candidateBySession[outcome.SessionID], outcome.CountryResults, accountUpdates, mailboxUpdates)
-				if updateErr != nil {
+				if eligibility == sunnyTrialEligible || eligibility == sunnyTrialIneligible {
+					result[eligibility] = result[eligibility].(int) + 1
+					item["status"], item["message"] = eligibility, outcome.Message
+				} else {
 					result["failed"] = result["failed"].(int) + 1
-					item["status"], item["error"] = "failed", updateErr.Error()
-				} else {
-					item["trial_eligibility"] = eligibility
-					if len(countryResults) > 0 {
-						item["trial_country_results"] = countryResults
-					}
-					if eligibility == sunnyTrialEligible || eligibility == sunnyTrialIneligible {
-						result[eligibility] = result[eligibility].(int) + 1
-						item["status"], item["message"] = eligibility, outcome.Message
-					} else {
-						result["failed"] = result["failed"].(int) + 1
-						item["status"], item["error"] = "failed", fallback(outcome.TrialError, "无法确认试用资格")
-					}
-				}
-				if item["status"] == "failed" {
-					s.appendAccountTaskEvent(task.ID, outcome.Email, "trial", "trial.check_failed", fmt.Sprintf("账户 %s 试用资格检测失败：%s", outcome.Email, item["error"]), "warning", map[string]any{"error": item["error"]})
-				} else {
-					s.appendAccountTaskEvent(task.ID, outcome.Email, "trial", "trial.checked", fmt.Sprintf("账户 %s 试用资格检测完成：%s", outcome.Email, eligibility), "info", map[string]any{"trial_eligibility": eligibility})
-				}
-				if outcome.InvalidToken {
-					errorMessage := fallback(outcome.TrialError, "Access Token 无效或已过期")
-					s.db.Model(&SunnySession{}).Where("id = ?", outcome.SessionID).Updates(map[string]any{"access_token_status": "invalid", "access_token_error": errorMessage, "access_token_checked_at": now})
-					invalidSessions = append(invalidSessions, outcome.SessionID)
-					if outcome.AccountID != 0 && !seenAccounts[outcome.AccountID] {
-						seenAccounts[outcome.AccountID] = true
-						invalidAccounts = append(invalidAccounts, outcome.AccountID)
-					}
+					item["status"], item["error"] = "failed", fallback(outcome.TrialError, "无法确认试用资格")
 				}
 			}
-			items = append(items, item)
-			task.ProgressCurrent++
-			s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
+			if item["status"] == "failed" {
+				s.appendAccountTaskEvent(task.ID, outcome.Email, "trial", "trial.check_failed", fmt.Sprintf("账户 %s 试用资格检测失败：%s", outcome.Email, item["error"]), "warning", map[string]any{"error": item["error"]})
+			} else {
+				s.appendAccountTaskEvent(task.ID, outcome.Email, "trial", "trial.checked", fmt.Sprintf("账户 %s 试用资格检测完成：%s", outcome.Email, eligibility), "info", map[string]any{"trial_eligibility": eligibility})
+			}
+			if outcome.InvalidToken {
+				errorMessage := fallback(outcome.TrialError, "Access Token 无效或已过期")
+				s.db.Model(&SunnySession{}).Where("id = ?", outcome.SessionID).Updates(map[string]any{"access_token_status": "invalid", "access_token_error": errorMessage, "access_token_checked_at": now})
+				invalidSessions = append(invalidSessions, outcome.SessionID)
+				if outcome.AccountID != 0 && !seenAccounts[outcome.AccountID] {
+					seenAccounts[outcome.AccountID] = true
+					invalidAccounts = append(invalidAccounts, outcome.AccountID)
+				}
+			}
 		}
+		items = append(items, item)
+		task.ProgressCurrent++
+		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
 	}
 	if len(invalidAccounts) > 0 {
 		renewalAccounts := s.filterActiveSunnyRenewalAccounts(invalidAccounts)

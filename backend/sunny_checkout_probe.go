@@ -64,10 +64,6 @@ func checkSunnyCheckoutProbeWithRetry(ctx context.Context, accessToken string) (
 	return retried, true
 }
 
-func (s *Server) sunnyCheckoutProbeBatchSize() int {
-	return sunnyDetectionBatchSize("SUNNY_CHECKOUT_PROBE_BATCH_SIZE", 12, 100)
-}
-
 func (s *Server) sunnyCheckoutProbeConcurrency() int {
 	return s.sunnyConfiguredConcurrency("checkout_probe_concurrency", "SUNNY_CHECKOUT_PROBE_CONCURRENCY", 16)
 }
@@ -165,73 +161,66 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 	}
 	result := map[string]any{"requested": len(candidates), "detected": 0, "retried": 0, "skipped": 0, "failed": 0, "items": []any{}}
 	items := make([]any, 0, len(candidates))
-	batchSize := s.sunnyCheckoutProbeBatchSize()
-	for start := 0; start < len(candidates); start += batchSize {
-		end := start + batchSize
-		if end > len(candidates) {
-			end = len(candidates)
-		}
-		outcomes := streamSunnyDetectionBatch(candidates[start:end], s.sunnyCheckoutProbeConcurrency(), func(candidate sunnyCheckoutProbeCandidate) sunnyCheckoutProbeOutcome {
-			outcome := sunnyCheckoutProbeOutcome{Candidate: candidate}
-			if candidate.SkipReason != "" || candidate.Error != "" {
-				return outcome
-			}
-			meter := &sunnyTrafficMeter{}
-			ctx := withSunnyTrafficMeter(context.Background(), meter)
-			ctx = context.WithValue(ctx, sunnyCheckoutProxyContextKey{}, s.sunnyCommerceProxyURL(candidate.Email))
-			probed, retried := checkSunnyCheckoutProbeWithRetry(ctx, candidate.AccessToken)
-			outcome.CheckoutKind = normalizeSunnyCheckoutKind(probed.CheckoutKind)
-			outcome.InvalidToken = probed.InvalidToken
-			outcome.Retried = retried
-			outcome.Error = probed.CheckoutError
-			outcome.TrafficBytes = meter.totalBytes()
+	outcomes := streamSunnyWorkerPool(candidates, s.sunnyCheckoutProbeConcurrency(), func(candidate sunnyCheckoutProbeCandidate) sunnyCheckoutProbeOutcome {
+		outcome := sunnyCheckoutProbeOutcome{Candidate: candidate}
+		if candidate.SkipReason != "" || candidate.Error != "" {
 			return outcome
-		})
-		for outcome := range outcomes {
-			now := time.Now()
-			candidate := outcome.Candidate
-			item := map[string]any{"session_id": candidate.SessionID, "email": candidate.Email, "checkout_kind": outcome.CheckoutKind, "proxy_traffic_bytes": outcome.TrafficBytes}
-			s.recordSunnyProxyTraffic(candidate.Email, outcome.TrafficBytes)
-			if outcome.Retried {
-				result["retried"] = result["retried"].(int) + 1
-				item["retried"] = true
-			}
-			switch {
-			case candidate.SkipReason != "":
-				result["skipped"] = result["skipped"].(int) + 1
-				item["status"], item["message"] = "skipped", candidate.SkipReason
-			case candidate.Error != "":
-				result["failed"] = result["failed"].(int) + 1
-				item["status"], item["error"] = "failed", candidate.Error
-				if persistErr := s.persistSunnyCheckoutProbe(candidate, sunnyCheckoutUnknown, candidate.Error, now); persistErr != nil {
-					item["error"] = persistErr.Error()
-				}
-			case outcome.Error != "" || outcome.CheckoutKind == sunnyCheckoutUnknown:
-				message := fallback(outcome.Error, "无法识别 Checkout 类型")
-				result["failed"] = result["failed"].(int) + 1
-				item["status"], item["error"] = "failed", message
-				if persistErr := s.persistSunnyCheckoutProbe(candidate, sunnyCheckoutUnknown, message, now); persistErr != nil {
-					item["error"] = persistErr.Error()
-				}
-				s.appendAccountTaskEvent(task.ID, candidate.Email, "checkout", "checkout.probe_failed", fmt.Sprintf("账户 %s Checkout 探测失败：%s", candidate.Email, message), "warning", map[string]any{"error": message})
-			default:
-				if persistErr := s.persistSunnyCheckoutProbe(candidate, outcome.CheckoutKind, "", now); persistErr != nil {
-					result["failed"] = result["failed"].(int) + 1
-					item["status"], item["error"] = "failed", persistErr.Error()
-				} else {
-					result["detected"] = result["detected"].(int) + 1
-					item["status"] = "detected"
-					s.appendAccountTaskEvent(task.ID, candidate.Email, "checkout", "checkout.probed", fmt.Sprintf("账户 %s Checkout 类型探测完成：%s", candidate.Email, outcome.CheckoutKind), "info", map[string]any{"checkout_kind": outcome.CheckoutKind})
-				}
-			}
-			if outcome.InvalidToken {
-				message := fallback(outcome.Error, "Access Token 无效或已过期")
-				s.db.Model(&SunnySession{}).Where("id = ?", candidate.SessionID).Updates(map[string]any{"access_token_status": "invalid", "access_token_error": message, "access_token_checked_at": now})
-			}
-			items = append(items, item)
-			task.ProgressCurrent++
-			s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
 		}
+		meter := &sunnyTrafficMeter{}
+		ctx := withSunnyTrafficMeter(context.Background(), meter)
+		ctx = context.WithValue(ctx, sunnyCheckoutProxyContextKey{}, s.sunnyCommerceProxyURL(candidate.Email))
+		probed, retried := checkSunnyCheckoutProbeWithRetry(ctx, candidate.AccessToken)
+		outcome.CheckoutKind = normalizeSunnyCheckoutKind(probed.CheckoutKind)
+		outcome.InvalidToken = probed.InvalidToken
+		outcome.Retried = retried
+		outcome.Error = probed.CheckoutError
+		outcome.TrafficBytes = meter.totalBytes()
+		return outcome
+	})
+	for outcome := range outcomes {
+		now := time.Now()
+		candidate := outcome.Candidate
+		item := map[string]any{"session_id": candidate.SessionID, "email": candidate.Email, "checkout_kind": outcome.CheckoutKind, "proxy_traffic_bytes": outcome.TrafficBytes}
+		s.recordSunnyProxyTraffic(candidate.Email, outcome.TrafficBytes)
+		if outcome.Retried {
+			result["retried"] = result["retried"].(int) + 1
+			item["retried"] = true
+		}
+		switch {
+		case candidate.SkipReason != "":
+			result["skipped"] = result["skipped"].(int) + 1
+			item["status"], item["message"] = "skipped", candidate.SkipReason
+		case candidate.Error != "":
+			result["failed"] = result["failed"].(int) + 1
+			item["status"], item["error"] = "failed", candidate.Error
+			if persistErr := s.persistSunnyCheckoutProbe(candidate, sunnyCheckoutUnknown, candidate.Error, now); persistErr != nil {
+				item["error"] = persistErr.Error()
+			}
+		case outcome.Error != "" || outcome.CheckoutKind == sunnyCheckoutUnknown:
+			message := fallback(outcome.Error, "无法识别 Checkout 类型")
+			result["failed"] = result["failed"].(int) + 1
+			item["status"], item["error"] = "failed", message
+			if persistErr := s.persistSunnyCheckoutProbe(candidate, sunnyCheckoutUnknown, message, now); persistErr != nil {
+				item["error"] = persistErr.Error()
+			}
+			s.appendAccountTaskEvent(task.ID, candidate.Email, "checkout", "checkout.probe_failed", fmt.Sprintf("账户 %s Checkout 探测失败：%s", candidate.Email, message), "warning", map[string]any{"error": message})
+		default:
+			if persistErr := s.persistSunnyCheckoutProbe(candidate, outcome.CheckoutKind, "", now); persistErr != nil {
+				result["failed"] = result["failed"].(int) + 1
+				item["status"], item["error"] = "failed", persistErr.Error()
+			} else {
+				result["detected"] = result["detected"].(int) + 1
+				item["status"] = "detected"
+				s.appendAccountTaskEvent(task.ID, candidate.Email, "checkout", "checkout.probed", fmt.Sprintf("账户 %s Checkout 类型探测完成：%s", candidate.Email, outcome.CheckoutKind), "info", map[string]any{"checkout_kind": outcome.CheckoutKind})
+			}
+		}
+		if outcome.InvalidToken {
+			message := fallback(outcome.Error, "Access Token 无效或已过期")
+			s.db.Model(&SunnySession{}).Where("id = ?", candidate.SessionID).Updates(map[string]any{"access_token_status": "invalid", "access_token_error": message, "access_token_checked_at": now})
+		}
+		items = append(items, item)
+		task.ProgressCurrent++
+		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
 	}
 	result["items"] = items
 	task.Status = TaskSucceeded

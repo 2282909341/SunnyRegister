@@ -6,32 +6,12 @@ import (
 	"time"
 )
 
-func TestSunnyDetectionBatchSize(t *testing.T) {
-	const key = "SUNNY_TEST_DETECTION_BATCH_SIZE"
-	t.Setenv(key, "")
-	if got := sunnyDetectionBatchSize(key, 12, 100); got != 12 {
-		t.Fatalf("default batch size = %d, want 12", got)
-	}
-	t.Setenv(key, "0")
-	if got := sunnyDetectionBatchSize(key, 12, 100); got != 1 {
-		t.Fatalf("minimum batch size = %d, want 1", got)
-	}
-	t.Setenv(key, "250")
-	if got := sunnyDetectionBatchSize(key, 12, 100); got != 100 {
-		t.Fatalf("maximum batch size = %d, want 100", got)
-	}
-	t.Setenv(key, "7")
-	if got := sunnyDetectionBatchSize(key, 12, 100); got != 7 {
-		t.Fatalf("configured batch size = %d, want 7", got)
-	}
-}
-
-func TestStreamSunnyDetectionBatchLimitsConcurrencyAndStreamsResults(t *testing.T) {
+func TestStreamSunnyWorkerPoolLimitsConcurrencyAndStreamsResults(t *testing.T) {
 	candidates := []int{0, 1, 2, 3, 4, 5, 6, 7}
 	release := make(chan struct{})
 	var active int32
 	var maximum int32
-	results := streamSunnyDetectionBatch(candidates, 3, func(candidate int) int {
+	results := streamSunnyWorkerPool(candidates, 3, func(candidate int) int {
 		current := atomic.AddInt32(&active, 1)
 		for {
 			observed := atomic.LoadInt32(&maximum)
@@ -65,5 +45,55 @@ func TestStreamSunnyDetectionBatchLimitsConcurrencyAndStreamsResults(t *testing.
 	}
 	if got := atomic.LoadInt32(&maximum); got > 3 {
 		t.Fatalf("maximum concurrency = %d, want at most 3", got)
+	}
+}
+
+func TestStreamSunnyWorkerPoolRefillsFreedWorkerImmediately(t *testing.T) {
+	started := make(chan int, 3)
+	releaseFirst := make(chan struct{})
+	releaseOthers := make(chan struct{})
+	results := streamSunnyWorkerPool([]int{0, 1, 2}, 2, func(candidate int) int {
+		started <- candidate
+		if candidate == 0 {
+			<-releaseFirst
+		} else {
+			<-releaseOthers
+		}
+		return candidate
+	})
+
+	initial := map[int]bool{}
+	for len(initial) < 2 {
+		select {
+		case candidate := <-started:
+			initial[candidate] = true
+		case <-time.After(time.Second):
+			t.Fatal("initial workers did not start")
+		}
+	}
+	if !initial[0] || !initial[1] {
+		t.Fatalf("initial workers started %v, want candidates 0 and 1", initial)
+	}
+
+	close(releaseFirst)
+	select {
+	case result := <-results:
+		if result != 0 {
+			t.Fatalf("first completed result = %d, want 0", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first worker did not complete")
+	}
+	select {
+	case candidate := <-started:
+		if candidate != 2 {
+			t.Fatalf("replacement worker started candidate %d, want 2", candidate)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("next candidate did not start while another worker was still running")
+	}
+
+	close(releaseOthers)
+	for range results {
 	}
 }

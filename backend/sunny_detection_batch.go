@@ -1,23 +1,10 @@
 package main
 
 import (
-	"os"
-	"strings"
 	"sync"
 )
 
-func sunnyDetectionBatchSize(envKey string, fallback, maximum int) int {
-	value := intValue(strings.TrimSpace(os.Getenv(envKey)), fallback)
-	if value < 1 {
-		return 1
-	}
-	if value > maximum {
-		return maximum
-	}
-	return value
-}
-
-func streamSunnyDetectionBatch[Candidate any, Result any](candidates []Candidate, concurrency int, run func(Candidate) Result) <-chan Result {
+func streamSunnyWorkerPool[Candidate any, Result any](candidates []Candidate, concurrency int, run func(Candidate) Result) <-chan Result {
 	results := make(chan Result)
 	if len(candidates) == 0 {
 		close(results)

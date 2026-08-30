@@ -2906,21 +2906,19 @@ def _refresh_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[s
         f"[系统] AT 第一阶段验活完成：有效 {success}，需要恢复 {len(recovery)}，未确认 {len(errors)}",
         detail={"scope": "global", "operation": "access_token_renewal", "phase": "probe_complete", "valid": success, "login_required": len(recovery), "unconfirmed": len(errors), "proxy_scheduler": scheduler.snapshot()},
     )
-    for batch_start in range(0, len(recovery), concurrency):
-        batch = recovery[batch_start : batch_start + concurrency]
-        if not hasattr(db, "task_id"):
-            for outcome in batch:
-                account_id = int(outcome["account"].get("id") or 0)
-                single_payload = dict(probe_payloads[account_id])
-                single_payload.update({"account_ids": [account_id], "_renewal_index_offset": int(outcome["index"]), "_renewal_total": len(accounts), "_renewal_parallel": True})
-                account_ok, account_errors, account_items = _refresh_sessions_sequential(db, single_payload)
-                completed += 1
-                success += account_ok
-                errors.extend(account_errors)
-                items.extend(account_items)
-                scheduler.record(leases[account_id], success=bool(account_ok), error=account_errors[0] if account_errors else "")
-                db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
-            continue
+    if not hasattr(db, "task_id"):
+        for outcome in recovery:
+            account_id = int(outcome["account"].get("id") or 0)
+            single_payload = dict(probe_payloads[account_id])
+            single_payload.update({"account_ids": [account_id], "_renewal_index_offset": int(outcome["index"]), "_renewal_total": len(accounts), "_renewal_parallel": True})
+            account_ok, account_errors, account_items = _refresh_sessions_sequential(db, single_payload)
+            completed += 1
+            success += account_ok
+            errors.extend(account_errors)
+            items.extend(account_items)
+            scheduler.record(leases[account_id], success=bool(account_ok), error=account_errors[0] if account_errors else "")
+            db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
+    elif recovery:
         pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-renewal")
         try:
             futures = {
@@ -2931,8 +2929,8 @@ def _refresh_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[s
                     int(outcome["account"].get("id") or 0),
                     int(outcome["index"]) + 1,
                     len(accounts),
-                ): str(outcome["account"].get("email") or "")
-                for outcome in batch
+                ): outcome
+                for outcome in recovery
             }
             pending = set(futures)
             while pending:
@@ -2944,6 +2942,8 @@ def _refresh_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[s
                 if not done:
                     continue
                 for future in done:
+                    outcome = futures[future]
+                    email = str(outcome["account"].get("email") or "")
                     try:
                         _index, ok, account_errors, account_items = future.result()
                     except Exception as exc:
@@ -2951,12 +2951,12 @@ def _refresh_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[s
                             raise
                         ok = 0
                         account_items = []
-                        account_errors = [f"[{futures[future]}] AT续期并行 Worker 失败: {exc}"]
+                        account_errors = [f"[{email}] AT续期并行 Worker 失败: {exc}"]
                     completed += 1
                     success += ok
                     errors.extend(account_errors)
                     items.extend(account_items)
-                    account_id = next((int(item["account"].get("id") or 0) for item in batch if str(item["account"].get("email") or "") == futures[future]), 0)
+                    account_id = int(outcome["account"].get("id") or 0)
                     scheduler.record(leases.get(account_id, ProxyLease("", 0, "", -1)), success=bool(ok), error=account_errors[0] if account_errors else "")
                     db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
         finally:
@@ -3132,34 +3132,46 @@ def _acquire_refresh_tokens(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, 
             scheduler.record(outcome["lease"], success=False, error=error)
             db.update_task(progress_current=completed, success_count=ok, error_count=len(errors))
 
-    for batch_start in range(0, len(recovery), concurrency):
-        batch = recovery[batch_start : batch_start + concurrency]
-        if concurrency == 1 and not hasattr(db, "task_id"):
-            for outcome in batch:
-                succeeded, error, item = _acquire_refresh_token_recovery(db, outcome["payload"], outcome["account"], int(outcome["index"]), len(accounts))
-                ok += int(succeeded)
-                completed += 1
-                if error:
-                    errors.append(error)
-                items.append(item)
-                scheduler.record(outcome["lease"], success=succeeded, error=error)
-                db.update_task(progress_current=completed, success_count=ok, error_count=len(errors))
-            continue
-        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-rt-acquire") as pool:
+    if concurrency == 1 and not hasattr(db, "task_id"):
+        for outcome in recovery:
+            succeeded, error, item = _acquire_refresh_token_recovery(db, outcome["payload"], outcome["account"], int(outcome["index"]), len(accounts))
+            ok += int(succeeded)
+            completed += 1
+            if error:
+                errors.append(error)
+            items.append(item)
+            scheduler.record(outcome["lease"], success=succeeded, error=error)
+            db.update_task(progress_current=completed, success_count=ok, error_count=len(errors))
+    elif recovery:
+        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-rt-acquire")
+        try:
             futures = {
                 pool.submit(_acquire_refresh_token_isolated, db.task_id, outcome["payload"], int(outcome["account"].get("id") or 0), int(outcome["index"]), len(accounts)): outcome
-                for outcome in batch
+                for outcome in recovery
             }
-            for future, outcome in futures.items():
+            pending = set(futures)
+            while pending:
                 db.ensure_not_cancelled()
-                _index, succeeded, error, item = future.result()
-                ok += int(succeeded)
-                completed += 1
-                if error:
-                    errors.append(error)
-                items.append(item)
-                scheduler.record(outcome["lease"], success=succeeded, error=error)
-                db.update_task(progress_current=completed, success_count=ok, error_count=len(errors))
+                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    outcome = futures[future]
+                    try:
+                        _index, succeeded, error, item = future.result()
+                    except Exception as exc:
+                        if _is_cancel_exception(exc):
+                            raise
+                        email = str(outcome["account"].get("email") or "")
+                        succeeded, error = False, f"[{email}] RT 获取并行 Worker 失败：{exc}"
+                        item = {"email": email, "status": "failed", "error": str(exc)}
+                    ok += int(succeeded)
+                    completed += 1
+                    if error:
+                        errors.append(error)
+                    items.append(item)
+                    scheduler.record(outcome["lease"], success=succeeded, error=error)
+                    db.update_task(progress_current=completed, success_count=ok, error_count=len(errors))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
     db.event(
         f"[系统] RT 两阶段任务完成：成功 {ok}，失败 {len(errors)}；所有新 AT 均已二次验活",
         detail={"scope": "global", "operation": "refresh_token_acquire", "success": ok, "failed": len(errors), "proxy_scheduler": scheduler.snapshot()},
@@ -3296,32 +3308,30 @@ def _sub2_import(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[str], 
     errors: list[str] = []
     items: list[dict[str, Any]] = []
     db.update_task(progress_total=len(accounts), progress_current=0, success_count=0, error_count=0)
-    for batch_start in range(0, len(accounts), concurrency):
-        batch = accounts[batch_start:batch_start + concurrency]
-        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-sub2-import") as pool:
-            futures = {
-                pool.submit(_sub2_import_one_isolated, db.task_id, payload, int(account.get("id") or 0), batch_start + offset, len(accounts)): str(account.get("email") or "")
-                for offset, account in enumerate(batch, start=1)
-            }
-            pending = set(futures)
-            while pending:
-                if db.cancel_requested():
-                    for future in pending:
-                        future.cancel()
-                    raise SunnyTaskCancelled("Task cancelled by user")
-                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                for future in done:
-                    try:
-                        _index, account_success, account_errors, item = future.result()
-                    except Exception as exc:
-                        if _is_cancel_exception(exc):
-                            raise
-                        account_success, account_errors, item = 0, [f"[{futures[future]}] 反代并行 Worker 失败：{exc}"], {"email": futures[future], "status": "failed", "error": str(exc)}
-                    completed += 1
-                    success += account_success
-                    errors.extend(account_errors)
-                    items.append(item)
-                    db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-sub2-import") as pool:
+        futures = {
+            pool.submit(_sub2_import_one_isolated, db.task_id, payload, int(account.get("id") or 0), offset, len(accounts)): str(account.get("email") or "")
+            for offset, account in enumerate(accounts, start=1)
+        }
+        pending = set(futures)
+        while pending:
+            if db.cancel_requested():
+                for future in pending:
+                    future.cancel()
+                raise SunnyTaskCancelled("Task cancelled by user")
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    _index, account_success, account_errors, item = future.result()
+                except Exception as exc:
+                    if _is_cancel_exception(exc):
+                        raise
+                    account_success, account_errors, item = 0, [f"[{futures[future]}] 反代并行 Worker 失败：{exc}"], {"email": futures[future], "status": "failed", "error": str(exc)}
+                completed += 1
+                success += account_success
+                errors.extend(account_errors)
+                items.append(item)
+                db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
     return success, errors, items
 
 
@@ -3449,45 +3459,43 @@ def _add_login_secrets(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[
             db.update_task(progress_current=index, success_count=success, error_count=len(errors))
         return success, errors, items
 
-    for batch_start in range(0, len(accounts), concurrency):
-        batch = accounts[batch_start : batch_start + concurrency]
-        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-add-ls")
-        try:
-            futures = {
-                pool.submit(
-                    _add_login_secret_isolated,
-                    db.task_id,
-                    payload,
-                    int(account.get("id") or 0),
-                    prefiltered_count + batch_start + offset,
-                    total,
-                ): str(account.get("email") or "")
-                for offset, account in enumerate(batch, start=1)
-            }
-            pending = set(futures)
-            while pending:
-                if db.cancel_requested():
-                    for future in pending:
-                        future.cancel()
-                    raise SunnyTaskCancelled("Task cancelled by user")
-                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                for future in done:
-                    try:
-                        _index, account_success, account_errors, item = future.result()
-                    except Exception as exc:
-                        if _is_cancel_exception(exc):
-                            raise
-                        email = futures[future]
-                        account_success = 0
-                        account_errors = [f"[{email}] 添加 LS 并行 Worker 失败: {exc}"]
-                        item = {"email": email, "status": "failed", "login_secret_complete": False, "error": str(exc)}
-                    completed += 1
-                    success += account_success
-                    errors.extend(account_errors)
-                    items.append(item)
-                    db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-add-ls")
+    try:
+        futures = {
+            pool.submit(
+                _add_login_secret_isolated,
+                db.task_id,
+                payload,
+                int(account.get("id") or 0),
+                prefiltered_count + offset,
+                total,
+            ): str(account.get("email") or "")
+            for offset, account in enumerate(accounts, start=1)
+        }
+        pending = set(futures)
+        while pending:
+            if db.cancel_requested():
+                for future in pending:
+                    future.cancel()
+                raise SunnyTaskCancelled("Task cancelled by user")
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    _index, account_success, account_errors, item = future.result()
+                except Exception as exc:
+                    if _is_cancel_exception(exc):
+                        raise
+                    email = futures[future]
+                    account_success = 0
+                    account_errors = [f"[{email}] 添加 LS 并行 Worker 失败: {exc}"]
+                    item = {"email": email, "status": "failed", "login_secret_complete": False, "error": str(exc)}
+                completed += 1
+                success += account_success
+                errors.extend(account_errors)
+                items.append(item)
+                db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
     return success, errors, items
 
 
@@ -3613,44 +3621,42 @@ def _rebind_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[st
         return success, errors, items
 
     completed = 0
-    for batch_start in range(0, len(accounts), concurrency):
-        batch = accounts[batch_start : batch_start + concurrency]
-        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-rebind")
-        try:
-            futures = {
-                pool.submit(
-                    _rebind_one_isolated,
-                    db.task_id,
-                    payload,
-                    int(account.get("id") or 0),
-                    batch_start + offset,
-                    len(accounts),
-                ): str(account.get("email") or "")
-                for offset, account in enumerate(batch, start=1)
-            }
-            pending = set(futures)
-            while pending:
-                if db.cancel_requested():
-                    for future in pending:
-                        future.cancel()
-                    raise SunnyTaskCancelled("Task cancelled by user")
-                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                for future in done:
-                    email = futures[future]
-                    try:
-                        index, result = future.result()
-                        handle_result(index, result)
-                    except Exception as exc:
-                        if _is_cancel_exception(exc):
-                            raise
-                        message = f"[{email}] 邮箱换绑并行 Worker 失败：{exc}"
-                        errors.append(message)
-                        items.append({"email": email, "status": "failed", "error": str(exc)})
-                        db.event(message, "error", detail={"email": email, "module": "auth", "action": "rebind.failed"})
-                    completed += 1
-                    db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-rebind")
+    try:
+        futures = {
+            pool.submit(
+                _rebind_one_isolated,
+                db.task_id,
+                payload,
+                int(account.get("id") or 0),
+                offset,
+                len(accounts),
+            ): str(account.get("email") or "")
+            for offset, account in enumerate(accounts, start=1)
+        }
+        pending = set(futures)
+        while pending:
+            if db.cancel_requested():
+                for future in pending:
+                    future.cancel()
+                raise SunnyTaskCancelled("Task cancelled by user")
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                email = futures[future]
+                try:
+                    index, result = future.result()
+                    handle_result(index, result)
+                except Exception as exc:
+                    if _is_cancel_exception(exc):
+                        raise
+                    message = f"[{email}] 邮箱换绑并行 Worker 失败：{exc}"
+                    errors.append(message)
+                    items.append({"email": email, "status": "failed", "error": str(exc)})
+                    db.event(message, "error", detail={"email": email, "module": "auth", "action": "rebind.failed"})
+                completed += 1
+                db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
     return success, errors, items
 
 

@@ -426,10 +426,6 @@ func (s *Server) createSunnySubscriptionTask(body map[string]any) (Task, error) 
 	return s.createTask(sunnySubscriptionTaskType, "sunny", map[string]any{"session_ids": ids}, len(candidates)), nil
 }
 
-func (s *Server) sunnySubscriptionBatchSize() int {
-	return sunnyDetectionBatchSize("SUNNY_SUBSCRIPTION_BATCH_SIZE", 20, 100)
-}
-
 func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any) {
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
@@ -481,81 +477,68 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 	}
 
 	noMailCandidates := make([]sunnySubscriptionCandidate, 0, len(candidates))
-	batchSize := s.sunnySubscriptionBatchSize()
 	concurrency := s.sunnySubscriptionConcurrency()
-	for start := 0; start < len(candidates); start += batchSize {
-		end := start + batchSize
-		if end > len(candidates) {
-			end = len(candidates)
+	results := streamSunnyWorkerPool(candidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionResult {
+		if candidate.Error != "" {
+			return sunnySubscriptionResult{SessionID: candidate.SessionID, Email: candidate.Email, Error: candidate.Error}
 		}
-		results := streamSunnyDetectionBatch(candidates[start:end], concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionResult {
-			if candidate.Error != "" {
-				return sunnySubscriptionResult{SessionID: candidate.SessionID, Email: candidate.Email, Error: candidate.Error}
-			}
-			subscribed, subject, detectErr := s.detectSunnySubscriptionMail(candidate, proxyURL)
-			outcome := sunnySubscriptionResult{SessionID: candidate.SessionID, Email: candidate.Email, Subscribed: subscribed, Subject: subject}
-			if detectErr != nil {
-				outcome.Error = detectErr.Error()
-			}
-			return outcome
-		})
-		for outcome := range results {
-			item := map[string]any{"email": outcome.Email}
-			if outcome.Error != "" {
-				candidate := candidateBySession[outcome.SessionID]
-				if strings.TrimSpace(candidate.AccessToken) != "" {
-					noMailCandidates = append(noMailCandidates, candidate)
-					s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.mail_fallback", fmt.Sprintf("账户 %s 邮箱订阅检测未完成，改用 AT 兜底：%s", outcome.Email, outcome.Error), "warning", map[string]any{"error": outcome.Error})
-					continue
-				}
-				result["failed"] = result["failed"].(int) + 1
-				item["status"] = "failed"
-				item["error"] = outcome.Error
-				s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.check_failed", fmt.Sprintf("账户 %s 订阅检测失败：%s", outcome.Email, outcome.Error), "warning", map[string]any{"error": outcome.Error})
-				record(item)
+		subscribed, subject, detectErr := s.detectSunnySubscriptionMail(candidate, proxyURL)
+		outcome := sunnySubscriptionResult{SessionID: candidate.SessionID, Email: candidate.Email, Subscribed: subscribed, Subject: subject}
+		if detectErr != nil {
+			outcome.Error = detectErr.Error()
+		}
+		return outcome
+	})
+	for outcome := range results {
+		item := map[string]any{"email": outcome.Email}
+		if outcome.Error != "" {
+			candidate := candidateBySession[outcome.SessionID]
+			if strings.TrimSpace(candidate.AccessToken) != "" {
+				noMailCandidates = append(noMailCandidates, candidate)
+				s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.mail_fallback", fmt.Sprintf("账户 %s 邮箱订阅检测未完成，改用 AT 兜底：%s", outcome.Email, outcome.Error), "warning", map[string]any{"error": outcome.Error})
 				continue
 			}
-			if outcome.Subscribed {
-				item["subject"] = outcome.Subject
-				confirmPlan(candidateBySession[outcome.SessionID], "plus", item, map[string]any{"subject": outcome.Subject, "source": "mail"})
-				record(item)
-				continue
-			}
-			noMailCandidates = append(noMailCandidates, candidateBySession[outcome.SessionID])
+			result["failed"] = result["failed"].(int) + 1
+			item["status"] = "failed"
+			item["error"] = outcome.Error
+			s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.check_failed", fmt.Sprintf("账户 %s 订阅检测失败：%s", outcome.Email, outcome.Error), "warning", map[string]any{"error": outcome.Error})
+			record(item)
+			continue
 		}
+		if outcome.Subscribed {
+			item["subject"] = outcome.Subject
+			confirmPlan(candidateBySession[outcome.SessionID], "plus", item, map[string]any{"subject": outcome.Subject, "source": "mail"})
+			record(item)
+			continue
+		}
+		noMailCandidates = append(noMailCandidates, candidateBySession[outcome.SessionID])
 	}
 
 	// Mailbox lookup remains the first source of truth. Only accounts with no
 	// matching mail reach the AT fallback, which avoids renewing accounts that
 	// already have a definitive subscription confirmation.
 	invalidForRenewal := make([]sunnySubscriptionATResult, 0)
-	for start := 0; start < len(noMailCandidates); start += batchSize {
-		end := start + batchSize
-		if end > len(noMailCandidates) {
-			end = len(noMailCandidates)
+	atResults := streamSunnyWorkerPool(noMailCandidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionATResult {
+		if candidate.Error != "" {
+			return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "failed", Error: candidate.Error}
 		}
-		results := streamSunnyDetectionBatch(noMailCandidates[start:end], concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionATResult {
-			if candidate.Error != "" {
-				return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "failed", Error: candidate.Error}
-			}
-			return sunnyProbeSubscriptionAT(s, candidate, proxyURL)
-		})
-		for outcome := range results {
-			item := map[string]any{"email": outcome.Email, "source": "access_token"}
-			switch outcome.Status {
-			case "valid":
-				confirmPlan(candidateBySession[outcome.SessionID], outcome.PlanType, item, map[string]any{"source": "access_token"})
-				record(item)
-			case "invalid":
-				invalidForRenewal = append(invalidForRenewal, outcome)
-				s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.at_invalid", fmt.Sprintf("账户 %s 邮件未检测到订阅，AT 已失效，准备续期", outcome.Email), "warning", map[string]any{"error": outcome.Error})
-			default:
-				result["failed"] = result["failed"].(int) + 1
-				item["status"] = "failed"
-				item["error"] = outcome.Error
-				s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.check_failed", fmt.Sprintf("账户 %s AT 兜底检测失败：%s", outcome.Email, fallback(outcome.Error, "未得到有效 AT 响应")), "warning", map[string]any{"error": outcome.Error, "status": outcome.Status})
-				record(item)
-			}
+		return sunnyProbeSubscriptionAT(s, candidate, proxyURL)
+	})
+	for outcome := range atResults {
+		item := map[string]any{"email": outcome.Email, "source": "access_token"}
+		switch outcome.Status {
+		case "valid":
+			confirmPlan(candidateBySession[outcome.SessionID], outcome.PlanType, item, map[string]any{"source": "access_token"})
+			record(item)
+		case "invalid":
+			invalidForRenewal = append(invalidForRenewal, outcome)
+			s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.at_invalid", fmt.Sprintf("账户 %s 邮件未检测到订阅，AT 已失效，准备续期", outcome.Email), "warning", map[string]any{"error": outcome.Error})
+		default:
+			result["failed"] = result["failed"].(int) + 1
+			item["status"] = "failed"
+			item["error"] = outcome.Error
+			s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.check_failed", fmt.Sprintf("账户 %s AT 兜底检测失败：%s", outcome.Email, fallback(outcome.Error, "未得到有效 AT 响应")), "warning", map[string]any{"error": outcome.Error, "status": outcome.Status})
+			record(item)
 		}
 	}
 
