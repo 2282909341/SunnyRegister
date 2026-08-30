@@ -19,7 +19,7 @@ from email.utils import parsedate_to_datetime
 from html import escape, unescape
 from html.parser import HTMLParser
 from typing import Any, Callable
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 
 import requests
 
@@ -349,7 +349,92 @@ def _url_api_strategy(value: str) -> str:
         return "mczero"
     if hostname == "mail.ai1998.xyz" or hostname.endswith(".mail.ai1998.xyz"):
         return "ai1998"
+    if hostname == "mail.wuasai.com" or hostname.endswith(".mail.wuasai.com"):
+        return "wuasai"
     return "generic"
+
+
+def _wuasai_mail_token(value: str) -> str:
+    """Extract the mailbox token from a Token Mail URL like https://mail.wuasai.com/m/<token>."""
+    parts = [part for part in (urlparse(str(value or "")).path or "").split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() == "m":
+        return parts[1]
+    if len(parts) >= 3 and parts[-3].lower() == "mailbox" and parts[-2].lower() == "token":
+        return parts[-1]
+    return parts[-1] if parts else ""
+
+
+def _decode_wuasai_body(value: str) -> str:
+    """Decode the data: URIs Token Mail may use for message text."""
+    if not value.startswith("data:"):
+        return value
+    try:
+        meta, payload = value.split(",", 1)
+        if ";base64" in meta.lower():
+            return base64.b64decode(payload).decode("utf-8", errors="replace")
+        return unquote(payload)
+    except Exception:
+        return value
+
+
+def _wuasai_payload_message(payload: dict[str, Any], email: str) -> dict[str, Any]:
+    """Build the newest-message dict from a Token Mail /emails JSON payload."""
+    emails = payload.get("emails") if isinstance(payload, dict) else None
+    if not isinstance(emails, list):
+        emails = []
+    items: list[dict[str, Any]] = []
+    for index, raw in enumerate(emails):
+        if not isinstance(raw, dict):
+            continue
+        mail_id = str(raw.get("id") or f"idx{index}")
+        text = _decode_wuasai_body(str(raw.get("text") or raw.get("content") or raw.get("body") or ""))
+        subject = str(raw.get("subject") or "")
+        from_addr = str(raw.get("from_addr") or raw.get("from") or raw.get("sender_label") or "")
+        received_at = str(raw.get("received_at") or raw.get("time") or raw.get("date") or "")
+        plain = _html_to_text(text)
+        candidates: list[dict[str, Any]] = []
+        for cand in extract_otp_candidates(text):
+            cand = dict(cand)
+            cand["key"] = f"url-api:wuasai:{mail_id}:{cand.get('key') or f'idx{index}'}"
+            candidates.append(cand)
+        candidate = candidates[0] if candidates else None
+        relevant = bool(re.search(r"openai|chatgpt", subject + "\n" + plain, flags=re.I))
+        items.append(
+            {
+                "id": f"url-api:{mail_id}",
+                "email": email,
+                "folder": "iCloud",
+                "subject": subject or ("ChatGPT" if relevant else "Latest iCloud mail"),
+                "from": from_addr,
+                "to": email,
+                "date": received_at,
+                "body": plain,
+                "body_preview": plain[:500],
+                "raw_html": text,
+                "otp": str(candidate.get("code") or "") if candidate else "",
+                "otp_key": str(candidate.get("key") or "") if candidate else "",
+                "otp_candidates": candidates,
+                "source": "url_api",
+            }
+        )
+    if items:
+        return items[0]
+    return {
+        "id": "url-api:wuasai:empty",
+        "email": email,
+        "folder": "iCloud",
+        "subject": "Latest iCloud mail",
+        "from": "",
+        "to": email,
+        "date": "",
+        "body": "",
+        "body_preview": "",
+        "raw_html": "",
+        "otp": "",
+        "otp_key": "",
+        "otp_candidates": [],
+        "source": "url_api",
+    }
 
 
 def _html_to_text(value: str) -> str:
@@ -1671,10 +1756,54 @@ class URLAPIICloudReader:
             "source": "url_api",
         }
 
+    def _latest_wuasai(self, timeout: int = URL_API_REQUEST_TIMEOUT) -> dict[str, Any]:
+        parsed = urlparse(self.url)
+        token = _wuasai_mail_token(self.url)
+        if not token:
+            raise MailboxAccessError(
+                "mailbox_format_error",
+                "wuasai/Token Mail 取码 URL 缺少邮箱令牌（应为 https://mail.wuasai.com/m/<token>）",
+                terminal=True,
+            )
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        endpoint = f"{origin}/api/public/mailbox/{quote(token, safe='')}/emails"
+        response = self._request_url(
+            endpoint,
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            timeout=min(URL_API_REQUEST_TIMEOUT + 5, max(URL_API_REQUEST_TIMEOUT, int(timeout or 0))),
+            allow_redirects=True,
+        )
+        try:
+            if response.status_code in {401, 403, 404, 410}:
+                raise MailboxAccessError(
+                    "mailbox_credential_invalid",
+                    "url_api 取码 URL 无效、已过期或无权访问",
+                    f"HTTP {response.status_code}",
+                    terminal=True,
+                )
+            if not response.ok:
+                raise MailboxAccessError("mailbox_provider_failed", "url_api 邮箱渠道请求失败，请稍后重试", f"HTTP {response.status_code}")
+            raw_payload = getattr(response, "content", b"")
+            if isinstance(raw_payload, (bytes, bytearray)):
+                payload = json.loads(bytes(raw_payload).decode("utf-8-sig", errors="replace"))
+            else:
+                payload = response.json()
+        except MailboxAccessError:
+            raise
+        except Exception as exc:
+            raise MailboxAccessError("mailbox_service_response_invalid", "url_api 邮箱渠道返回了无法解析的响应，请稍后重试", str(exc)) from exc
+        finally:
+            response.close()
+        if not isinstance(payload, dict):
+            raise MailboxAccessError("mailbox_service_response_invalid", "url_api 邮箱渠道返回了无法解析的响应，请稍后重试")
+        return _wuasai_payload_message(payload, self.account.email)
+
     def _latest(self, timeout: int = URL_API_REQUEST_TIMEOUT, strategy: str | None = None) -> dict[str, Any]:
         selected = strategy or getattr(self, "strategy", "generic")
         if selected == "mczero":
             return self._latest_mczero(timeout)
+        if selected == "wuasai":
+            return self._latest_wuasai(timeout)
         return self._latest_generic(timeout, latest_card_only=selected == "ai1998")
 
     def _request_url(
