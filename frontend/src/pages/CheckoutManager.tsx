@@ -805,7 +805,11 @@ export default function CheckoutManager() {
       setLinkType(value);
     }
     const provider = providers.find((item) => item.value === value);
-    if (provider) { setCountry(provider.country); setCurrency(provider.currency); }
+    if (provider) {
+      setCountry(provider.country);
+      setCurrency(provider.currency);
+      setPromoCountry(provider.country);
+    }
   }
   async function precheck() {
     const effectivePromotionProxies = linkType === "gcash" ? checkoutProxies : promotionProxies;
