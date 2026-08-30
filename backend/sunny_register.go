@@ -4065,7 +4065,7 @@ func toInt(v any) int {
 
 func defaultProxyConfig() map[string]any {
 	return map[string]any{
-		"proxy_enabled": true, "local_proxy": "http://127.0.0.1:7897", "register_proxy": "", "provider_configs": []any{}, "precheck": true, "sid_mode": "random",
+		"proxy_enabled": true, "local_proxy": "http://127.0.0.1:7890", "register_proxy": "", "provider_configs": []any{}, "precheck": true, "sid_mode": "random",
 		"browser_traffic_optimization": map[string]any{
 			"enabled": true, "block_heavy_resources": true, "static_cache_enabled": true,
 			"cache_ttl_hours": 168, "cache_max_mib": 256, "cache_object_max_mib": 8,
@@ -6023,7 +6023,7 @@ func (s *Server) sunnyTaskProxySnapshot(payload map[string]any) map[string]any {
 	cfg := s.sunnyGetConfig(sunnyCfgProxy, defaultProxyConfig())
 	stats := s.sunnyProxyStats()
 	proxyEnabled := boolValue(cfg["proxy_enabled"], true)
-	localProxy := normalizeSunnyProxyAddress(fallback(text(cfg["local_proxy"]), "http://127.0.0.1:7897"))
+	localProxy := normalizeSunnyProxyAddress(fallback(text(cfg["local_proxy"]), "http://127.0.0.1:7890"))
 	next["proxy_enabled"] = proxyEnabled
 	next["proxy_stats"] = stats
 	browserTrafficConfig := map[string]any{}
