@@ -72,7 +72,9 @@ def test_sentinel_runtime_disables_default_viewport_for_camoufox_context() -> No
 def test_sentinel_node_runtime_builds_headers_and_reuses_requirements_proof() -> None:
     with patch("sunny_core.sentinel.shutil.which", return_value="node"):
         runtime = SentinelNodeRuntime(object())
-    with patch.object(runtime, "_run", side_effect=[{"request_p": "requirements"}, {"final_p": None, "t": "", "so": None}]):
+    with patch.object(runtime, "_run", return_value={"request_p": "requirements"}), patch.object(
+        runtime, "_v8_request", return_value={"p": None, "t": "", "so": None}
+    ):
         assert runtime.requirements_token() == "requirements"
         headers = runtime.build_headers(
             challenge_payload={"token": "challenge", "turnstile": {"required": False}},

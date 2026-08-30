@@ -4,6 +4,8 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from sunny_core import mailbox as mailbox_module
 from sunny_core import domain_mail_cleanup as cleanup_module
 from sunny_core import rebind as rebind_module
@@ -226,6 +228,33 @@ def test_rebind_begin_retries_transient_network_error():
     assert rebind_module._begin_with_retry(Client(), "new@example.com", logs.append) == {"success": True}
     assert calls == ["new@example.com", "new@example.com"]
     assert any("瞬时网络错误" in message for message in logs)
+
+
+def test_rebind_begin_403_is_classified_as_rejected_mailbox():
+    class Response:
+        status_code = 403
+        text = '{"error":"email is not eligible"}'
+        url = "https://chatgpt.com/backend-api/accounts/change_email/begin"
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {"error": "email is not eligible"}
+
+    class Session:
+        class Cookies:
+            jar = []
+
+        cookies = Cookies()
+
+        @staticmethod
+        def request(*_args, **_kwargs):
+            return Response()
+
+    flow = type("Flow", (), {"session": Session(), "device_id": "device", "_last_access_token": "access"})()
+    client = rebind_module.ChangeEmailClient(flow, "account", lambda _message: None)
+    with pytest.raises(rebind_module.RebindMailboxRejected):
+        client.begin("candidate@example.com")
 
 
 def test_failed_domain_mailbox_retention_defaults_to_enabled():

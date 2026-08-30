@@ -27,19 +27,24 @@ VERIFY_PATH = "/backend-api/accounts/change_email/verify"
 # Keep the account API headers aligned with the current ChatGPT web client. A
 # stale build can still return HTTP 200 while not starting the email delivery
 # workflow, which leaves the mailbox listener waiting until it times out.
-CLIENT_VERSION = "prod-180ca8b8699a733aef330b7026892aee9bf85fbe"
-CLIENT_BUILD = "9758774"
+CLIENT_VERSION = os.getenv("OPENAI_CLIENT_VERSION", "prod-7890a3be6202572c0e8e3bb4907574d660b4e4f4")
+CLIENT_BUILD = os.getenv("OPENAI_CLIENT_BUILD", "10012890")
 # CloudMail pickup is near real time. If no message arrives quickly, resend the
 # accepted request twice instead of spending several minutes polling an empty
 # mailbox: 20s + resend + 45s + resend + 45s.
 REBIND_OTP_FIRST_WAIT_SECONDS = 20
 REBIND_OTP_SECOND_WAIT_SECONDS = 45
 REBIND_OTP_FINAL_WAIT_SECONDS = 45
+REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS = 5
 _DOMAIN_ROTATION = itertools.count()
 
 
 class RebindError(RuntimeError):
     pass
+
+
+class RebindMailboxRejected(RebindError):
+    """OpenAI rejected the current replacement mailbox in ``begin``."""
 
 
 def _is_retryable_rebind_error(error: Exception) -> bool:
@@ -125,7 +130,21 @@ class ChangeEmailClient:
         request_suffix = f"，request_id={request_id}" if request_id else ""
         self.log(f"[换绑接口] {method} {path} -> HTTP {response.status_code}（耗时 {time.monotonic() - started:.1f}s{request_suffix}）")
         if response.status_code < 200 or response.status_code >= 300:
-            if response.status_code in {401, 403} or "reauth" in body.lower() or "recent" in body.lower():
+            auth_error = any(
+                marker in body.lower()
+                for marker in (
+                    "reauth",
+                    "sign-in session",
+                    "session is no longer valid",
+                    "token_invalid",
+                    "token invalid",
+                    "unauthorized",
+                    "authentication required",
+                )
+            )
+            if path == BEGIN_PATH and response.status_code == 403 and not auth_error:
+                raise RebindMailboxRejected(f"换绑邮箱被 OpenAI 拒绝：HTTP 403 {body}")
+            if response.status_code in {401, 403} or auth_error or "recent" in body.lower():
                 raise RebindError(f"换绑接口需要重新认证：HTTP {response.status_code} {body}")
             raise RebindError(f"换绑接口 {path} 失败：HTTP {response.status_code} {body}")
         try:
@@ -478,6 +497,26 @@ def _handle_failed_domain_mailbox(
         log(f"[{old_email}] 失败邮箱清理未完全完成：{cleanup_exc}")
 
 
+def _discard_rejected_domain_mailbox(
+    db: SunnyDB,
+    email: str,
+    pickup_token_hash: str,
+    log: Callable[[str], None],
+) -> None:
+    """Always discard a mailbox rejected by ``change_email/begin``.
+
+    The retention switch is intended for ordinary task failures. A 403 at
+    ``begin`` means OpenAI will not send a code to this candidate, so retaining
+    it would only fill CloudMail/D1 with unusable addresses.
+    """
+    cfg = dict(db.get_config("domain_mailbox") or {})
+    cfg["retain_failed_mailboxes"] = False
+    try:
+        cleanup_failed_mailbox(db, cfg, email, pickup_token_hash, log)
+    except Exception as cleanup_exc:
+        log(f"[{email}] OpenAI 拒绝的候选邮箱清理未完全完成：{cleanup_exc}")
+
+
 def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callable[[str], None]) -> dict[str, Any]:
     old_email = str(account_row.get("email") or "").strip()
     if not old_email:
@@ -502,34 +541,64 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
         client = ChangeEmailClient(old_flow, str(old_result.get("account_id") or ""), log)
         client.set_access_token(str(old_result.get("access_token") or ""))
         client.eligibility()
-        new_email, new_api, new_api_token_hash = _domain_mailbox(db, log)
-        # Register the one-time pickup credential before ChatGPT sends the verification mail.
-        # The public pickup endpoint validates the token against this database row.
-        db.persist_rebind_pending(new_email, new_api, new_api_token_hash)
-        reader_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api)
-        reader = DomainMailReader(reader_account, log)
-        try:
-            reader.connect()
-            issued_after = time.time()
-            log(f"[{old_email}] 已建立换绑邮箱取件监听，准备请求 ChatGPT 发送验证码")
+        reader = None
+        candidate_error: Exception | None = None
+        for candidate_index in range(REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS):
+            new_email, new_api, new_api_token_hash = _domain_mailbox(db, log)
+            # Register the one-time pickup credential before ChatGPT sends the
+            # verification mail. The public pickup endpoint validates this row.
+            db.persist_rebind_pending(new_email, new_api, new_api_token_hash)
+            reader_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api)
+            candidate_reader = DomainMailReader(reader_account, log)
+            accepted = False
             try:
-                _begin_with_retry(client, new_email, log)
-                log(f"[{old_email}] ChatGPT 换绑验证码请求已接受，等待新邮箱验证码")
-            except RebindError as exc:
-                if "重新认证" not in str(exc):
-                    raise
-                previous_flow = old_flow
-                old_flow, old_result = _login_flow(account, proxy, log, keep_session=True, should_cancel=db.cancel_requested)
-                _persist_login_result(db, old_email, mailbox, old_result, log)
+                candidate_reader.connect()
+                issued_after = time.time()
+                log(f"[{old_email}] 已建立换绑邮箱取件监听（候选 {candidate_index + 1}/{REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS}），准备请求 ChatGPT 发送验证码")
                 try:
-                    if previous_flow and previous_flow.session:
-                        previous_flow.session.close()
-                except Exception:
-                    pass
-                client = ChangeEmailClient(old_flow, str(old_result.get("account_id") or ""), log)
-                client.set_access_token(str(old_result.get("access_token") or ""))
-                _begin_with_retry(client, new_email, log)
-                log(f"[{old_email}] 重新认证后已重新提交换绑验证码请求，等待新邮箱验证码")
+                    _begin_with_retry(client, new_email, log)
+                except RebindMailboxRejected as exc:
+                    candidate_error = exc
+                    log(f"[{old_email}] 换绑邮箱 {new_email} 的验证码请求被 HTTP 403 拒绝，立即删除并更换下一个候选邮箱")
+                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                    new_email = new_api = new_api_token_hash = ""
+                    continue
+                except RebindError as exc:
+                    if "重新认证" not in str(exc):
+                        raise
+                    previous_flow = old_flow
+                    old_flow, old_result = _login_flow(account, proxy, log, keep_session=True, should_cancel=db.cancel_requested)
+                    _persist_login_result(db, old_email, mailbox, old_result, log)
+                    try:
+                        if previous_flow and previous_flow.session:
+                            previous_flow.session.close()
+                    except Exception:
+                        pass
+                    client = ChangeEmailClient(old_flow, str(old_result.get("account_id") or ""), log)
+                    client.set_access_token(str(old_result.get("access_token") or ""))
+                    try:
+                        _begin_with_retry(client, new_email, log)
+                    except RebindMailboxRejected as rejected_exc:
+                        candidate_error = rejected_exc
+                        log(f"[{old_email}] 重新认证后候选邮箱 {new_email} 仍被 HTTP 403 拒绝，立即删除并更换下一个候选邮箱")
+                        _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                        new_email = new_api = new_api_token_hash = ""
+                        continue
+                    log(f"[{old_email}] 重新认证后已重新提交换绑验证码请求，等待新邮箱验证码")
+                log(f"[{old_email}] ChatGPT 换绑验证码请求已接受，等待新邮箱验证码")
+                reader = candidate_reader
+                accepted = True
+                break
+            finally:
+                if not accepted:
+                    candidate_reader.close()
+        if reader is None:
+            if candidate_error is not None:
+                raise RebindError(
+                    f"连续 {REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS} 个候选换绑邮箱均被 OpenAI 的 begin 接口拒绝"
+                ) from candidate_error
+            raise RebindError("未能建立可用的换绑邮箱取件监听")
+        try:
             code = _wait_for_rebind_code(reader, client, new_email, issued_after, log)
         finally:
             reader.close()

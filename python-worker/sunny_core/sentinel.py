@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import random
@@ -11,6 +12,7 @@ import threading
 import tempfile
 import time
 import uuid
+import queue
 from typing import Any, Callable
 
 from .proxy import playwright_proxy
@@ -371,8 +373,18 @@ class SentinelNodeRuntime:
         self._script = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "tools", "pay153_checkout", "gen_token_jsdom.js")
         )
-        if not os.path.isfile(self._script):
-            raise RuntimeError(f"Sentinel Node VM script not found: {self._script}")
+        self._server_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "tools", "pay153_checkout", "sentinel_vm", "sentinel-server.js")
+        )
+        if not os.path.isfile(self._script) or not os.path.isfile(self._server_script):
+            raise RuntimeError("Sentinel Node VM scripts are missing from the deployment")
+        self._server_dir = os.path.dirname(self._server_script)
+        self._sdk_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "tools", "pay153_checkout", "sentinel_sdk_full.js")
+        )
+        self._server_process: subprocess.Popen[str] | None = None
+        self._server_port = 0
+        self._server_lock = threading.Lock()
         self.log("[认证] Sentinel Node V8 运行时已就绪；证明生成不经过 Firefox Xray")
 
     def _check_cancelled(self) -> None:
@@ -439,19 +451,26 @@ class SentinelNodeRuntime:
         flow: str,
     ) -> dict[str, str]:
         del enforcement
-        result = self._run(
+        challenge = dict(challenge_payload)
+        challenge["_python_proof"] = cached_proof
+        result = self._v8_request(
             {
-                "action": "solve",
-                "chatReq": challenge_payload,
-                "cachedProof": cached_proof,
-                "deviceId": device_id,
+                "challenge": challenge,
                 "flow": flow,
-                "userAgent": SENTINEL_USER_AGENT,
+                "device_id": device_id,
+                "user_agent": SENTINEL_USER_AGENT,
+                "page_url": "https://auth.openai.com/about-you",
+                "script_src": SENTINEL_SDK_URL,
+                "sdk": self._sdk_path if os.path.isfile(self._sdk_path) else None,
+                "width": 1920,
+                "height": 1080,
+                "cores": 8,
+                "language": "ja-JP",
+                "languages": "ja-JP,ja,en",
+                "no_cookie": True,
             }
         )
-        # The SDK returns null when the endpoint did not request a second PoW;
-        # in that case the official client reuses the requirements proof.
-        final_p = str(result.get("final_p") or cached_proof or "").strip()
+        final_p = str(result.get("p") or cached_proof or "").strip()
         if final_p != str(cached_proof or "").strip() and not final_p.startswith("gAAAAAB"):
             raise RuntimeError("Sentinel Node SDK returned an invalid enforcement token")
         turnstile = challenge_payload.get("turnstile") if isinstance(challenge_payload.get("turnstile"), dict) else {}
@@ -484,8 +503,104 @@ class SentinelNodeRuntime:
                 )
         return headers
 
+    def _ensure_v8_server(self) -> None:
+        if self._server_process is not None and self._server_process.poll() is None and self._server_port:
+            return
+        with self._server_lock:
+            if self._server_process is not None and self._server_process.poll() is None and self._server_port:
+                return
+            self._stop_v8_server()
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            process = subprocess.Popen(
+                [self._node, self._server_script],
+                cwd=self._server_dir,
+                env={**os.environ, "SENTINEL_SERVER_PORT": "0"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creation_flags,
+            )
+            self._server_process = process
+            if process.stderr is not None:
+                def drain_stderr(stream: Any) -> None:
+                    for _line in stream:
+                        pass
+
+                threading.Thread(
+                    target=drain_stderr,
+                    args=(process.stderr,),
+                    daemon=True,
+                    name="sentinel-v8-stderr",
+                ).start()
+            ready: queue.Queue[str] = queue.Queue(maxsize=1)
+
+            def read_ready() -> None:
+                line = process.stdout.readline() if process.stdout else ""
+                try:
+                    ready.put_nowait(line)
+                except queue.Full:
+                    pass
+
+            threading.Thread(target=read_ready, daemon=True, name="sentinel-v8-ready").start()
+            try:
+                line = ready.get(timeout=15)
+                payload = json.loads(line)
+                port = int(payload.get("port") or 0)
+                if not payload.get("ready") or port <= 0:
+                    raise RuntimeError("invalid Sentinel V8 server ready response")
+                self._server_port = port
+            except Exception as exc:
+                self._stop_v8_server()
+                raise RuntimeError(f"Sentinel V8 server failed to start: {exc}") from exc
+
+    def _stop_v8_server(self) -> None:
+        process = self._server_process
+        self._server_process = None
+        self._server_port = 0
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except OSError:
+                pass
+
+    def _v8_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_v8_server()
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", self._server_port, timeout=60)
+            try:
+                connection.request("POST", "/token", body=body, headers={"content-type": "application/json", "content-length": str(len(body))})
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8", errors="replace")
+            finally:
+                connection.close()
+            data = json.loads(raw)
+            if response.status >= 400 or not data.get("ok"):
+                raise RuntimeError(str(data.get("error") or f"Sentinel V8 HTTP {response.status}"))
+            token = json.loads(str(data.get("token") or "{}"))
+            if not isinstance(token, dict):
+                raise RuntimeError("Sentinel V8 server returned an invalid token")
+            return token
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            with self._server_lock:
+                self._stop_v8_server()
+            raise RuntimeError(f"Sentinel V8 worker request failed: {exc}") from exc
+
     def close(self) -> None:
-        return None
+        with self._server_lock:
+            self._stop_v8_server()
 
 
 def browser_fetch(
