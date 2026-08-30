@@ -17,6 +17,8 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from curl_cffi import requests as curl_requests
 
+from .ca_bundle import ca_bundle_path
+
 
 AUTH_API_BASE = "https://auth.openai.com/api/accounts"
 AUTH_MODE = "agentIdentity"
@@ -97,7 +99,7 @@ def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
 
 def _session(proxy_url: str):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    return curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=30)
+    return curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=30, verify=ca_bundle_path())
 
 
 def _response_error(response, action: str) -> RuntimeError:

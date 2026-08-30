@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlencode, urlsplit
 
 from .auth_challenges import generate_totp
 from .browser_traffic import ProxyTrafficMeter, _response_body_bytes, suspend_http_traffic_hook
+from .ca_bundle import ca_bundle_path
 from .mailbox import MailAccount, create_mailbox_reader
 from .proxy import normalize_proxy_url
 from .sentinel import (
@@ -308,6 +309,7 @@ class ProtocolRegistrationFlow:
             impersonate="chrome136",
             proxies=proxies,
             timeout=30,
+            verify=ca_bundle_path(),
         )
         session.headers.update(
             {

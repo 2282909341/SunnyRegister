@@ -9,6 +9,7 @@ from typing import Any
 from curl_cffi import requests as curl_requests
 
 from .browser_traffic import ProxyTrafficMeter, use_traffic_meter
+from .ca_bundle import ca_bundle_path
 
 try:
     from tools.pay153_checkout.paypal_routing import session_checkout_kind
@@ -90,7 +91,7 @@ def _request_with_retry(request: Any) -> Any:
 
 
 def _session(proxy_url: str) -> Any:
-    session = curl_requests.Session(impersonate="firefox144")
+    session = curl_requests.Session(impersonate="firefox144", verify=ca_bundle_path())
     try:
         session.trust_env = False
     except Exception:

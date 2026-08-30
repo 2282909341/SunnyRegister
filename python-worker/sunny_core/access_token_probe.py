@@ -5,6 +5,7 @@ from typing import Any
 from curl_cffi import requests as curl_requests
 
 from .browser_traffic import ProxyTrafficMeter, use_traffic_meter
+from .ca_bundle import ca_bundle_path
 
 
 MODELS_URL = "https://chatgpt.com/backend-api/models"
@@ -53,7 +54,7 @@ def _classify(response) -> dict[str, Any]:
 
 def _request(access_token: str, proxy_url: str) -> dict[str, Any]:
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    session = curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=18)
+    session = curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=18, verify=ca_bundle_path())
     try:
         response = session.get(
             MODELS_URL,
