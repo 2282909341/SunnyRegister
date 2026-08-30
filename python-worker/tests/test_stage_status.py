@@ -1974,6 +1974,29 @@ class AddLoginSecretTaskTests(unittest.TestCase):
         self.assertEqual((success, errors, item["status"]), (0, [], "skipped"))
         run_one.assert_not_called()
 
+    def test_password_only_account_is_sent_to_runtime_for_2fa_setup(self):
+        db = MagicMock()
+        db.fetch_mailbox_by_email.return_value = {
+            "id": 11,
+            "email": "user@example.com",
+            "status": "已注册",
+            "chat_gpt_password": "chatgpt-password",
+            "totp_secret": "",
+        }
+        with patch.object(worker, "_run_one", return_value=(True, {"login_secret_complete": True})) as run_one:
+            success, errors, item = worker._add_login_secret_account(
+                db,
+                {},
+                {"id": 7, "email": "user@example.com"},
+                1,
+                1,
+            )
+
+        self.assertEqual((success, errors, item["status"]), (1, [], "success"))
+        run_one.assert_called_once()
+        runtime_mailbox = run_one.call_args.args[3]
+        self.assertEqual(runtime_mailbox["chat_gpt_password"], "chatgpt-password")
+
     def test_default_concurrency_is_one_and_a_half_times_cpu_count(self):
         db = MagicMock()
         db.task_id = "task-add-ls"

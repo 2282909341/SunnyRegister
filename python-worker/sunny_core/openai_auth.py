@@ -651,7 +651,10 @@ class OpenAIEmailRegisterFlow:
             self.log(f"[认证] 执行方式：{mode_label}")
             if self.existing_account:
                 if self._uses_login_secret():
-                    self.log("[认证] 检测到完整 LS，本次优先使用 ChatGPT 密码与 2FA 登录")
+                    if self.account.has_login_secret:
+                        self.log("[认证] 检测到完整 LS，本次优先使用 ChatGPT 密码与 2FA 登录")
+                    else:
+                        self.log("[认证] 检测到已保存 ChatGPT 密码，本次优先使用密码登录")
                 elif not self.prefer_login_secret and self.account.has_login_secret:
                     self.log("[认证] LS 登录未完成，本次回退使用邮箱凭证登录")
                 else:
@@ -2021,7 +2024,7 @@ class OpenAIEmailRegisterFlow:
         return bool(self._visible_inputs(page, ['input[type="password"]', 'input[name="password"]']))
 
     def _uses_login_secret(self) -> bool:
-        return bool(self.existing_account and self.prefer_login_secret and self.account.has_login_secret)
+        return bool(self.existing_account and self.prefer_login_secret and self.account.has_chatgpt_password)
 
     def _login_secret_rejection(self, page) -> str:
         if not self.login_secret_stage:
@@ -3522,7 +3525,7 @@ def login_or_register(account: MailAccount, proxy_url: str = "", headless: bool 
             account, proxy_url, headless, log, prefer_login_secret=True, **retry_kwargs,
         ).run()
     except LoginSecretAuthenticationError as exc:
-        if not existing_account or not account.has_login_secret:
+        if not existing_account or not account.has_chatgpt_password:
             raise
         if any(marker in str(exc).lower() for marker in _ACCOUNT_DEACTIVATED_MARKERS):
             raise

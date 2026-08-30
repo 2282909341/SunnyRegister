@@ -284,7 +284,7 @@ class ProtocolRegistrationFlow:
         """Return whether this auth attempt may need an email OTP reader."""
         return (
             not self.skip_mailbox
-            and (not self.existing_account or not self.account.has_login_secret)
+            and (not self.existing_account or not self.account.has_chatgpt_password)
             and not (
                 self.account.mailbox_type == "apple"
                 and self.account.mailbox_channel == "url_api"
@@ -1204,11 +1204,13 @@ class ProtocolRegistrationFlow:
         if self.existing_account:
             if self.account.has_login_secret:
                 self.log("[认证] 检测到完整 LS，协议登录优先使用 ChatGPT 密码与 2FA")
+            elif self.account.has_chatgpt_password:
+                self.log("[认证] 检测到已保存 ChatGPT 密码，协议登录优先使用密码")
             else:
                 self.log("[认证] 未检测到完整 LS，协议登录使用邮箱凭证")
         try:
             self._check_cancelled()
-            # A complete LS login (password + TOTP) never needs the mailbox.
+            # A saved ChatGPT password can authenticate without an email OTP.
             # Do not connect or poll the mailbox speculatively; only create the
             # reader after the auth state explicitly enters email OTP.
             if self._needs_mailbox_reader():
@@ -1240,7 +1242,7 @@ class ProtocolRegistrationFlow:
                 continue_url = str(state.get("continue_url") or continue_url)
             elif page_type in {"login_password"}:
                 self.auth_action = "login"
-                if self.account.has_login_secret:
+                if self.account.has_chatgpt_password:
                     try:
                         state = self._verify_login_password(continue_url or self.auth_page_url)
                         login_secret_attempted = True

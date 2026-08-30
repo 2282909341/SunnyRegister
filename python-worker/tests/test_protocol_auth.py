@@ -141,13 +141,13 @@ def test_complete_ls_protocol_login_does_not_connect_mailbox_reader() -> None:
     assert flow._needs_mailbox_reader() is False
 
 
-def test_mailbox_protocol_login_still_connects_reader_when_ls_is_incomplete() -> None:
+def test_mailbox_protocol_login_skips_reader_when_password_is_available() -> None:
     account = MailAccount(
         "user@outlook.com", "mail-password", "client", "refresh", "raw",
         chatgpt_password="ChatGPT-password",
     )
     flow = ProtocolRegistrationFlow(account, existing_account=True)
-    assert flow._needs_mailbox_reader() is True
+    assert flow._needs_mailbox_reader() is False
 
 
 def test_remail_registration_disallowed_uses_long_bounded_backoff() -> None:
@@ -525,7 +525,7 @@ def test_protocol_password_verification_uses_har_sentinel_flow() -> None:
     assert json.loads(request[2]["data"]) == {"password": "ChatGPT-password"}
 
 
-def test_protocol_incomplete_login_secret_uses_mailbox_otp() -> None:
+def test_protocol_password_only_login_uses_saved_password_before_adding_2fa() -> None:
     account = MailAccount(
         "user@outlook.com", "mail-password", "client", "refresh", "raw",
         chatgpt_password="ChatGPT-password",
@@ -545,6 +545,7 @@ def test_protocol_incomplete_login_secret_uses_mailbox_otp() -> None:
         "continue_url": "https://auth.openai.com/log-in/password",
     }
     flow._verify_email = Mock(return_value={"page": {"type": "login_success"}, "continue_url": "https://chatgpt.com/callback"})
+    flow._verify_login_password = Mock(return_value={"page": {"type": "login_success"}, "continue_url": "https://chatgpt.com/callback"})
     flow._finish_session = lambda _url: {
         "access_token": "access", "session_json": {"accessToken": "access"},
         "auth_action": "login", "protocol_traffic": flow.traffic.snapshot(),
@@ -554,7 +555,8 @@ def test_protocol_incomplete_login_secret_uses_mailbox_otp() -> None:
         result = flow.run()
 
     assert result["access_token"] == "second-access"
-    flow._verify_email.assert_called_once()
+    flow._verify_login_password.assert_called_once()
+    flow._verify_email.assert_not_called()
     callback.assert_called_once()
 
 

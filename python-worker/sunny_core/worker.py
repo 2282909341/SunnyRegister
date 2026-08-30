@@ -3356,7 +3356,9 @@ def _add_login_secret_account(
             detail={"email": email, "scope": "selected", "account_deactivated": True, "skipped": True},
         )
         return 0, [], {"email": email, "status": "skipped", "login_secret_complete": False, "reason": "account_deactivated"}
-    chatgpt_password = str(mailbox.get("chat_gpt_password") or "").strip()
+    # The mailbox table uses chat_gpt_password; accept the legacy alias as
+    # well so accounts imported from older records retain their password.
+    chatgpt_password = str(mailbox.get("chat_gpt_password") or mailbox.get("chatgpt_password") or "").strip()
     totp_secret = str(mailbox.get("totp_secret") or "").strip()
     if chatgpt_password and totp_secret:
         db.event(f"[{email}] [登录密钥] 已存在完整 LS，跳过重复设置", detail={"email": email, "scope": "selected"})

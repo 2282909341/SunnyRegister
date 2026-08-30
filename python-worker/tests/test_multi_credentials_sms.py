@@ -363,7 +363,7 @@ def test_browser_password_login_uses_exact_imported_password() -> None:
     assert account.chatgpt_password == "Short1!"
 
 
-def test_browser_password_login_requires_complete_login_secret() -> None:
+def test_browser_password_login_uses_saved_password_without_2fa() -> None:
     password_only = MailAccount(
         "user@example.com", "mailbox-password", "client", "mail-rt", "raw",
         chatgpt_password="Short1!",
@@ -373,7 +373,7 @@ def test_browser_password_login_requires_complete_login_secret() -> None:
         totp_secret="JBSWY3DPEHPK3PXP",
     )
 
-    assert OpenAIEmailRegisterFlow(password_only, "", True, None, existing_account=True)._uses_login_secret() is False
+    assert OpenAIEmailRegisterFlow(password_only, "", True, None, existing_account=True)._uses_login_secret() is True
     assert OpenAIEmailRegisterFlow(totp_only, "", True, None, existing_account=True)._uses_login_secret() is False
 
 
