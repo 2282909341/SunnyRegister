@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -213,7 +214,7 @@ func TestSunnySubscriptionTaskPersistsCompletedAccountBeforeBatchFinishes(t *tes
 	}
 	t.Cleanup(func() { sunnyDetectSubscriptionMail = previousDetect })
 	previousProbe := sunnyProbeSubscriptionAT
-	sunnyProbeSubscriptionAT = func(_ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
+	sunnyProbeSubscriptionAT = func(_ context.Context, _ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
 		return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "valid", PlanType: "free"}
 	}
 	t.Cleanup(func() { sunnyProbeSubscriptionAT = previousProbe })
@@ -271,7 +272,7 @@ func TestSunnySubscriptionTaskKeepsPlanWhenNoMailMatches(t *testing.T) {
 	sunnyDetectSubscriptionMail = func(sunnySubscriptionCandidate, string) (bool, string, error) { return false, "", nil }
 	t.Cleanup(func() { sunnyDetectSubscriptionMail = previousDetect })
 	previousProbe := sunnyProbeSubscriptionAT
-	sunnyProbeSubscriptionAT = func(_ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
+	sunnyProbeSubscriptionAT = func(_ context.Context, _ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
 		return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "valid", PlanType: "team"}
 	}
 	t.Cleanup(func() { sunnyProbeSubscriptionAT = previousProbe })
@@ -297,7 +298,7 @@ func TestSunnySubscriptionTaskUsesAccessTokenFallbackWhenMailDoesNotMatch(t *tes
 	sunnyDetectSubscriptionMail = func(sunnySubscriptionCandidate, string) (bool, string, error) { return false, "", nil }
 	t.Cleanup(func() { sunnyDetectSubscriptionMail = previousDetect })
 	previousProbe := sunnyProbeSubscriptionAT
-	sunnyProbeSubscriptionAT = func(_ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
+	sunnyProbeSubscriptionAT = func(_ context.Context, _ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
 		return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "valid", PlanType: "plus"}
 	}
 	t.Cleanup(func() { sunnyProbeSubscriptionAT = previousProbe })
@@ -348,7 +349,7 @@ func TestSunnySubscriptionBatchUsesSameMailThenAccessTokenFallback(t *testing.T)
 	sunnyDetectSubscriptionMail = func(sunnySubscriptionCandidate, string) (bool, string, error) { return false, "", nil }
 	t.Cleanup(func() { sunnyDetectSubscriptionMail = previousDetect })
 	previousProbe := sunnyProbeSubscriptionAT
-	sunnyProbeSubscriptionAT = func(_ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
+	sunnyProbeSubscriptionAT = func(_ context.Context, _ *Server, candidate sunnySubscriptionCandidate, _ string) sunnySubscriptionATResult {
 		plan := "free"
 		if candidate.SessionID == first.ID {
 			plan = "plus"

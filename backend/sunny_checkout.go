@@ -513,6 +513,8 @@ func (s *Server) executeSunnyCheckoutTask(task *Task, payload map[string]any) {
 	task.StartedAt.Valid = true
 	task.StartedAt.Time = now
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	credentialID := text(payload["credential_id"])
 	defer func() {
 		s.checkoutMu.Lock()
@@ -545,19 +547,22 @@ func (s *Server) executeSunnyCheckoutTask(task *Task, payload map[string]any) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
-			case <-time.After(500 * time.Millisecond):
-				if s.taskCancelled(task) {
-					return
-				}
-				sem <- struct{}{}
+			case <-ctx.Done():
+				return
 			}
 			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
 			token := s.checkoutCredential(credentialID, intValue(row["index"], idx))
 			email := text(row["email"])
 			accountID := uint(intValue(row["session_id"], 0))
 			rowIndex := intValue(row["index"], idx)
 			s.appendCheckoutProgress(task, email, accountID, rowIndex, 3, "已领取提链任务")
-			item := s.runSunnyCheckoutAttempt(task, payload, row, token, secret)
+			item := s.runSunnyCheckoutAttempt(ctx, task, payload, row, token, secret)
+			if ctx.Err() != nil {
+				return
+			}
 			item["index"] = rowIndex
 			if accountID > 0 {
 				item["account_id"] = accountID
@@ -580,14 +585,7 @@ func (s *Server) executeSunnyCheckoutTask(task *Task, payload map[string]any) {
 		}()
 	}
 	wg.Wait()
-	if s.taskCancelled(task) {
-		task.ResultJSON = dumpJSON(result)
-		task.Status = TaskCancelled
-		task.Error = "用户已停止提链任务"
-		task.FinishedAt.Valid = true
-		task.FinishedAt.Time = time.Now()
-		s.db.Save(task)
-		s.appendTaskEvent(task.ID, task.Error, "log", "warning", nil)
+	if s.finishCancelledTask(task, result, "用户已停止提链任务") {
 		return
 	}
 	task.ResultJSON = dumpJSON(result)
@@ -616,7 +614,7 @@ func recordSunnyCheckoutResult(task *Task, result map[string]any, item map[strin
 	task.ResultJSON = dumpJSON(result)
 }
 
-func (s *Server) runSunnyCheckoutAttempt(task *Task, payload, row map[string]any, token string, secret checkoutSecret) map[string]any {
+func (s *Server) runSunnyCheckoutAttempt(ctx context.Context, task *Task, payload, row map[string]any, token string, secret checkoutSecret) map[string]any {
 	email := text(row["email"])
 	accountID := uint(intValue(row["session_id"], 0))
 	rowIndex := intValue(row["index"], 0)
@@ -624,7 +622,7 @@ func (s *Server) runSunnyCheckoutAttempt(task *Task, payload, row map[string]any
 		s.appendCheckoutProgress(task, email, accountID, rowIndex, 100, "AT 为空或已失效")
 		return map[string]any{"email": email, "status": "failed", "error": "AT 为空或已失效"}
 	}
-	item, err := s.requestSunnyCheckout(context.Background(), task, token, text(row["checkout_kind"]), payload, secret.Checkout, secret.Promotion, email, accountID, rowIndex)
+	item, err := s.requestSunnyCheckout(ctx, task, token, text(row["checkout_kind"]), payload, secret.Checkout, secret.Promotion, email, accountID, rowIndex)
 	if err != nil {
 		message := sanitizeCheckoutError(err.Error())
 		s.appendCheckoutProgress(task, email, accountID, rowIndex, 100, message)
@@ -706,10 +704,6 @@ func (s *Server) requestSunnyCheckout(ctx context.Context, task *Task, token, ch
 	workerLogSequence := 0
 	s.appendCheckoutProgress(task, email, accountID, rowIndex, 8, "已提交提链引擎")
 	for poll := 0; poll < 800; poll++ {
-		if sCancelled := task != nil && task.ID != "" && task.Status == TaskCancelled; sCancelled || (task != nil && s.taskCancelled(task)) {
-			_ = cancelSunnyCheckoutWorkerJob(ctx, workerURL, jobID)
-			return nil, fmt.Errorf("任务已取消")
-		}
 		timer := time.NewTimer(1500 * time.Millisecond)
 		select {
 		case <-ctx.Done():

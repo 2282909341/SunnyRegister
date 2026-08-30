@@ -376,17 +376,25 @@ func shuffledSunnyProxies(proxies []SunnyProxy) []SunnyProxy {
 }
 
 func (s *Server) probeSunnyPaymentCountry(candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy) sunnyPaymentCountryProbe {
+	return s.probeSunnyPaymentCountryContext(context.Background(), candidate, country, proxies)
+}
+
+func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy) sunnyPaymentCountryProbe {
 	result := sunnyPaymentCountryProbe{Country: country}
 	currency := checkoutCountryCurrency[country]
 	if currency == "" {
 		currency = "USD"
 	}
 	for _, proxy := range shuffledSunnyProxies(proxies) {
+		if ctx.Err() != nil {
+			result.Error = "任务已取消"
+			return result
+		}
 		result.Attempts++
-		ctx, cancel := context.WithTimeout(context.Background(), 105*time.Second)
+		probeCtx, cancel := context.WithTimeout(ctx, 105*time.Second)
 		meter := &sunnyTrafficMeter{}
-		ctx = withSunnyTrafficMeter(ctx, meter)
-		probed := sunnyProbePaymentMethods(ctx, candidate.AccessToken, country, currency, normalizeSunnyProxyAddress(proxy.Address))
+		probeCtx = withSunnyTrafficMeter(probeCtx, meter)
+		probed := sunnyProbePaymentMethods(probeCtx, candidate.AccessToken, country, currency, normalizeSunnyProxyAddress(proxy.Address))
 		cancel()
 		result.TrafficBytes += meter.totalBytes() + probed.TrafficBytes
 		result.ProxyID, result.HTTP, result.InvalidToken, result.Error = proxy.ID, probed.HTTP, probed.InvalidToken, probed.Error
@@ -403,6 +411,10 @@ func (s *Server) probeSunnyPaymentCountry(candidate sunnyPaymentProbeCandidate, 
 }
 
 func (s *Server) probeSunnyPaymentAccount(candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy) sunnyPaymentAccountProbe {
+	return s.probeSunnyPaymentAccountContext(context.Background(), candidate, groups)
+}
+
+func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy) sunnyPaymentAccountProbe {
 	result := sunnyPaymentAccountProbe{Candidate: candidate, Countries: map[string]any{}}
 	if candidate.SkipReason != "" || candidate.Error != "" {
 		return result
@@ -412,8 +424,8 @@ func (s *Server) probeSunnyPaymentAccount(candidate sunnyPaymentProbeCandidate, 
 		countries = append(countries, country)
 	}
 	sort.Strings(countries)
-	probes := streamSunnyWorkerPool(countries, s.sunnyPaymentCountryConcurrency(), func(country string) sunnyPaymentCountryProbe {
-		return s.probeSunnyPaymentCountry(candidate, country, groups[country])
+	probes := streamSunnyWorkerPoolContext(ctx, countries, s.sunnyPaymentCountryConcurrency(), func(country string) sunnyPaymentCountryProbe {
+		return s.probeSunnyPaymentCountryContext(ctx, candidate, country, groups[country])
 	})
 	allMethods := []string{}
 	for probe := range probes {
@@ -473,6 +485,8 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	candidates, err := s.sunnyPaymentProbeCandidates(uintSlice(payload["session_ids"]))
 	if err != nil {
 		s.failSunnyPaymentProbeTask(task, err.Error())
@@ -512,10 +526,13 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 	}
 	result := map[string]any{"requested": len(candidates), "detected": 0, "partial": 0, "skipped": 0, "failed": 0, "items": []any{}}
 	items := make([]any, 0, len(candidates))
-	outcomes := streamSunnyWorkerPool(candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
-		return s.probeSunnyPaymentAccount(candidate, groups)
+	outcomes := streamSunnyWorkerPoolContext(ctx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
+		return s.probeSunnyPaymentAccountContext(ctx, candidate, groups)
 	})
 	for outcome := range outcomes {
+		if ctx.Err() != nil {
+			break
+		}
 		now := time.Now()
 		item := map[string]any{"session_id": outcome.Candidate.SessionID, "email": outcome.Candidate.Email, "payment_methods": outcome.Methods, "countries": outcome.Countries, "proxy_traffic_bytes": outcome.TrafficBytes}
 		s.recordSunnyProxyTraffic(outcome.Candidate.Email, outcome.TrafficBytes)
@@ -604,6 +621,9 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		})
 	}
 	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止支付探测任务") {
+		return
+	}
 	task.Status = TaskSucceeded
 	task.SuccessCount = intValue(result["detected"], 0) + intValue(result["partial"], 0)
 	task.ErrorCount = intValue(result["failed"], 0)

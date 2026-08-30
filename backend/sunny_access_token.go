@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -252,6 +253,10 @@ func (s *Server) sunnyMaintenanceConfigHandler(w http.ResponseWriter, r *http.Re
 }
 
 func sunnyProbeAccessToken(accessToken, proxyURL string, meters ...*sunnyTrafficMeter) (string, error) {
+	return sunnyProbeAccessTokenContext(context.Background(), accessToken, proxyURL, meters...)
+}
+
+func sunnyProbeAccessTokenContext(ctx context.Context, accessToken, proxyURL string, meters ...*sunnyTrafficMeter) (string, error) {
 	if strings.TrimSpace(accessToken) == "" {
 		return "invalid", fmt.Errorf("账户没有可用的 Access Token")
 	}
@@ -271,7 +276,7 @@ func sunnyProbeAccessToken(accessToken, proxyURL string, meters ...*sunnyTraffic
 	if len(meters) > 0 && meters[0] != nil && strings.TrimSpace(proxyURL) != "" {
 		client.Transport = &sunnyTrafficTransport{base: transport, meter: meters[0]}
 	}
-	req, err := http.NewRequest(http.MethodGet, sunnyProbeAccessTokenEndpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sunnyProbeAccessTokenEndpoint, nil)
 	if err != nil {
 		return "probe_failed", err
 	}
@@ -318,14 +323,21 @@ func sunnyProbeAccessToken(accessToken, proxyURL string, meters ...*sunnyTraffic
 }
 
 func (s *Server) sunnyProbeAccessToken(accessToken, proxyURL string, meters ...*sunnyTrafficMeter) (string, error) {
-	if status, err, handled := s.sunnyProbeAccessTokenViaWorker(accessToken, proxyURL, meters...); handled {
+	return s.sunnyProbeAccessTokenContext(context.Background(), accessToken, proxyURL, meters...)
+}
+
+func (s *Server) sunnyProbeAccessTokenContext(ctx context.Context, accessToken, proxyURL string, meters ...*sunnyTrafficMeter) (string, error) {
+	if status, err, handled := s.sunnyProbeAccessTokenViaWorkerContext(ctx, accessToken, proxyURL, meters...); handled {
 		return status, err
 	}
-	directStatus, directErr := sunnyProbeAccessToken(accessToken, "", meters...)
+	if ctx.Err() != nil {
+		return "probe_failed", ctx.Err()
+	}
+	directStatus, directErr := sunnyProbeAccessTokenContext(ctx, accessToken, "", meters...)
 	if directStatus == "valid" || directStatus == "invalid" || strings.TrimSpace(proxyURL) == "" {
 		return directStatus, directErr
 	}
-	proxyStatus, proxyErr := sunnyProbeAccessToken(accessToken, proxyURL, meters...)
+	proxyStatus, proxyErr := sunnyProbeAccessTokenContext(ctx, accessToken, proxyURL, meters...)
 	if proxyStatus == "valid" || proxyStatus == "invalid" {
 		return proxyStatus, proxyErr
 	}
@@ -336,12 +348,16 @@ func (s *Server) sunnyProbeAccessToken(accessToken, proxyURL string, meters ...*
 }
 
 func (s *Server) sunnyProbeAccessTokenViaWorker(accessToken, proxyURL string, meters ...*sunnyTrafficMeter) (string, error, bool) {
+	return s.sunnyProbeAccessTokenViaWorkerContext(context.Background(), accessToken, proxyURL, meters...)
+}
+
+func (s *Server) sunnyProbeAccessTokenViaWorkerContext(ctx context.Context, accessToken, proxyURL string, meters ...*sunnyTrafficMeter) (string, error, bool) {
 	workerURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PYTHON_WORKER_URL")), "/")
 	if workerURL == "" {
 		workerURL = "http://127.0.0.1:8765"
 	}
 	body, _ := json.Marshal(map[string]any{"access_token": accessToken, "proxy_url": proxyURL})
-	req, err := http.NewRequest(http.MethodPost, workerURL+"/probe-access-token", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, workerURL+"/probe-access-token", bytes.NewReader(body))
 	if err != nil {
 		return "", nil, false
 	}
@@ -524,6 +540,8 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	candidates, skipped, err := s.sunnyAccessTokenCandidates(uintSlice(payload["session_ids"]), boolValue(payload["scheduled"], false))
 	if err != nil {
 		s.failSunnyAccessTokenCheckTask(task, err.Error())
@@ -544,9 +562,9 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 	}
 	items := make([]any, 0, len(candidates))
 	concurrency := s.sunnyAccessTokenCheckConcurrency()
-	results := streamSunnyWorkerPool(candidates, concurrency, func(candidate sunnyAccessTokenCandidate) sunnyAccessTokenResult {
+	results := streamSunnyWorkerPoolContext(ctx, candidates, concurrency, func(candidate sunnyAccessTokenCandidate) sunnyAccessTokenResult {
 		meter := &sunnyTrafficMeter{}
-		status, probeErr := s.sunnyProbeAccessToken(candidate.AccessToken, proxyURL, meter)
+		status, probeErr := s.sunnyProbeAccessTokenContext(ctx, candidate.AccessToken, proxyURL, meter)
 		message := ""
 		if probeErr != nil {
 			message = probeErr.Error()
@@ -555,6 +573,9 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 		return sunnyAccessTokenResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: status, Error: message}
 	})
 	for outcome := range results {
+		if ctx.Err() != nil {
+			break
+		}
 		now := time.Now()
 		item := map[string]any{"session_id": outcome.SessionID, "email": outcome.Email, "status": outcome.Status}
 		if outcome.Error != "" {
@@ -587,6 +608,10 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 		task.ProgressCurrent++
 		s.persistTaskProgress(task, intValue(result["valid"], 0)+intValue(result["invalid"], 0), intValue(result["failed"], 0), now)
 	}
+	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止 AT 检测任务") {
+		return
+	}
 	if len(invalidAccounts) > 0 {
 		renewalAccounts := s.filterActiveSunnyRenewalAccounts(invalidAccounts)
 		if len(renewalAccounts) > 0 {
@@ -608,7 +633,6 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 			}
 		}
 	}
-	result["items"] = items
 	s.completeSunnyAccessTokenCheckTask(task, result)
 }
 

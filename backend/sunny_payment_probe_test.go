@@ -7,7 +7,63 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestSunnyPaymentProbeStopsAfterCancellation(t *testing.T) {
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Create(&SunnyProxy{Address: "http://jp.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(ctx context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-ctx.Done()
+		return sunnyPaymentProbeResponse{Error: ctx.Err().Error()}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []string{"JP"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("payment probe did not start")
+	}
+	recorder := httptest.NewRecorder()
+	s.handleTasks(recorder, httptest.NewRequest(http.MethodPost, "/tasks/"+task.ID+"/cancel", nil), "/"+task.ID+"/cancel")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cancel endpoint status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("payment probe did not stop after cancellation")
+	}
+	var stored Task
+	if err := s.db.First(&stored, "id = ?", task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != TaskCancelled || !strings.Contains(stored.Error, "停止支付探测") {
+		t.Fatalf("cancelled task status=%q error=%q", stored.Status, stored.Error)
+	}
+}
 
 func TestSunnyPaymentMethodNormalizationAndFilter(t *testing.T) {
 	methods := normalizeSunnyPaymentMethods([]string{"cpmt_paypal", "credit-card", "KakaoPay", "paypal", "iDEAL", "go-pay", "przelewy24", "mbway", "bank_transfer_x"})

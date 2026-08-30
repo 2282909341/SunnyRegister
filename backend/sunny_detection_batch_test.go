@@ -1,10 +1,34 @@
 package main
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestStreamSunnyWorkerPoolContextStopsQueuedCandidates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan int, 1)
+	release := make(chan struct{})
+	results := streamSunnyWorkerPoolContext(ctx, []int{1, 2, 3, 4}, 1, func(candidate int) int {
+		started <- candidate
+		<-release
+		return candidate
+	})
+	if first := <-started; first != 1 {
+		t.Fatalf("first candidate=%d", first)
+	}
+	cancel()
+	close(release)
+	for range results {
+	}
+	select {
+	case candidate := <-started:
+		t.Fatalf("queued candidate %d started after cancellation", candidate)
+	default:
+	}
+}
 
 func TestStreamSunnyWorkerPoolLimitsConcurrencyAndStreamsResults(t *testing.T) {
 	candidates := []int{0, 1, 2, 3, 4, 5, 6, 7}

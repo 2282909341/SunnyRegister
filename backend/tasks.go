@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -441,8 +442,12 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, rest string
 					if isRegistrationTask {
 						s.markSunnyUnfinishedMailboxes(&task, "任务已由用户停止，当前邮箱未完成本次注册流程")
 					}
-				} else if err := s.requestPythonWorkerCancel(task.ID); err != nil {
-					s.appendTaskEvent(task.ID, "Python Worker 停止接口调用失败，将继续通过数据库取消信号终止任务: "+err.Error(), "log", "warning", map[string]any{"cancelled": true})
+				} else {
+					go func(taskID string) {
+						if err := s.requestPythonWorkerCancel(taskID); err != nil {
+							s.appendTaskEvent(taskID, "Python Worker 停止接口调用失败，将继续通过数据库取消信号终止任务: "+err.Error(), "log", "warning", map[string]any{"cancelled": true})
+						}
+					}(task.ID)
 				}
 				_ = s.db.First(&task, "id = ?", task.ID).Error
 			}
@@ -954,6 +959,43 @@ func (s *Server) taskCancelled(task *Task) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Server) taskCancellationContext(task *Task) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				var status string
+				if err := s.db.Model(&Task{}).Where("id = ?", task.ID).Pluck("status", &status).Error; err == nil &&
+					(status == TaskCancelRequested || status == TaskCancelled || status == TaskInterrupted) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, cancel
+}
+
+func (s *Server) finishCancelledTask(task *Task, result map[string]any, message string) bool {
+	var current Task
+	if err := s.db.First(&current, "id = ?", task.ID).Error; err != nil ||
+		(current.Status != TaskCancelRequested && current.Status != TaskCancelled && current.Status != TaskInterrupted) {
+		return false
+	}
+	task.Status = TaskCancelled
+	task.Error = message
+	task.ResultJSON = dumpJSON(result)
+	task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
+	s.db.Save(task)
+	s.appendTaskEvent(task.ID, message, "log", "warning", map[string]any{"cancelled": true})
+	return true
 }
 
 func (s *Server) finishTask(task *Task, status, errMsg string, result map[string]any) {

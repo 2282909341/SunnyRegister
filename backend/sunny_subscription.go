@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"html"
@@ -71,8 +72,8 @@ type sunnySubscriptionATResult struct {
 	Error     string
 }
 
-var sunnyProbeSubscriptionAT = func(s *Server, candidate sunnySubscriptionCandidate, proxyURL string) sunnySubscriptionATResult {
-	return s.sunnySubscriptionProbeAT(candidate, proxyURL)
+var sunnyProbeSubscriptionAT = func(ctx context.Context, s *Server, candidate sunnySubscriptionCandidate, proxyURL string) sunnySubscriptionATResult {
+	return s.sunnySubscriptionProbeATContext(ctx, candidate, proxyURL)
 }
 
 func sunnySubscriptionPlanTypeFromAccessToken(accessToken string) string {
@@ -334,6 +335,10 @@ func (s *Server) sunnySubscriptionCandidates(ids []uint) ([]sunnySubscriptionCan
 }
 
 func (s *Server) sunnySubscriptionProbeAT(candidate sunnySubscriptionCandidate, proxyURL string) sunnySubscriptionATResult {
+	return s.sunnySubscriptionProbeATContext(context.Background(), candidate, proxyURL)
+}
+
+func (s *Server) sunnySubscriptionProbeATContext(ctx context.Context, candidate sunnySubscriptionCandidate, proxyURL string) sunnySubscriptionATResult {
 	outcome := sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email}
 	if strings.TrimSpace(candidate.AccessToken) == "" {
 		outcome.Status = "invalid"
@@ -341,7 +346,7 @@ func (s *Server) sunnySubscriptionProbeAT(candidate sunnySubscriptionCandidate, 
 		return outcome
 	}
 	meter := &sunnyTrafficMeter{}
-	status, probeErr := s.sunnyProbeAccessToken(candidate.AccessToken, proxyURL, meter)
+	status, probeErr := s.sunnyProbeAccessTokenContext(ctx, candidate.AccessToken, proxyURL, meter)
 	s.recordSunnyProxyTraffic(candidate.Email, meter.totalBytes())
 	outcome.Status = status
 	if probeErr != nil {
@@ -364,12 +369,32 @@ func (s *Server) sunnySubscriptionRenewalTimeout() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func (s *Server) waitSunnySubscriptionRenewal(taskID string) (Task, error) {
+func (s *Server) waitSunnySubscriptionRenewal(ctx context.Context, taskID string) (Task, error) {
 	if strings.TrimSpace(taskID) == "" {
 		return Task{}, fmt.Errorf("未创建 AT 续期任务")
 	}
 	deadline := time.Now().Add(s.sunnySubscriptionRenewalTimeout())
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			var task Task
+			if s.db.First(&task, "id = ?", taskID).Error == nil && !terminalTaskStatuses[task.Status] {
+				if task.Status == TaskPending {
+					task.Status = TaskCancelled
+					task.Error = "父订阅检测任务已停止"
+					task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
+				} else {
+					task.Status = TaskCancelRequested
+				}
+				s.db.Save(&task)
+				s.appendTaskEvent(task.ID, "父订阅检测任务已停止，正在终止 AT 续期", "log", "warning", map[string]any{"cancelled": true})
+				if task.Status == TaskCancelRequested {
+					go func(taskID string) { _ = s.requestPythonWorkerCancel(taskID) }(task.ID)
+				}
+			}
+			return Task{}, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 		var task Task
 		if err := s.db.First(&task, "id = ?", taskID).Error; err != nil {
 			return Task{}, fmt.Errorf("读取 AT 续期任务失败：%w", err)
@@ -377,7 +402,6 @@ func (s *Server) waitSunnySubscriptionRenewal(taskID string) (Task, error) {
 		if terminalTaskStatuses[task.Status] {
 			return task, nil
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
 	return Task{}, fmt.Errorf("AT 续期任务等待超时（超过 %s）", s.sunnySubscriptionRenewalTimeout().Round(time.Second))
 }
@@ -430,6 +454,8 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	candidates, err := s.sunnySubscriptionCandidates(uintSlice(payload["session_ids"]))
 	if err != nil {
 		s.failSunnySubscriptionTask(task, err.Error())
@@ -478,7 +504,7 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 
 	noMailCandidates := make([]sunnySubscriptionCandidate, 0, len(candidates))
 	concurrency := s.sunnySubscriptionConcurrency()
-	results := streamSunnyWorkerPool(candidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionResult {
+	results := streamSunnyWorkerPoolContext(ctx, candidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionResult {
 		if candidate.Error != "" {
 			return sunnySubscriptionResult{SessionID: candidate.SessionID, Email: candidate.Email, Error: candidate.Error}
 		}
@@ -490,6 +516,9 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 		return outcome
 	})
 	for outcome := range results {
+		if ctx.Err() != nil {
+			break
+		}
 		item := map[string]any{"email": outcome.Email}
 		if outcome.Error != "" {
 			candidate := candidateBySession[outcome.SessionID]
@@ -513,18 +542,25 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 		}
 		noMailCandidates = append(noMailCandidates, candidateBySession[outcome.SessionID])
 	}
+	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止订阅检测任务") {
+		return
+	}
 
 	// Mailbox lookup remains the first source of truth. Only accounts with no
 	// matching mail reach the AT fallback, which avoids renewing accounts that
 	// already have a definitive subscription confirmation.
 	invalidForRenewal := make([]sunnySubscriptionATResult, 0)
-	atResults := streamSunnyWorkerPool(noMailCandidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionATResult {
+	atResults := streamSunnyWorkerPoolContext(ctx, noMailCandidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionATResult {
 		if candidate.Error != "" {
 			return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "failed", Error: candidate.Error}
 		}
-		return sunnyProbeSubscriptionAT(s, candidate, proxyURL)
+		return sunnyProbeSubscriptionAT(ctx, s, candidate, proxyURL)
 	})
 	for outcome := range atResults {
+		if ctx.Err() != nil {
+			break
+		}
 		item := map[string]any{"email": outcome.Email, "source": "access_token"}
 		switch outcome.Status {
 		case "valid":
@@ -540,6 +576,10 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 			s.appendAccountTaskEvent(task.ID, outcome.Email, "subscription", "subscription.check_failed", fmt.Sprintf("账户 %s AT 兜底检测失败：%s", outcome.Email, fallback(outcome.Error, "未得到有效 AT 响应")), "warning", map[string]any{"error": outcome.Error, "status": outcome.Status})
 			record(item)
 		}
+	}
+	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止订阅检测任务") {
+		return
 	}
 
 	if len(invalidForRenewal) > 0 {
@@ -558,7 +598,7 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 		var renewalTaskError string
 		if renewalTask.ID == "" {
 			renewalTaskError = "未能创建或找到 AT 续期任务"
-		} else if completedTask, waitErr := s.waitSunnySubscriptionRenewal(renewalTask.ID); waitErr != nil {
+		} else if completedTask, waitErr := s.waitSunnySubscriptionRenewal(ctx, renewalTask.ID); waitErr != nil {
 			renewalTaskError = waitErr.Error()
 		} else if completedTask.Status != TaskSucceeded {
 			renewalTaskError = strings.TrimSpace(completedTask.Error)
@@ -568,6 +608,11 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 		}
 		result["renewal_task_id"] = renewalTask.ID
 		result["renewal_queued"] = len(accountIDs)
+		if ctx.Err() != nil {
+			result["items"] = items
+			s.finishCancelledTask(task, result, "用户已停止订阅检测任务")
+			return
+		}
 
 		for _, outcome := range invalidForRenewal {
 			item := map[string]any{"email": outcome.Email, "source": "access_token_renewal"}

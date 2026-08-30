@@ -935,6 +935,8 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	candidates, err := s.sunnyTrialCandidates(uintSlice(payload["session_ids"]))
 	if err != nil {
 		s.failSunnyTrialTask(task, err.Error())
@@ -974,13 +976,16 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 		candidateBySession[candidate.SessionID] = candidate
 	}
 	concurrency := s.sunnyTrialConcurrency()
-	results := streamSunnyWorkerPool(candidates, concurrency, func(candidate sunnyTrialCandidate) sunnyTrialResult {
+	results := streamSunnyWorkerPoolContext(ctx, candidates, concurrency, func(candidate sunnyTrialCandidate) sunnyTrialResult {
 		outcome := sunnyTrialResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, SkipReason: candidate.SkipReason, Error: candidate.Error}
 		if outcome.SkipReason == "" && outcome.Error == "" {
 			meter := &sunnyTrafficMeter{}
 			outcome.CountryResults = map[string]string{}
 			for _, country := range trialCountries {
-				trialCtx := withSunnyTrafficMeter(context.Background(), meter)
+				if ctx.Err() != nil {
+					break
+				}
+				trialCtx := withSunnyTrafficMeter(ctx, meter)
 				proxyURL := sunnyProxyURLFromCountryGroup(candidate.Email, trialProxyGroups[country])
 				trialCtx = context.WithValue(trialCtx, sunnyTrialProxyContextKey{}, proxyURL)
 				trial, retried := checkSunnyTrialWithRetry(trialCtx, candidate.AccessToken)
@@ -1017,6 +1022,9 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 		return outcome
 	})
 	for outcome := range results {
+		if ctx.Err() != nil {
+			break
+		}
 		item := map[string]any{"session_id": outcome.SessionID, "email": outcome.Email}
 		s.recordSunnyProxyTraffic(outcome.Email, outcome.TrafficBytes)
 		item["proxy_traffic_bytes"] = outcome.TrafficBytes
@@ -1083,6 +1091,10 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 		task.ProgressCurrent++
 		s.persistTaskProgress(task, intValue(result["eligible"], 0)+intValue(result["ineligible"], 0), intValue(result["failed"], 0), now)
 	}
+	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止试用资格检测任务") {
+		return
+	}
 	if len(invalidAccounts) > 0 {
 		renewalAccounts := s.filterActiveSunnyRenewalAccounts(invalidAccounts)
 		if len(renewalAccounts) > 0 {
@@ -1104,7 +1116,6 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 			}
 		}
 	}
-	result["items"] = items
 	s.completeSunnyTrialTask(task, result)
 }
 

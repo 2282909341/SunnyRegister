@@ -145,6 +145,8 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	candidates, err := s.sunnyCheckoutProbeCandidates(uintSlice(payload["session_ids"]))
 	if err != nil {
 		s.failSunnyCheckoutProbeTask(task, err.Error())
@@ -161,15 +163,15 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 	}
 	result := map[string]any{"requested": len(candidates), "detected": 0, "retried": 0, "skipped": 0, "failed": 0, "items": []any{}}
 	items := make([]any, 0, len(candidates))
-	outcomes := streamSunnyWorkerPool(candidates, s.sunnyCheckoutProbeConcurrency(), func(candidate sunnyCheckoutProbeCandidate) sunnyCheckoutProbeOutcome {
+	outcomes := streamSunnyWorkerPoolContext(ctx, candidates, s.sunnyCheckoutProbeConcurrency(), func(candidate sunnyCheckoutProbeCandidate) sunnyCheckoutProbeOutcome {
 		outcome := sunnyCheckoutProbeOutcome{Candidate: candidate}
 		if candidate.SkipReason != "" || candidate.Error != "" {
 			return outcome
 		}
 		meter := &sunnyTrafficMeter{}
-		ctx := withSunnyTrafficMeter(context.Background(), meter)
-		ctx = context.WithValue(ctx, sunnyCheckoutProxyContextKey{}, s.sunnyCommerceProxyURL(candidate.Email))
-		probed, retried := checkSunnyCheckoutProbeWithRetry(ctx, candidate.AccessToken)
+		probeCtx := withSunnyTrafficMeter(ctx, meter)
+		probeCtx = context.WithValue(probeCtx, sunnyCheckoutProxyContextKey{}, s.sunnyCommerceProxyURL(candidate.Email))
+		probed, retried := checkSunnyCheckoutProbeWithRetry(probeCtx, candidate.AccessToken)
 		outcome.CheckoutKind = normalizeSunnyCheckoutKind(probed.CheckoutKind)
 		outcome.InvalidToken = probed.InvalidToken
 		outcome.Retried = retried
@@ -178,6 +180,9 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 		return outcome
 	})
 	for outcome := range outcomes {
+		if ctx.Err() != nil {
+			break
+		}
 		now := time.Now()
 		candidate := outcome.Candidate
 		item := map[string]any{"session_id": candidate.SessionID, "email": candidate.Email, "checkout_kind": outcome.CheckoutKind, "proxy_traffic_bytes": outcome.TrafficBytes}
@@ -223,6 +228,9 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 		s.persistTaskProgress(task, intValue(result["detected"], 0), intValue(result["failed"], 0), now)
 	}
 	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止 Checkout 探测任务") {
+		return
+	}
 	task.Status = TaskSucceeded
 	task.SuccessCount = intValue(result["detected"], 0)
 	task.ErrorCount = intValue(result["failed"], 0)

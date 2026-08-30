@@ -188,6 +188,8 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
+	ctx, cancel := s.taskCancellationContext(task)
+	defer cancel()
 	ids := uintSlice(payload["session_ids"])
 	all := boolValue(payload["scheduled"], false)
 	candidates, skipped, err := s.sunnyHealthCandidates(ids, all)
@@ -203,7 +205,7 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 	proxyURL := s.sunnyMailboxProxyURL()
 	concurrency := s.sunnyHealthCheckConcurrency()
 	items := make([]any, 0, len(candidates))
-	results := streamSunnyWorkerPool(candidates, concurrency, func(candidate sunnyHealthCandidate) sunnyHealthResult {
+	results := streamSunnyWorkerPoolContext(ctx, candidates, concurrency, func(candidate sunnyHealthCandidate) sunnyHealthResult {
 		if candidate.Error != "" {
 			return sunnyHealthResult{SessionID: candidate.SessionID, Email: candidate.Email, Error: candidate.Error}
 		}
@@ -253,6 +255,9 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 		return sunnyHealthResult{SessionID: candidate.SessionID, Email: candidate.Email, Banned: banned, Checked: true, TrafficBytes: trafficBytes}
 	})
 	for outcome := range results {
+		if ctx.Err() != nil {
+			break
+		}
 		s.recordSunnyProxyTraffic(outcome.Email, outcome.TrafficBytes)
 		item := map[string]any{"email": outcome.Email, "status": "alive"}
 		item["proxy_traffic_bytes"] = outcome.TrafficBytes
@@ -298,6 +303,9 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 		s.persistTaskProgress(task, intValue(result["alive"], 0)+intValue(result["banned"], 0), intValue(result["failed"], 0), time.Now())
 	}
 	result["items"] = items
+	if s.finishCancelledTask(task, result, "用户已停止账户测活任务") {
+		return
+	}
 	s.completeSunnyHealthTask(task, result)
 }
 
