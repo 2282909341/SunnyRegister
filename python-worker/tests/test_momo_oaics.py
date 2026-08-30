@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 PAY153_DIR = Path(__file__).parents[1] / "tools" / "pay153_checkout"
 if str(PAY153_DIR) not in sys.path:
@@ -32,6 +34,29 @@ def test_momo_stage1_requests_custom_oaics_and_defers_trial_campaign() -> None:
     assert payload["checkout_ui_mode"] == "custom"
     assert payload["billing_details"] == {"country": "VN", "currency": "VND"}
     assert "promo_campaign" not in payload
+
+
+def test_momo_stage1_can_attach_verified_campaign_at_checkout_creation() -> None:
+    payload = checkout_app.checkout_payload(
+        {
+            "plan": "plus",
+            "link_type": "momo",
+            "country": "VN",
+            "currency": "VND",
+            "checkout_country": "VN",
+            "checkout_currency": "VND",
+            "use_promo": True,
+            "promo_campaign": "account-specific-campaign",
+            "promo_on_create": True,
+            "checkout_ui_mode": "custom",
+        },
+        {},
+    )
+
+    assert payload["promo_campaign"] == {
+        "promo_campaign_id": "account-specific-campaign",
+        "is_coupon_from_query_param": False,
+    }
 
 
 def test_momo_authorization_url_accepts_expected_stripe_handoff() -> None:
@@ -87,11 +112,199 @@ def test_momo_attempts_request_custom_oaics_and_keep_cs_live_fallback() -> None:
     })
 
     assert strategies == [
+        ("custom", "standalone", True),
         ("custom", "late_promo", False),
-        ("custom", "late_promo", False),
-        ("custom", "late_promo", False),
+        ("custom", "standalone", True),
         ("custom", "late_promo", False),
     ]
+
+
+def test_momo_rebuilds_ten_new_oaics_inside_one_account_attempt() -> None:
+    store = object.__new__(checkout_app.JobStore)
+    state = {"status": "running", "error": "", "result": None}
+    attempts: list[dict] = []
+    store.cancelled = lambda _job_id: False
+    store.get = lambda _job_id: dict(state)
+    store.update = lambda _job_id, **fields: state.update(fields)
+    store.log = lambda _job_id, _message: None
+    store._record_success = lambda _job_id, _result: None
+
+    def run_single(_job_id: str, attempt_options: dict) -> None:
+        attempts.append(attempt_options)
+        if len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS:
+            state.update(status="done", error="", result={})
+        else:
+            state.update(
+                status="error",
+                error="MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED: fixture",
+            )
+
+    store._run_single = run_single
+    store._run_locked("job-momo-inner", {
+        "retry_count": 0,
+        "link_type": "momo",
+        "use_promo": True,
+        "country": "VN",
+        "checkout_country": "VN",
+        "entry_proxies": ["http://promotion:8001"],
+        "exit_proxies": ["http://checkout:9001"],
+        "paired_proxy_rotation": True,
+    })
+
+    assert len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS
+    assert len({id(options) for options in attempts}) == len(attempts)
+    assert [options["promo_on_create"] for options in attempts] == [True, False] * 5
+    assert [options["local_method_strategy"] for options in attempts] == [
+        "standalone", "late_promo",
+    ] * 5
+    assert state["status"] == "done"
+    assert state["result"]["attempt"] == 1
+
+
+def test_momo_exhausts_inner_budget_before_rotating_outer_proxy() -> None:
+    store = object.__new__(checkout_app.JobStore)
+    state = {"status": "running", "error": "", "result": None}
+    attempts: list[tuple[str, str, bool, str]] = []
+    store.cancelled = lambda _job_id: False
+    store.get = lambda _job_id: dict(state)
+    store.update = lambda _job_id, **fields: state.update(fields)
+    store.log = lambda _job_id, _message: None
+    store._record_success = lambda _job_id, _result: None
+
+    def run_single(_job_id: str, attempt_options: dict) -> None:
+        attempts.append((
+            str(attempt_options["fixed_entry_proxy"]),
+            str(attempt_options["fixed_exit_proxy"]),
+            bool(attempt_options["promo_on_create"]),
+            str(attempt_options["local_method_strategy"]),
+        ))
+        if len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS + 1:
+            state.update(status="done", error="", result={})
+        else:
+            state.update(
+                status="error",
+                error="MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED: fixture",
+            )
+
+    store._run_single = run_single
+    with patch.object(checkout_app.time, "sleep"):
+        store._run_locked("job-momo-proxy-rotation", {
+            "retry_count": 1,
+            "link_type": "momo",
+            "use_promo": True,
+            "country": "VN",
+            "checkout_country": "VN",
+            "entry_proxies": ["http://promotion-1", "http://promotion-2"],
+            "exit_proxies": ["http://checkout-1", "http://checkout-2"],
+            "paired_proxy_rotation": True,
+        })
+
+    assert len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS + 1
+    assert len({attempt[:2] for attempt in attempts[:10]}) == 1
+    assert attempts[10][:2] != attempts[0][:2]
+    assert attempts[0][2:] == (True, "standalone")
+    assert attempts[10][2:] == (False, "late_promo")
+    assert state["status"] == "done"
+    assert state["result"]["attempt"] == 2
+
+
+def test_momo_blocked_confirmation_rebuilds_a_new_session() -> None:
+    store = object.__new__(checkout_app.JobStore)
+    state = {"status": "running", "error": "", "result": None}
+    attempts: list[dict] = []
+    store.cancelled = lambda _job_id: False
+    store.get = lambda _job_id: dict(state)
+    store.update = lambda _job_id, **fields: state.update(fields)
+    store.log = lambda _job_id, _message: None
+    store._record_success = lambda _job_id, _result: None
+
+    def run_single(_job_id: str, attempt_options: dict) -> None:
+        attempts.append(attempt_options)
+        if len(attempts) == 2:
+            state.update(status="done", error="", result={})
+        else:
+            state.update(
+                status="error",
+                error="MOMO_OAICS_CONFIRM_BLOCKED: current session is blocked",
+            )
+
+    store._run_single = run_single
+    store._run_locked("job-momo-blocked", {
+        "retry_count": 0,
+        "link_type": "momo",
+        "use_promo": False,
+        "country": "VN",
+        "checkout_country": "VN",
+        "entry_proxies": ["http://vn:8001"],
+        "exit_proxies": ["http://vn:9001"],
+        "paired_proxy_rotation": True,
+    })
+
+    assert len(attempts) == 2
+    assert id(attempts[0]) != id(attempts[1])
+    assert state["status"] == "done"
+
+
+def test_momo_promotion_action_requires_momo_before_update() -> None:
+    assert checkout_app.momo_promotion_action([], "", 0, "VND", True) == "rebuild"
+    assert checkout_app.momo_promotion_action(["card"], "pm_wrong", 0, "VND", True) == "rebuild"
+    assert checkout_app.momo_promotion_action([], "cpmt_momo", 522500, "VND", True) == "refresh"
+
+
+def test_momo_promotion_action_skips_duplicate_update_for_discounted_checkout() -> None:
+    assert checkout_app.momo_promotion_action(["card", "momo"], "", 0, "VND", True) == "already_discounted"
+    assert checkout_app.momo_promotion_action(["momo"], "", 50, "vnd", True) == "already_discounted"
+    assert checkout_app.momo_promotion_action(["momo"], "", 51, "VND", True) == "refresh"
+    assert checkout_app.momo_promotion_action(["momo"], "", None, "VND", True) == "refresh"
+    assert checkout_app.momo_promotion_action(
+        ["momo"], "", 522500, "VND", True, True,
+    ) == "rebuild_late"
+    assert checkout_app.momo_promotion_action(["momo"], "", 522500, "VND", False) == "continue"
+
+
+def test_momo_promotion_incompatible_error_is_classified_for_rebuild() -> None:
+    incompatible = (
+        'HTTP 400 {"detail":"This promotion is not compatible with the checkout\'s payment methods."}'
+    )
+    assert checkout_app.momo_promotion_is_payment_method_incompatible(incompatible)
+    assert checkout_app.momo_create_checkout_rebuild_error(incompatible, True).startswith(
+        "MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED:"
+    )
+    assert checkout_app.momo_create_checkout_rebuild_error(incompatible, True).endswith(
+        "strategy=create_with_promo；将丢弃创建请求并切换优惠时序"
+    )
+    assert checkout_app.momo_create_checkout_rebuild_error("HTTP 400 invalid promotion", True) == ""
+    assert not checkout_app.momo_promotion_is_payment_method_incompatible(
+        "HTTP 400 invalid promotion"
+    )
+    assert checkout_app.momo_checkout_requires_rebuild(
+        "MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED: fixture"
+    )
+    assert checkout_app.momo_checkout_requires_rebuild(
+        "MOMO_METHOD_REMOVED_REBUILD_REQUIRED: fixture"
+    )
+    assert checkout_app.momo_checkout_requires_rebuild(
+        "MOMO_OAICS_CONFIRM_BLOCKED: fixture"
+    )
+    assert checkout_app.momo_checkout_requires_rebuild(
+        "CUSTOM_CONFIRM_BLOCKED: MoMo payment method was blocked"
+    )
+    assert checkout_app.momo_checkout_requires_rebuild(
+        "MOMO_REDIRECT_MISSING: fixture"
+    )
+    assert not checkout_app.momo_checkout_requires_rebuild(
+        "Sentinel token generation failed"
+    )
+
+
+def test_momo_reuses_checkout_session_only_for_identical_routes() -> None:
+    route = "socks5h://gate.example:1000#route=vn-sticky"
+
+    assert checkout_app.momo_reuses_checkout_http_session("momo", route, route)
+    assert not checkout_app.momo_reuses_checkout_http_session(
+        "momo", route, "socks5h://gate.example:1000#route=vn-other",
+    )
+    assert not checkout_app.momo_reuses_checkout_http_session("gopay", route, route)
 
 
 def test_momo_native_method_detection_reads_har_observed_oaics_shapes() -> None:
@@ -104,6 +317,123 @@ def test_momo_native_method_detection_reads_har_observed_oaics_shapes() -> None:
     }
 
     assert checkout_app.oaics_native_payment_method_types(payload) == ["link", "card", "momo"]
+
+
+def test_momo_stage_uses_latest_explicit_methods_instead_of_stale_history() -> None:
+    prior = {
+        "payment_method_types": ["card", "momo"],
+        "custom_payment_methods": [{"id": "cpmt_momo", "type": "momo"}],
+    }
+    latest = {"payment_method_types": ["card"], "custom_payment_methods": []}
+
+    assert checkout_app.oaics_stage_native_payment_method_types(latest, prior) == ["card"]
+    assert checkout_app.oaics_stage_custom_payment_method_id(latest, prior, "momo") == ""
+    assert checkout_app.oaics_stage_native_payment_method_types({}, prior) == ["card", "momo"]
+    assert checkout_app.oaics_stage_custom_payment_method_id({}, prior, "momo") == "cpmt_momo"
+
+    nested_latest = {
+        "checkout_session": {
+            "payment_method_types": ["card"],
+            "custom_payment_methods": [],
+        },
+    }
+    nested_empty = {
+        "checkout_session": {
+            "payment_method_types": [],
+            "custom_payment_methods": [],
+        },
+    }
+    assert checkout_app.oaics_stage_native_payment_method_types(
+        nested_empty, prior,
+    ) == []
+    assert checkout_app.oaics_stage_custom_payment_method_id(
+        nested_latest, prior, "momo",
+    ) == ""
+
+    nested_momo = {
+        "checkout_session": {
+            "custom_payment_methods": [{"id": "cpmt_nested", "type": "momo"}],
+        },
+    }
+    assert checkout_app.oaics_stage_custom_payment_method_id(
+        nested_momo, {}, "momo",
+    ) == "cpmt_nested"
+
+    camel_empty = {
+        "checkoutSession": {
+            "paymentMethodTypes": [],
+            "customPaymentMethods": [],
+        },
+    }
+    assert checkout_app.oaics_stage_native_payment_method_types(
+        camel_empty, prior,
+    ) == []
+    assert checkout_app.oaics_stage_custom_payment_method_id(
+        camel_empty, prior, "momo",
+    ) == ""
+
+
+def test_momo_does_not_treat_unlabelled_sole_custom_method_as_momo() -> None:
+    unlabeled = {
+        "checkout_session": {
+            "customPaymentMethods": [{"id": "cpmt_unlabelled"}],
+        },
+    }
+
+    assert checkout_app.oaics_stage_custom_payment_method_id(
+        unlabeled, {}, "momo",
+    ) == ""
+    assert checkout_app.custom_payment_method_id_for(
+        {"customPaymentMethods": [{"id": "cpmt_unlabelled"}]},
+        "gcash",
+    ) == "cpmt_unlabelled"
+
+    mixed_fields = {
+        "custom_payment_methods": [],
+        "customPaymentMethods": [
+            {"id": "cpmt_momo", "type": "momo"},
+            {"id": "cpmt_momo", "type": "momo"},
+        ],
+    }
+    assert checkout_app.oaics_custom_payment_method_items(mixed_fields) == [
+        {"id": "cpmt_momo", "type": "momo"},
+    ]
+    assert checkout_app.oaics_stage_custom_payment_method_id(
+        mixed_fields, {}, "momo",
+    ) == "cpmt_momo"
+
+
+def test_momo_oaics_poll_does_not_restore_explicitly_empty_methods() -> None:
+    fallback = {
+        "payment_method_types": ["card", "momo"],
+        "custom_payment_methods": [{"id": "cpmt_momo", "type": "momo"}],
+    }
+    http = _RecordingHttp([
+        _FakeResponse({
+            "payment_method_types": [],
+            "custom_payment_methods": [],
+        }),
+        _FakeResponse({
+            "payment_method_types": ["momo"],
+            "custom_payment_methods": [],
+        }),
+    ])
+
+    with patch.object(checkout_app.time, "sleep"):
+        state = checkout_app.fetch_oaics_native_checkout_with_retry(
+            http,
+            "access-token",
+            "oaics_fixture",
+            "openai_llc",
+            "device-fixture",
+            "momo",
+            preserve_from=fallback,
+            attempts=2,
+            delay_seconds=0,
+        )
+
+    assert state["payment_method_types"] == ["momo"]
+    assert len(http.calls) == 2
 
 
 def test_momo_discounted_amount_accepts_har_threshold() -> None:
@@ -136,6 +466,10 @@ class _RecordingHttp:
     def __init__(self, responses: list[_FakeResponse]) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, str, dict]] = []
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
 
     def post(self, url: str, **kwargs):
         self.calls.append(("POST", url, kwargs))
@@ -144,6 +478,282 @@ class _RecordingHttp:
     def get(self, url: str, **kwargs):
         self.calls.append(("GET", url, kwargs))
         return self.responses.pop(0)
+
+
+def test_momo_create_promo_waits_for_amount_to_settle_before_rebuilding() -> None:
+    initial = {
+        "payment_method_types": ["momo"],
+        "amount_total": 522500,
+        "currency": "VND",
+    }
+    settled = {
+        "payment_method_types": ["momo"],
+        "amount_total": 1,
+        "currency": "VND",
+    }
+    http = _RecordingHttp([_FakeResponse(settled)])
+    logs: list[str] = []
+
+    with patch.object(checkout_app.time, "sleep"):
+        state = checkout_app.fetch_momo_discounted_checkout_with_retry(
+            http,
+            "access-token",
+            "oaics_fixture",
+            "openai_llc",
+            "device-fixture",
+            initial,
+            attempts=3,
+            delay_seconds=0,
+            log=logs.append,
+        )
+
+    assert state == settled
+    assert len(http.calls) == 1
+    assert logs and "amount=522500 VND" in logs[0]
+
+
+def test_momo_late_promo_waits_for_stable_method_snapshot() -> None:
+    initial = {
+        "payment_method_types": ["momo"],
+        "amount_total": 522500,
+        "currency": "VND",
+    }
+    withdrawn = {
+        "paymentMethodTypes": [],
+        "customPaymentMethods": [],
+        "amount_total": 522500,
+        "currency": "VND",
+    }
+    http = _RecordingHttp([
+        _FakeResponse(withdrawn),
+        _FakeResponse(withdrawn),
+    ])
+
+    with patch.object(checkout_app.time, "sleep"):
+        state = checkout_app.fetch_momo_checkout_stable_with_retry(
+            http,
+            "access-token",
+            "oaics_fixture",
+            "openai_llc",
+            "device-fixture",
+            initial,
+            attempts=3,
+            delay_seconds=0,
+        )
+
+    assert state == withdrawn
+    assert checkout_app.oaics_stage_native_payment_method_types(
+        state, initial,
+    ) == []
+    assert len(http.calls) == 2
+
+
+def test_momo_late_promo_rebuilds_when_snapshot_never_stabilizes() -> None:
+    initial = {
+        "payment_method_types": ["momo"],
+        "amount_total": 522500,
+        "currency": "VND",
+    }
+    http = _RecordingHttp([
+        _FakeResponse({
+            "paymentMethodTypes": [],
+            "amount_total": 522500,
+            "currency": "VND",
+        }),
+        _FakeResponse({
+            "paymentMethodTypes": ["momo"],
+            "amount_total": 1,
+            "currency": "VND",
+        }),
+    ])
+
+    with (
+        patch.object(checkout_app.time, "sleep"),
+        pytest.raises(RuntimeError, match="MOMO_CHECKOUT_REBUILD_REQUIRED"),
+    ):
+        checkout_app.fetch_momo_checkout_stable_with_retry(
+            http,
+            "access-token",
+            "oaics_fixture",
+            "openai_llc",
+            "device-fixture",
+            initial,
+            attempts=3,
+            delay_seconds=0,
+        )
+
+    assert len(http.calls) == 2
+
+
+@pytest.mark.parametrize("marker", ["not_blocked", "not blocked", "unblocked"])
+def test_momo_confirm_does_not_misclassify_negated_blocked_marker(marker: str) -> None:
+    assert not checkout_app.checkout_confirmation_is_blocked(
+        {"result": marker},
+        '{"result":"' + marker + '"}',
+    )
+
+
+def test_momo_session_cleanup_closes_each_http_client_once() -> None:
+    class _Closable:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    checkout_http = _Closable()
+    stripe_http = _Closable()
+
+    checkout_app.close_http_sessions([
+        checkout_http, checkout_http, stripe_http,
+    ])
+
+    assert checkout_http.close_count == 1
+    assert stripe_http.close_count == 1
+
+
+def test_momo_checkout_uses_checkout_flow_and_strict_sentinel_identity() -> None:
+    class _Cookies:
+        def __init__(self) -> None:
+            self.values: list[tuple[str, str, str]] = []
+
+        def set(self, name: str, value: str, *, domain: str) -> None:
+            self.values.append((name, value, domain))
+
+    http = _RecordingHttp([
+        _FakeResponse({}),
+        _FakeResponse({
+            "checkout_session_id": "oaics_fixture",
+            "processor_entity": "openai_llc",
+        }),
+    ])
+    http.cookies = _Cookies()
+
+    with (
+        patch.object(checkout_app.sc, "build_http", return_value=http),
+        patch.object(
+            checkout_app,
+            "resolve_payment_sentinel_headers",
+            return_value={"OpenAI-Sentinel-Token": "sentinel-fixture"},
+        ) as sentinel,
+    ):
+        created = checkout_app.create_checkout(
+            "access-token",
+            {"checkout_ui_mode": "custom"},
+            "socks5h://vn-proxy",
+            "device-fixture",
+            "device-fixture",
+            lambda _message: None,
+            allow_sentinel_fallback=False,
+            diagnostic_label="MoMo",
+        )
+
+    assert created["data"]["checkout_session_id"] == "oaics_fixture"
+    sentinel.assert_called_once()
+    args, kwargs = sentinel.call_args
+    assert args[1:5] == (
+        "socks5h://vn-proxy",
+        "chatgpt_checkout",
+        "device-fixture",
+        "device-fixture",
+    )
+    assert kwargs["allow_fallback"] is False
+    assert http.cookies.values == [
+        ("oai-did", "device-fixture", "chatgpt.com"),
+    ]
+    assert http.close_count == 0
+    _, checkout_url, checkout_request = http.calls[1]
+    assert checkout_url == checkout_app.sc.OPENAI_CHECKOUT_URL
+    assert checkout_request["headers"]["OAI-Device-Id"] == "device-fixture"
+    assert checkout_request["headers"]["OpenAI-Sentinel-Token"] == "sentinel-fixture"
+
+
+def test_momo_create_promotion_400_is_rebuildable_and_closes_unregistered_session() -> None:
+    warmup = _FakeResponse({})
+    rejected = _FakeResponse({}, status_code=400)
+    rejected.text = (
+        '{"detail":"This promotion is not compatible with the checkout\'s payment methods."}'
+    )
+    http = _RecordingHttp([warmup, rejected])
+
+    with (
+        patch.object(checkout_app.sc, "build_http", return_value=http),
+        patch.object(
+            checkout_app,
+            "resolve_payment_sentinel_headers",
+            return_value={},
+        ),
+        pytest.raises(RuntimeError, match="MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED"),
+    ):
+        checkout_app.create_checkout(
+            "access-token",
+            {
+                "checkout_ui_mode": "custom",
+                "promo_campaign": {"promo_campaign_id": "plus-1-month-free"},
+            },
+            "socks5h://vn-proxy",
+            "device-fixture",
+            "device-fixture",
+            lambda _message: None,
+            allow_sentinel_fallback=False,
+            diagnostic_label="MoMo",
+        )
+
+    assert http.close_count == 1
+
+
+def test_momo_checkout_closes_session_when_sentinel_generation_fails() -> None:
+    http = _RecordingHttp([_FakeResponse({})])
+
+    with (
+        patch.object(checkout_app.sc, "build_http", return_value=http),
+        patch.object(
+            checkout_app,
+            "resolve_payment_sentinel_headers",
+            side_effect=RuntimeError("sentinel fixture failure"),
+        ),
+        pytest.raises(RuntimeError, match="sentinel fixture failure"),
+    ):
+        checkout_app.create_checkout(
+            "access-token",
+            {"checkout_ui_mode": "custom"},
+            "socks5h://vn-proxy",
+            "device-fixture",
+            "device-fixture",
+            lambda _message: None,
+            allow_sentinel_fallback=False,
+            diagnostic_label="MoMo",
+        )
+
+    assert http.close_count == 1
+
+
+def test_momo_checkout_closes_session_on_non_promotion_http_error() -> None:
+    rejected = _FakeResponse({}, status_code=500)
+    rejected.text = '{"detail":"upstream failure"}'
+    http = _RecordingHttp([_FakeResponse({}), rejected])
+
+    with (
+        patch.object(checkout_app.sc, "build_http", return_value=http),
+        patch.object(
+            checkout_app,
+            "resolve_payment_sentinel_headers",
+            return_value={},
+        ),
+        pytest.raises(RuntimeError, match="OpenAI Checkout HTTP 500"),
+    ):
+        checkout_app.create_checkout(
+            "access-token",
+            {"checkout_ui_mode": "custom"},
+            "socks5h://vn-proxy",
+            "device-fixture",
+            "device-fixture",
+            lambda _message: None,
+            allow_sentinel_fallback=False,
+            diagnostic_label="MoMo",
+        )
+
+    assert http.close_count == 1
 
 
 def test_momo_confirmation_token_uses_payment_method_without_leaking_it_to_logs() -> None:
@@ -200,6 +810,62 @@ def test_momo_native_checkout_confirm_uses_confirm_token_contract() -> None:
         "selected_payment_method_type": "momo",
         "confirm_token": "ctoken_fixture",
     }
+
+
+@pytest.mark.parametrize("status_code", [200, 400])
+def test_momo_native_confirm_classifies_result_blocked_before_http_error(
+    status_code: int,
+) -> None:
+    blocked = _FakeResponse({"result": "blocked", "code": "risk_blocked"}, status_code)
+    blocked.text = '{"result":"blocked","code":"risk_blocked"}'
+    http = _RecordingHttp([blocked])
+
+    with (
+        patch.object(checkout_app, "resolve_payment_sentinel_headers", return_value={}),
+        pytest.raises(RuntimeError, match="MOMO_OAICS_CONFIRM_BLOCKED"),
+    ):
+        checkout_app.confirm_oaics_native_payment_method(
+            http,
+            "access-token",
+            "oaics_fixture",
+            "openai_llc",
+            "momo",
+            "ctoken_fixture",
+            "http://vn-proxy",
+            "device-fixture",
+            "did-fixture",
+        )
+
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize("status_code", [200, 400])
+def test_momo_custom_confirm_blocked_rebuilds_without_reusing_session(
+    status_code: int,
+) -> None:
+    blocked = _FakeResponse({"result": "blocked", "code": "risk_blocked"}, status_code)
+    blocked.text = '{"result":"blocked","code":"risk_blocked"}'
+    http = _RecordingHttp([blocked])
+
+    with (
+        patch.object(checkout_app, "resolve_payment_sentinel_headers", return_value={}),
+        pytest.raises(RuntimeError, match="CUSTOM_CONFIRM_BLOCKED"),
+    ):
+        checkout_app.confirm_custom_checkout_method_with_retry(
+            http,
+            "access-token",
+            "oaics_fixture",
+            "openai_llc",
+            "cpmt_momo",
+            "http://vn-proxy",
+            "device-fixture",
+            "did-fixture",
+            method_name="MoMo",
+            max_retries=2,
+            rebuild_on_blocked=True,
+        )
+
+    assert len(http.calls) == 1
 
 
 def test_momo_intent_fallback_confirms_setup_intent_with_created_payment_method() -> None:
