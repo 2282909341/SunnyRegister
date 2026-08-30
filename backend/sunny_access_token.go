@@ -585,7 +585,7 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 		}
 		items = append(items, item)
 		task.ProgressCurrent++
-		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
+		s.persistTaskProgress(task, intValue(result["valid"], 0)+intValue(result["invalid"], 0), intValue(result["failed"], 0), now)
 	}
 	if len(invalidAccounts) > 0 {
 		renewalAccounts := s.filterActiveSunnyRenewalAccounts(invalidAccounts)
@@ -615,6 +615,7 @@ func (s *Server) executeSunnyAccessTokenCheckTask(task *Task, payload map[string
 func (s *Server) failSunnyAccessTokenCheckTask(task *Task, message string) {
 	task.Status = TaskFailed
 	task.Error = message
+	task.ErrorCount = task.ProgressTotal
 	task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	task.ResultJSON = dumpJSON(map[string]any{"requested": task.ProgressTotal, "valid": 0, "invalid": 0, "failed": task.ProgressTotal, "skipped": 0})
 	s.db.Save(task)

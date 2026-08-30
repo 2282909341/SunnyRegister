@@ -220,7 +220,7 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 		}
 		items = append(items, item)
 		task.ProgressCurrent++
-		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
+		s.persistTaskProgress(task, intValue(result["detected"], 0), intValue(result["failed"], 0), now)
 	}
 	result["items"] = items
 	task.Status = TaskSucceeded

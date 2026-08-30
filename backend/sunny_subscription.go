@@ -449,7 +449,7 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 	record := func(item map[string]any) {
 		items = append(items, item)
 		task.ProgressCurrent++
-		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": time.Now()})
+		s.persistTaskProgress(task, intValue(result["subscribed"], 0)+intValue(result["not_subscribed"], 0), intValue(result["failed"], 0), time.Now())
 	}
 	confirmPlan := func(candidate sunnySubscriptionCandidate, planType string, item map[string]any, detail map[string]any) {
 		email := candidate.Email
@@ -630,6 +630,7 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 func (s *Server) failSunnySubscriptionTask(task *Task, message string) {
 	task.Status = TaskFailed
 	task.Error = message
+	task.ErrorCount = task.ProgressTotal
 	task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	task.ResultJSON = dumpJSON(map[string]any{"requested": task.ProgressTotal, "subscribed": 0, "not_subscribed": 0, "failed": task.ProgressTotal})
 	s.db.Save(task)

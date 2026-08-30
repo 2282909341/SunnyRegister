@@ -295,7 +295,7 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 		items = append(items, item)
 		current := task.ProgressCurrent + 1
 		task.ProgressCurrent = current
-		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": current, "updated_at": time.Now()})
+		s.persistTaskProgress(task, intValue(result["alive"], 0)+intValue(result["banned"], 0), intValue(result["failed"], 0), time.Now())
 	}
 	result["items"] = items
 	s.completeSunnyHealthTask(task, result)
@@ -304,6 +304,7 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 func (s *Server) failSunnyHealthTask(task *Task, message string) {
 	task.Status = TaskFailed
 	task.Error = message
+	task.ErrorCount = task.ProgressTotal
 	task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	task.ResultJSON = dumpJSON(map[string]any{"requested": task.ProgressTotal, "checked": 0, "alive": 0, "banned": 0, "failed": task.ProgressTotal, "skipped": 0})
 	s.db.Save(task)

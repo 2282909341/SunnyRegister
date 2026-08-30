@@ -1081,7 +1081,7 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 		}
 		items = append(items, item)
 		task.ProgressCurrent++
-		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
+		s.persistTaskProgress(task, intValue(result["eligible"], 0)+intValue(result["ineligible"], 0), intValue(result["failed"], 0), now)
 	}
 	if len(invalidAccounts) > 0 {
 		renewalAccounts := s.filterActiveSunnyRenewalAccounts(invalidAccounts)
@@ -1148,6 +1148,7 @@ func (s *Server) sunnyCommerceProxyURL(accountKey string) string {
 func (s *Server) failSunnyTrialTask(task *Task, message string) {
 	task.Status = TaskFailed
 	task.Error = message
+	task.ErrorCount = task.ProgressTotal
 	task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	task.ResultJSON = dumpJSON(map[string]any{"requested": task.ProgressTotal, "eligible": 0, "ineligible": 0, "skipped": 0, "failed": task.ProgressTotal})
 	s.db.Save(task)

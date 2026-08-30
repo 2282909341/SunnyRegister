@@ -592,7 +592,7 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		}
 		items = append(items, item)
 		task.ProgressCurrent++
-		s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"progress_current": task.ProgressCurrent, "updated_at": now})
+		s.persistTaskProgress(task, intValue(result["detected"], 0)+intValue(result["partial"], 0), intValue(result["failed"], 0), now)
 		status := text(item["status"])
 		progressMessage := fmt.Sprintf("[%s] [支付探测] 账户任务完成：%d/%d，结果=%s，支付方式=%s", outcome.Candidate.Email, task.ProgressCurrent, task.ProgressTotal, status, fallback(strings.Join(outcome.Methods, ", "), "-"))
 		progressLevel := "info"

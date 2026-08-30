@@ -196,6 +196,21 @@ func (s *Server) createTask(taskType, platform string, payload map[string]any, t
 	return task
 }
 
+// persistTaskProgress records the counters after one account outcome has been
+// consumed. Keeping these fields in the task row lets polling clients display
+// live success/failure totals instead of waiting for the final summary save.
+func (s *Server) persistTaskProgress(task *Task, success, failed int, updatedAt time.Time) {
+	task.SuccessCount = success
+	task.ErrorCount = failed
+	task.UpdatedAt = updatedAt
+	s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{
+		"progress_current": task.ProgressCurrent,
+		"success_count":    success,
+		"error_count":      failed,
+		"updated_at":       updatedAt,
+	})
+}
+
 func serializeTask(t Task) map[string]any {
 	result := jsonMap(t.ResultJSON)
 	errors := []any{}
