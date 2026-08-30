@@ -7,6 +7,14 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
+let input = {};
+try {
+  input = JSON.parse(fs.readFileSync(process.argv[2], "utf-8"));
+} catch (error) {
+  console.error("Input JSON error:", error.message);
+  process.exit(1);
+}
+
 // 读取与部署包放在一起的 Sentinel SDK，避免依赖开发机私有目录。
 const sdkPath = process.env.SENTINEL_SDK_PATH || path.join(__dirname, "sentinel_sdk_full.js");
 let sdkCode = fs.readFileSync(sdkPath, "utf-8");
@@ -45,6 +53,20 @@ const dom = new JSDOM(`<!DOCTYPE html><html><body></body></html>`, {
 
 const { window } = dom;
 
+// Keep the SDK fingerprint aligned with the HTTP authentication session.  The
+// jsdom default user agent ("jsdom/...") is readily detectable and can cause
+// Sentinel authorize_continue to reject an otherwise valid proof.
+const userAgent = String(input.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36");
+Object.defineProperty(window.navigator, "userAgent", { value: userAgent, configurable: true });
+Object.defineProperty(window.navigator, "language", { value: "ja-JP", configurable: true });
+Object.defineProperty(window.navigator, "languages", { value: ["ja-JP", "ja", "en"], configurable: true });
+Object.defineProperty(window.navigator, "platform", { value: "Win32", configurable: true });
+Object.defineProperty(window.navigator, "hardwareConcurrency", { value: 8, configurable: true });
+Object.defineProperty(window.navigator, "webdriver", { value: false, configurable: true });
+for (const [name, value] of Object.entries({ width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24, pixelDepth: 24 })) {
+  try { Object.defineProperty(window.screen, name, { value, configurable: true }); } catch (_) {}
+}
+
 // 补充 crypto
 if (!window.crypto) window.crypto = {};
 window.crypto.getRandomValues = (arr) => {
@@ -78,7 +100,6 @@ try {
 // requirements token before /req, and enforcement token after /req. Keep this
 // path separate from the legacy diagnostic mode below so Pay153 callers keep
 // their existing output contract.
-const input = JSON.parse(fs.readFileSync(process.argv[2], "utf-8"));
 if (input.action === "requirements" || input.action === "solve") {
   (async () => {
     try {

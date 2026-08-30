@@ -21,6 +21,7 @@ from .sentinel import (
     SENTINEL_FRAME_URL,
     SENTINEL_REQ_URL,
     SentinelBrowserRuntime,
+    SentinelNodeRuntime,
     SentinelTokenGenerator,
     generate_datadog_trace_headers,
 )
@@ -271,7 +272,7 @@ class ProtocolRegistrationFlow:
         self.challenge_strategy = (
             challenge_strategy if challenge_strategy in {"native_headless", "sentinel_protocol"} else "native_headless"
         )
-        self._sentinel_runtime: SentinelBrowserRuntime | None = None
+        self._sentinel_runtime: SentinelBrowserRuntime | SentinelNodeRuntime | None = None
 
     def _check_cancelled(self) -> None:
         if self.should_cancel():
@@ -436,7 +437,9 @@ class ProtocolRegistrationFlow:
 
     def _sentinel_headers(self, flow: str) -> dict[str, str]:
         """Build Sentinel headers, refreshing the narrow browser runtime once."""
-        attempts = 2 if self.challenge_strategy == "sentinel_protocol" else 1
+        # A fresh proof is single-use. Three bounded attempts tolerate a
+        # transient challenge/runtime failure without looping indefinitely.
+        attempts = 3 if self.challenge_strategy == "sentinel_protocol" else 1
         last_error: BaseException | None = None
         for attempt in range(attempts):
             try:
@@ -445,13 +448,13 @@ class ProtocolRegistrationFlow:
                 last_error = exc
                 if attempt + 1 >= attempts or self.should_cancel():
                     raise
-                self.log(f"[认证] Sentinel {flow} 证明生成/校验失败，刷新窄范围 Camoufox 运行时重试 ({attempt + 1}/{attempts - 1})")
+                self.log(f"[认证] Sentinel {flow} 证明生成/校验失败，刷新运行时重试 ({attempt + 1}/{attempts - 1})")
                 self._reset_sentinel_runtime()
             except Exception as exc:
                 last_error = exc
                 if attempt + 1 >= attempts or self.should_cancel():
                     raise
-                self.log(f"[认证] Sentinel {flow} 运行时异常，刷新窄范围 Camoufox 运行时重试 ({attempt + 1}/{attempts - 1})")
+                self.log(f"[认证] Sentinel {flow} 运行时异常，刷新运行时重试 ({attempt + 1}/{attempts - 1})")
                 self._reset_sentinel_runtime()
         if last_error is not None:
             raise last_error
@@ -465,16 +468,42 @@ class ProtocolRegistrationFlow:
         if self.challenge_strategy == "sentinel_protocol":
             try:
                 if self._sentinel_runtime is None:
-                    self._sentinel_runtime = SentinelBrowserRuntime(
-                        self.session,
-                        proxy_url=self.proxy_url,
-                        log=self.log,
-                        should_cancel=self.should_cancel,
-                    )
+                    try:
+                        self._sentinel_runtime = SentinelNodeRuntime(
+                            self.session,
+                            proxy_url=self.proxy_url,
+                            log=self.log,
+                            should_cancel=self.should_cancel,
+                        )
+                    except Exception as node_exc:
+                        self.log(f"[认证] Sentinel Node V8 运行时不可用，回退 Camoufox：{node_exc}")
+                        self._sentinel_runtime = SentinelBrowserRuntime(
+                            self.session,
+                            proxy_url=self.proxy_url,
+                            log=self.log,
+                            should_cancel=self.should_cancel,
+                        )
                 runtime = self._sentinel_runtime
                 sdk_requirements = getattr(runtime, "requirements_token", None)
                 if callable(sdk_requirements):
-                    requirements_proof = str(sdk_requirements() or "").strip()
+                    try:
+                        requirements_proof = str(sdk_requirements() or "").strip()
+                    except Exception as runtime_exc:
+                        if not isinstance(runtime, SentinelNodeRuntime):
+                            raise
+                        self.log(f"[认证] Sentinel Node V8 证明生成失败，回退 Camoufox：{runtime_exc}")
+                        try:
+                            runtime.close()
+                        except Exception:
+                            pass
+                        runtime = SentinelBrowserRuntime(
+                            self.session,
+                            proxy_url=self.proxy_url,
+                            log=self.log,
+                            should_cancel=self.should_cancel,
+                        )
+                        self._sentinel_runtime = runtime
+                        requirements_proof = str(runtime.requirements_token() or "").strip()
                     if not requirements_proof:
                         raise RuntimeError("Sentinel SDK returned an empty requirements token")
             except Exception as exc:
@@ -523,13 +552,36 @@ class ProtocolRegistrationFlow:
             try:
                 if runtime is None:
                     runtime = self._sentinel_runtime
-                return runtime.build_headers(
-                    challenge_payload=payload,
-                    cached_proof=requirements_proof,
-                    enforcement="",
-                    device_id=self.device_id,
-                    flow=flow,
-                )
+                try:
+                    return runtime.build_headers(
+                        challenge_payload=payload,
+                        cached_proof=requirements_proof,
+                        enforcement="",
+                        device_id=self.device_id,
+                        flow=flow,
+                    )
+                except Exception as runtime_exc:
+                    if not isinstance(runtime, SentinelNodeRuntime):
+                        raise
+                    self.log(f"[认证] Sentinel Node V8 证明校验失败，回退 Camoufox 重试：{runtime_exc}")
+                    try:
+                        runtime.close()
+                    except Exception:
+                        pass
+                    runtime = SentinelBrowserRuntime(
+                        self.session,
+                        proxy_url=self.proxy_url,
+                        log=self.log,
+                        should_cancel=self.should_cancel,
+                    )
+                    self._sentinel_runtime = runtime
+                    return runtime.build_headers(
+                        challenge_payload=payload,
+                        cached_proof=requirements_proof,
+                        enforcement="",
+                        device_id=self.device_id,
+                        flow=flow,
+                    )
             except Exception as exc:
                 if self.should_cancel():
                     raise
@@ -574,7 +626,7 @@ class ProtocolRegistrationFlow:
         data: str,
     ) -> Any:
         """Retry a rejected Sentinel header without rebuilding auth cookies."""
-        attempts = 2 if self.challenge_strategy == "sentinel_protocol" else 1
+        attempts = 3 if self.challenge_strategy == "sentinel_protocol" else 1
         for attempt in range(attempts):
             headers = dict(base_headers)
             headers.update(self._sentinel_headers(flow))

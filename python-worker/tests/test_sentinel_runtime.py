@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from sunny_core.sentinel import SentinelBrowserRuntime
+import pytest
+
+from sunny_core.sentinel import SentinelBrowserRuntime, SentinelNodeRuntime
 
 
 class FakePage:
@@ -65,3 +67,25 @@ def test_sentinel_runtime_disables_default_viewport_for_camoufox_context() -> No
         "locale": "ja-JP",
     }
     assert FakeManager.last_browser.context.closed is True
+
+
+def test_sentinel_node_runtime_builds_headers_and_reuses_requirements_proof() -> None:
+    with patch("sunny_core.sentinel.shutil.which", return_value="node"):
+        runtime = SentinelNodeRuntime(object())
+    with patch.object(runtime, "_run", side_effect=[{"request_p": "requirements"}, {"final_p": None, "t": "", "so": None}]):
+        assert runtime.requirements_token() == "requirements"
+        headers = runtime.build_headers(
+            challenge_payload={"token": "challenge", "turnstile": {"required": False}},
+            cached_proof="requirements",
+            enforcement="",
+            device_id="device",
+            flow="authorize_continue",
+        )
+    assert '"p":"requirements"' in headers["openai-sentinel-token"]
+    assert '"c":"challenge"' in headers["openai-sentinel-token"]
+
+
+def test_sentinel_node_runtime_requires_node() -> None:
+    with patch("sunny_core.sentinel.shutil.which", return_value=None):
+        with pytest.raises(RuntimeError, match="Node.js"):
+            SentinelNodeRuntime(object())

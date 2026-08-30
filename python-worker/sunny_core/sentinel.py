@@ -5,7 +5,10 @@ import json
 import os
 import random
 import secrets
+import shutil
+import subprocess
 import threading
+import tempfile
 import time
 import uuid
 from typing import Any, Callable
@@ -19,6 +22,11 @@ SENTINEL_FRAME_VERSION = os.environ.get("SENTINEL_FRAME_VERSION", "20260219f9f6"
 SENTINEL_SDK_URL = f"{SENTINEL_BASE}/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
 SENTINEL_REQ_URL = f"{SENTINEL_BASE}/backend-api/sentinel/req"
 SENTINEL_FRAME_URL = f"{SENTINEL_BASE}/backend-api/sentinel/frame.html?sv={SENTINEL_FRAME_VERSION}"
+SENTINEL_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
 
 
 def generate_datadog_trace_headers() -> dict[str, str]:
@@ -334,6 +342,150 @@ class SentinelBrowserRuntime:
                 manager.__exit__(None, None, None)
             except Exception:
                 pass
+
+
+class SentinelNodeRuntime:
+    """Generate Sentinel proofs in an isolated Node V8/jsdom process.
+
+    Firefox exposes cross-origin values through Xray wrappers.  The Sentinel
+    SDK's TypedArray-heavy device challenge is rejected by that boundary on
+    some Camoufox versions, which makes the protocol path fail before the
+    account login request is sent.  Running the same bundled SDK in Node keeps
+    the proof generation inside one JavaScript realm and avoids that failure.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        *,
+        proxy_url: str = "",
+        log: Callable[[str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
+        del session, proxy_url
+        self.log = log or (lambda _message: None)
+        self.should_cancel = should_cancel or (lambda: False)
+        self._node = os.environ.get("SUNNY_NODE_BINARY") or os.environ.get("NODE_BINARY") or shutil.which("node")
+        if not self._node:
+            raise RuntimeError("Sentinel Node V8 runtime requires Node.js, but no node executable was found")
+        self._script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "tools", "pay153_checkout", "gen_token_jsdom.js")
+        )
+        if not os.path.isfile(self._script):
+            raise RuntimeError(f"Sentinel Node VM script not found: {self._script}")
+        self.log("[认证] Sentinel Node V8 运行时已就绪；证明生成不经过 Firefox Xray")
+
+    def _check_cancelled(self) -> None:
+        if self.should_cancel():
+            from .openai_auth import TaskCancelledError
+
+            raise TaskCancelledError("Task cancelled by user")
+
+    def _run(self, payload: dict[str, Any], *, timeout: int = 60) -> dict[str, Any]:
+        self._check_cancelled()
+        fd, input_file = tempfile.mkstemp(prefix="sunny_sentinel_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            try:
+                result = subprocess.run(
+                    [self._node, self._script, input_file],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    cwd=os.path.dirname(self._script),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"Sentinel Node VM timed out after {timeout} seconds") from exc
+            self._check_cancelled()
+            output = str(result.stdout or "")
+            marker = "=== JSON_OUTPUT ==="
+            if result.returncode != 0:
+                detail = str(result.stderr or output).strip().replace("\r", " ").replace("\n", " ")
+                raise RuntimeError(f"Sentinel Node VM exited with code {result.returncode}: {detail[:500]}")
+            if marker not in output:
+                detail = str(result.stderr or output).strip().replace("\r", " ").replace("\n", " ")
+                raise RuntimeError(f"Sentinel Node VM produced no JSON output: {detail[:500]}")
+            raw = output.split(marker, 1)[1].strip()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Sentinel Node VM returned invalid JSON: {exc}") from exc
+            if not isinstance(data, dict):
+                raise RuntimeError("Sentinel Node VM returned a non-object result")
+            return data
+        finally:
+            try:
+                os.unlink(input_file)
+            except OSError:
+                pass
+
+    def requirements_token(self) -> str:
+        result = self._run({"action": "requirements", "userAgent": SENTINEL_USER_AGENT})
+        token = str(result.get("request_p") or "").strip()
+        if not token:
+            raise RuntimeError("Sentinel Node SDK returned an empty requirements token")
+        return token
+
+    def build_headers(
+        self,
+        *,
+        challenge_payload: dict[str, Any],
+        cached_proof: str,
+        enforcement: str,
+        device_id: str,
+        flow: str,
+    ) -> dict[str, str]:
+        del enforcement
+        result = self._run(
+            {
+                "action": "solve",
+                "chatReq": challenge_payload,
+                "cachedProof": cached_proof,
+                "deviceId": device_id,
+                "flow": flow,
+                "userAgent": SENTINEL_USER_AGENT,
+            }
+        )
+        # The SDK returns null when the endpoint did not request a second PoW;
+        # in that case the official client reuses the requirements proof.
+        final_p = str(result.get("final_p") or cached_proof or "").strip()
+        if final_p != str(cached_proof or "").strip() and not final_p.startswith("gAAAAAB"):
+            raise RuntimeError("Sentinel Node SDK returned an invalid enforcement token")
+        turnstile = challenge_payload.get("turnstile") if isinstance(challenge_payload.get("turnstile"), dict) else {}
+        t_value = str(result.get("t") or "").strip()
+        if turnstile.get("required") and not t_value:
+            raise RuntimeError("Sentinel Node VM did not generate the required Turnstile token")
+        if not final_p:
+            raise RuntimeError("Sentinel Node SDK returned an empty enforcement token")
+        token = {
+            "p": final_p,
+            "c": str(challenge_payload.get("token") or ""),
+            "id": device_id,
+            "flow": flow,
+        }
+        if t_value:
+            token["t"] = t_value
+        headers = {"openai-sentinel-token": json.dumps(token, separators=(",", ":"))}
+        so_value = result.get("so")
+        if isinstance(so_value, str) and so_value.strip():
+            try:
+                parsed_so = json.loads(so_value)
+            except json.JSONDecodeError:
+                parsed_so = None
+            if isinstance(parsed_so, dict):
+                headers["openai-sentinel-so-token"] = json.dumps(parsed_so, separators=(",", ":"))
+            else:
+                headers["openai-sentinel-so-token"] = json.dumps(
+                    {"so": so_value, "c": str(challenge_payload.get("token") or ""), "id": device_id, "flow": flow},
+                    separators=(",", ":"),
+                )
+        return headers
+
+    def close(self) -> None:
+        return None
 
 
 def browser_fetch(
