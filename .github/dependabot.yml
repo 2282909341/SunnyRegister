@@ -3,29 +3,57 @@ updates:
   - package-ecosystem: npm
     directory: /frontend
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 1
     groups:
-      eslint-toolchain:
+      frontend-dependencies:
         patterns:
-          - "@eslint/*"
-          - "eslint"
-          - "eslint-*"
-          - "typescript-eslint"
+          - "*"
   - package-ecosystem: gomod
     directory: /backend
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 1
+    groups:
+      backend-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: pip
     directory: /python-worker
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 1
+    groups:
+      python-worker-dependencies:
+        patterns:
+          - "*"
     ignore:
       - dependency-name: playwright
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 1
+    groups:
+      container-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 1
+    groups:
+      workflow-dependencies:
+        patterns:
+          - "*"
