@@ -13,7 +13,7 @@ import DirectCardPayment from "@/pages/payments/DirectCardPayment";
 type Row = Record<string, any>;
 type GoPayView = "overview" | "register" | "pool" | "accounts" | "payment" | "settings";
 type PaymentMethod = "gopay" | "paypal" | "direct_card";
-type RunAction = (key: string, action: () => Promise<any>, success: string, refresh?: () => Promise<void>) => Promise<void>;
+type RunAction = (key: string, action: () => Promise<any>, success: string, refresh?: () => Promise<void>) => Promise<boolean>;
 
 const api = (path: string, options?: RequestInit) => apiFetch(`/payments/gopay${path}`, options);
 const post = (path: string, body: Row = {}) => api(path, { method: "POST", body: JSON.stringify(body) });
@@ -26,7 +26,7 @@ function formatTime(value: unknown) {
 
 function statusLabel(value: unknown) {
   const key = String(value || "unknown");
-  return ({ queued: "排队中", running: "进行中", awaiting_otp: "等待 OTP", awaiting_captcha: "等待验证", completed: "已完成", success: "成功", failed: "失败", cancelled: "已取消", cancelling: "取消中", done: "已完成", available: "可用", registered: "已注册", already_registered: "已存在", missing: "未设置", unknown: "未检测" } as Record<string, string>)[key] || key;
+  return ({ queued: "排队中", running: "进行中", awaiting_otp: "等待 OTP", validating_otp: "验证 OTP", awaiting_captcha: "等待验证", interrupted_unknown: "交易待核对", success_unreconciled: "成功·待收尾", fraud_denied: "风控拒绝", completed: "已完成", success: "成功", failed: "失败", cancelled: "已取消", cancelling: "取消中", done: "已完成", available: "可用", registered: "已注册", already_registered: "已存在", missing: "未设置", unknown: "未检测" } as Record<string, string>)[key] || key;
 }
 
 function Status({ value }: { value: unknown }) {
@@ -57,6 +57,7 @@ export default function PaymentManagement() {
   const [paypalJobs, setPaypalJobs] = useState<Row[]>([]);
   const [paypalConfig, setPaypalConfig] = useState<Row>({});
   const [sms, setSms] = useState<Row>({});
+  const [captcha, setCaptcha] = useState<Row>({});
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState<{ type: "ok" | "error"; text: string } | null>(null);
@@ -80,6 +81,7 @@ export default function PaymentManagement() {
     setPaymentJobs(paymentData.jobs || []);
   }, []);
   const loadSms = useCallback(async () => { setSms(await api("/sms-status")); }, []);
+  const loadCaptcha = useCallback(async () => { setCaptcha(await api("/captcha-status")); }, []);
   const loadPaypal = useCallback(async () => {
     const [jobs, config] = await Promise.all([api("/paypal-jobs"), api("/paypal-config")]);
     setPaypalJobs(jobs.jobs || []);
@@ -87,11 +89,11 @@ export default function PaymentManagement() {
   }, []);
   const refreshAll = useCallback(async (showToast = false) => {
     try {
-      await Promise.all([loadAccounts(), loadPhones(), loadJobs(), loadSms(), loadPaypal()]);
+      await Promise.all([loadAccounts(), loadPhones(), loadJobs(), loadSms(), loadCaptcha(), loadPaypal()]);
       if (showToast) toast("GoPay 数据已刷新");
     } catch (error) { toast(error instanceof Error ? error.message : "GoPay 数据加载失败", "error"); }
     finally { setLoading(false); }
-  }, [loadAccounts, loadPhones, loadJobs, loadSms, loadPaypal, toast]);
+  }, [loadAccounts, loadPhones, loadJobs, loadSms, loadCaptcha, loadPaypal, toast]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => { void refreshAll(); }, 0);
@@ -104,8 +106,8 @@ export default function PaymentManagement() {
 
   const run = useCallback(async (key: string, action: () => Promise<any>, success: string, refresh?: () => Promise<void>) => {
     setBusy(key);
-    try { await action(); toast(success); if (refresh) await refresh(); }
-    catch (error) { toast(error instanceof Error ? error.message : "操作失败", "error"); }
+    try { await action(); toast(success); if (refresh) await refresh(); return true; }
+    catch (error) { toast(error instanceof Error ? error.message : "操作失败", "error"); return false; }
     finally { setBusy(""); }
   }, [toast]);
 
@@ -158,7 +160,7 @@ export default function PaymentManagement() {
             {view === "pool" && <PoolView phones={phones} search={poolSearch} setSearch={setPoolSearch} busy={busy} run={run} refresh={loadPhones} />}
             {view === "accounts" && <AccountsView accounts={accounts} search={accountSearch} setSearch={setAccountSearch} busy={busy} run={run} refresh={loadAccounts} onPin={setPinAccount} onRegister={() => setView("register")} />}
             {view === "payment" && <PaymentView accounts={accounts} jobs={paymentJobs} filter={paymentFilter} setFilter={setPaymentFilter} selected={selectedPayment} select={setSelectedPaymentId} busy={busy} run={run} refresh={loadJobs} onLogs={setLogJob} />}
-            {view === "settings" && <SettingsView sms={sms} busy={busy} run={run} refresh={loadSms} />}
+            {view === "settings" && <SettingsView sms={sms} captcha={captcha} busy={busy} run={run} refresh={async () => { await Promise.all([loadSms(), loadCaptcha()]); }} />}
           </>}
         </>}
       </main>
@@ -284,11 +286,14 @@ function AccountsView({ accounts, search, setSearch, busy, run, refresh, onPin, 
 }
 
 function paymentStage(job: Row) {
+  const status = String(job.status || "");
+  const phase = String(job.payment_phase || "");
   const text = `${(job.logs || []).map((row: Row) => row.message || "").join(" ")} ${job.message || ""}`;
-  if (job.status === "success" || /成功|完成|扣款/.test(text)) return 4;
-  if (/PIN|pin/.test(text)) return 3;
-  if (job.status === "waiting_otp" || /OTP|验证码/.test(text)) return 2;
-  if (/绑定|Midtrans|支付方式/.test(text)) return 1;
+  if (["success", "success_unreconciled"].includes(status) || job.charge_started_at || ["charge_started", "charged", "processing"].includes(phase)) return 4;
+  if (/Step (?:9|1[0-4]):|Resume payment Step|charge challenge_ref=|Payment process OK|Transaction status:/.test(text)) return 4;
+  if (/Step (?:6|7):|PIN verify \((?:MGUPA|GWC)\)|Step 7: validate-pin/.test(text)) return 3;
+  if (["waiting_otp", "validating_otp"].includes(status) || /Step (?:4|5):|Waiting for OTP|OTP received/.test(text)) return 2;
+  if (status === "awaiting_captcha" || /Step (?:1|2|3|8):|linking reference=|Linking complete|GoPay linked:/.test(text)) return 1;
   return 0;
 }
 const stageNames = ["检查账号", "绑定 Midtrans", "等待 OTP", "验证 PIN", "扣款结果"];
@@ -301,22 +306,89 @@ function PaymentView({ accounts, jobs, filter, setFilter, selected, select, busy
   return <div className="gopay-view"><div className="gopay-section-title"><div><h2>支付中心</h2><p>绑定 GoPay 并完成 Midtrans 支付</p></div></div><div className="gopay-payment-layout"><div className="gopay-payment-main"><div className="gopay-two-column">
     <Panel title="发起支付任务"><form className="gopay-form" onSubmit={submit}><div className="gopay-form-grid"><label className="wide"><span>GoPay 账号</span><select name="phone" required><option value="">请选择账号</option>{accounts.map((row) => <option key={row.phone} value={row.phone}>{row.phone} · {Number(row.balance || 0).toLocaleString("zh-CN")} Rp</option>)}</select></label><label><span>付款 PIN（可选）</span><input name="pin" type="password" inputMode="numeric" maxLength={6} autoComplete="off" placeholder="留空使用已保存 PIN" /></label><label><span>代理（可选）</span><input name="proxy" placeholder="留空使用账号代理" /></label><label className="wide"><span>Midtrans 链接</span><input name="midtrans_url" type="url" required placeholder="https://app.midtrans.com/snap/v4/redirection/..." /></label></div><div className="gopay-warning"><ShieldCheck />此操作可能直接产生真实扣款，请核对账号、订单与金额。</div><label className="gopay-check"><input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} /><span>我已核对订单并确认开始支付</span></label><Button type="submit" disabled={!ack || busy !== ""} className="w-full"><CircleDollarSign className="mr-2 h-4 w-4" />确认并开始支付</Button></form></Panel>
     <Panel title="支付流程" action={selected && <Status value={selected.status} />}><div className="gopay-flow">{stageNames.map((name, index) => <div key={name} className={cn(index <= stage && "active")}><span>{index + 1}</span><small>{name}</small></div>)}</div><div className="gopay-flow-copy"><strong>{selected ? stageNames[stage] : "准备开始"}</strong><span>{selected?.message || "创建或选择任务后显示当前阶段"}</span></div></Panel>
-  </div><Panel title="支付任务" action={<div className="gopay-panel-actions"><select value={filter} onChange={(e) => setFilter(e.target.value)}><option value="">全部状态</option><option value="running">进行中</option><option value="waiting_otp">等待 OTP</option><option value="success">成功</option><option value="failed">失败</option></select><Button size="sm" variant="outline" onClick={() => void refresh()}><RefreshCw className="h-3.5 w-3.5" /></Button><Button size="sm" variant="outline" onClick={() => void run("clear-payment", () => post("/tasks/clear-finished", { scope: "payment" }), "支付历史已清理", refresh)}><ListRestart className="mr-1 h-3.5 w-3.5" />清理已结束</Button></div>}><div className="gopay-table-wrap"><table><thead><tr><th>任务 ID</th><th>手机号</th><th>当前阶段</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((job) => <tr key={job.id} className={String(job.id) === String(selected?.id) ? "selected" : ""} onClick={() => select(String(job.id))}><td className="mono">{job.id}</td><td>{job.phone || "-"}</td><td>{stageNames[paymentStage(job)]}</td><td><Status value={job.status} /></td><td>{formatTime(job.updated_at)}</td><td><Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); onLogs(job); }}>日志</Button></td></tr>) : <tr><td colSpan={6}><Empty title="暂无支付任务" /></td></tr>}</tbody></table></div></Panel></div>
+  </div><Panel title="支付任务" action={<div className="gopay-panel-actions"><select value={filter} onChange={(e) => setFilter(e.target.value)}><option value="">全部状态</option><option value="running">进行中</option><option value="awaiting_captcha">等待验证</option><option value="waiting_otp">等待 OTP</option><option value="interrupted_unknown">交易待核对</option><option value="success">成功</option><option value="success_unreconciled">成功·待收尾</option><option value="failed">失败</option></select><Button size="sm" variant="outline" onClick={() => void refresh()}><RefreshCw className="h-3.5 w-3.5" /></Button><Button size="sm" variant="outline" onClick={() => void run("clear-payment", () => post("/tasks/clear-finished", { scope: "payment" }), "支付历史已清理", refresh)}><ListRestart className="mr-1 h-3.5 w-3.5" />清理已结束</Button></div>}><div className="gopay-table-wrap"><table><thead><tr><th>任务 ID</th><th>手机号</th><th>当前阶段</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{rows.length ? rows.map((job) => <tr key={job.id} className={String(job.id) === String(selected?.id) ? "selected" : ""} onClick={() => select(String(job.id))}><td className="mono">{job.id}</td><td>{job.phone || "-"}</td><td>{stageNames[paymentStage(job)]}</td><td><Status value={job.status} /></td><td>{formatTime(job.updated_at)}</td><td><Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); onLogs(job); }}>日志</Button></td></tr>) : <tr><td colSpan={6}><Empty title="暂无支付任务" /></td></tr>}</tbody></table></div></Panel></div>
     <PaymentDetail job={selected} run={run} refresh={refresh} />
   </div></div>;
 }
 
 function PaymentDetail({ job, run, refresh }: { job: Row | null; run: RunAction; refresh: () => Promise<void> }) {
   if (!job) return <aside className="gopay-panel gopay-payment-detail"><Empty title="选择支付任务" detail="任务详情、日志和 OTP 输入会显示在这里" /></aside>;
-  const meta = job.meta || job.metadata || job.result || {};
+  const meta = job.midtrans_meta || job.meta || job.metadata || job.result || {};
   return <aside className="gopay-panel gopay-payment-detail"><header><h3>任务详情</h3><Status value={job.status} /></header><div className="gopay-detail"><dl><dt>任务 ID</dt><dd className="mono">{job.id}</dd><dt>手机号</dt><dd>{job.phone || "-"}</dd><dt>订单</dt><dd>{meta.order_id || "-"}</dd><dt>金额</dt><dd>{meta.gross_amount || "-"} {meta.currency || ""}</dd><dt>创建时间</dt><dd>{formatTime(job.created_at)}</dd><dt>更新时间</dt><dd>{formatTime(job.updated_at)}</dd></dl>{job.status === "waiting_otp" && <div className="gopay-otp-box"><KeyRound /><strong>输入支付 OTP</strong><p>验证码发送至 {job.phone}</p><OtpSubmit onSubmit={(code) => run(`payment-otp-${job.id}`, () => post(`/payment-jobs/${encodeURIComponent(job.id)}/otp`, { code }), "支付 OTP 已提交", refresh)} /></div>}<h4>流程日志</h4><ol className="gopay-logs">{(job.logs || []).map((entry: Row, index: number) => <li key={index}><time>{formatTime(entry.at)}</time><span>{entry.message || "-"}</span></li>)}</ol></div></aside>;
 }
 
-function SettingsView({ sms, busy, run, refresh }: { sms: Row; busy: string; run: RunAction; refresh: () => Promise<void> }) {
+function SettingsView({ sms, captcha, busy, run, refresh }: { sms: Row; captcha: Row; busy: string; run: RunAction; refresh: () => Promise<void> }) {
+  const [section, setSection] = useState<"sms" | "captcha">("sms");
   const [provider, setProvider] = useState<"smsbower" | "smspool">("smsbower");
+  const [captchaSecrets, setCaptchaSecrets] = useState({ solverify: "", twocaptcha: "" });
   const current = provider === "smspool" ? (sms.providers?.smspool || {}) : (sms.providers?.smsbower || sms);
-  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); await run("sms", () => post("/sms-config", { provider, api_key: data.get("api_key"), api_base_url: data.get("api_base_url"), service: data.get("service"), country: data.get("country"), pool: data.get("pool"), max_price: data.get("max_price") }), `${provider === "smspool" ? "SMSPool" : "SMSBower"} 配置已保存`, refresh); }
-  return <div className="gopay-view"><div className="gopay-section-title"><div><h2>系统配置</h2><p>按支付方式维护号码供应商接口</p></div></div><div className="gopay-segmented" role="tablist" aria-label="短信供应商"><button type="button" className={provider === "smsbower" ? "active" : ""} onClick={() => setProvider("smsbower")}>SMSBower</button><button type="button" className={provider === "smspool" ? "active" : ""} onClick={() => setProvider("smspool")}>SMSPool</button></div><Panel title={`${provider === "smspool" ? "SMSPool" : "SMSBower"} 配置`} className="gopay-settings-panel" action={<Status value={current.api_key_configured ? "success" : "failed"} />}><form className="gopay-form" onSubmit={submit}><div className="gopay-form-grid"><label className="wide"><span>API Key</span><input name="api_key" type="password" autoComplete="off" placeholder={current.api_key_configured ? `已配置 ${current.api_key || ""}，留空保持不变` : "请输入 API Key"} /></label><label className="wide"><span>Base URL</span><input name="api_base_url" type="url" defaultValue={current.api_base_url || (provider === "smspool" ? "https://api.smspool.net" : "https://smsbower.page")} /></label><label><span>服务代码</span><input name="service" defaultValue={current.service || (provider === "smspool" ? "392" : "ni")} /></label><label><span>国家代码</span><input name="country" defaultValue={current.country || (provider === "smspool" ? "9" : "6")} /></label>{provider === "smspool" && <><label><span>号码池（可选）</span><input name="pool" defaultValue={current.pool || ""} /></label><label><span>最高价格（可选）</span><input name="max_price" defaultValue={current.max_price || ""} placeholder="例如 0.01" /></label></>}</div><Button type="submit" disabled={busy !== ""}><Settings2 className="mr-2 h-4 w-4" />保存配置</Button></form></Panel></div>;
+  const twocaptchaConfigured = Boolean(captcha.twocaptcha_api_key_configured);
+  const captchaConfigured = Boolean(captcha.configured || captcha.solverify_api_key_configured || twocaptchaConfigured);
+
+  async function submitSms(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    await run("sms", () => post("/sms-config", {
+      provider,
+      api_key: data.get("api_key"),
+      api_base_url: data.get("api_base_url"),
+      service: data.get("service"),
+      country: data.get("country"),
+      pool: data.get("pool"),
+      max_price: data.get("max_price"),
+    }), `${provider === "smspool" ? "SMSPool" : "SMSBower"} 配置已保存`, refresh);
+  }
+
+  async function submitCaptcha(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const saved = await run("captcha", () => post("/captcha-config", {
+      api_key: captchaSecrets.twocaptcha,
+      poll_sec: data.get("poll_sec"),
+      timeout_sec: data.get("timeout_sec"),
+      max_attempts: data.get("max_attempts"),
+      solverify_api_key: captchaSecrets.solverify,
+      solverify_poll_sec: data.get("solverify_poll_sec"),
+      solverify_timeout_sec: data.get("solverify_timeout_sec"),
+      scene_id: data.get("scene_id"),
+      prefix: data.get("prefix"),
+      region: data.get("region"),
+      api_get_lib: data.get("api_get_lib"),
+    }), "人机验证配置已保存", refresh);
+    if (saved) setCaptchaSecrets({ solverify: "", twocaptcha: "" });
+  }
+
+  return <div className="gopay-view">
+    <div className="gopay-section-title"><div><h2>系统配置</h2><p>按支付方式维护号码供应商与 GoPay 人机验证</p></div></div>
+    <div className="gopay-segmented" role="tablist" aria-label="系统配置类别">
+      <button type="button" className={section === "sms" ? "active" : ""} onClick={() => setSection("sms")}>短信供应商</button>
+      <button type="button" className={section === "captcha" ? "active" : ""} onClick={() => setSection("captcha")}>人机验证</button>
+    </div>
+    {section === "sms" ? <>
+      <div className="gopay-segmented" role="tablist" aria-label="短信供应商"><button type="button" className={provider === "smsbower" ? "active" : ""} onClick={() => setProvider("smsbower")}>SMSBower</button><button type="button" className={provider === "smspool" ? "active" : ""} onClick={() => setProvider("smspool")}>SMSPool</button></div>
+      <Panel title={`${provider === "smspool" ? "SMSPool" : "SMSBower"} 配置`} className="gopay-settings-panel" action={<Status value={current.api_key_configured ? "success" : "failed"} />}>
+        <form className="gopay-form" onSubmit={submitSms}><div className="gopay-form-grid"><label className="wide"><span>API Key</span><input name="api_key" type="password" autoComplete="off" placeholder={current.api_key_configured ? `已配置 ${current.api_key || ""}，留空保持不变` : "请输入 API Key"} /></label><label className="wide"><span>Base URL</span><input name="api_base_url" type="url" defaultValue={current.api_base_url || (provider === "smspool" ? "https://api.smspool.net" : "https://smsbower.page")} /></label><label><span>服务代码</span><input name="service" defaultValue={current.service || (provider === "smspool" ? "392" : "ni")} /></label><label><span>国家代码</span><input name="country" defaultValue={current.country || (provider === "smspool" ? "9" : "6")} /></label>{provider === "smspool" && <><label><span>号码池（可选）</span><input name="pool" defaultValue={current.pool || ""} /></label><label><span>最高价格（可选）</span><input name="max_price" defaultValue={current.max_price || ""} placeholder="例如 0.01" /></label></>}</div><Button type="submit" disabled={busy !== ""}><Settings2 className="mr-2 h-4 w-4" />保存配置</Button></form>
+      </Panel>
+    </> : <Panel title="Midtrans Alibaba 人机验证" className="gopay-settings-panel" action={<Status value={captchaConfigured ? "success" : "failed"} />}>
+      <form className="gopay-form" onSubmit={submitCaptcha}>
+        <div className="gopay-warning"><ShieldCheck /><span>遇到验证时会在当前支付代理下打开 Midtrans 页面，获取动态参数、Cookie 与一次性令牌；未触发验证时不会启动浏览器。</span></div>
+        <div className="gopay-form-grid">
+          <label className="wide"><span>Solverify API Key</span><input name="solverify_api_key" type="password" autoComplete="new-password" value={captchaSecrets.solverify} onChange={(event) => setCaptchaSecrets((currentSecrets) => ({ ...currentSecrets, solverify: event.target.value }))} placeholder={captcha.solverify_api_key_configured ? `已配置 ${captcha.solverify_api_key || ""}，留空保持不变` : "可选，优先使用 Solverify"} /></label>
+          <label><span>Solverify 轮询（秒）</span><input name="solverify_poll_sec" type="number" min="1" step="1" defaultValue={captcha.solverify_poll_sec || "3"} /></label>
+          <label><span>Solverify 超时（秒）</span><input name="solverify_timeout_sec" type="number" min="10" step="1" defaultValue={captcha.solverify_timeout_sec || "130"} /></label>
+          <label className="wide"><span>2Captcha API Key</span><input name="api_key" type="password" autoComplete="new-password" value={captchaSecrets.twocaptcha} onChange={(event) => setCaptchaSecrets((currentSecrets) => ({ ...currentSecrets, twocaptcha: event.target.value }))} placeholder={twocaptchaConfigured ? `已配置 ${captcha.api_key || ""}，留空保持不变` : "可选备用密钥"} /></label>
+          <label><span>2Captcha 轮询（秒）</span><input name="poll_sec" type="number" min="1" step="1" defaultValue={captcha.poll_sec || "5"} /></label>
+          <label><span>2Captcha 超时（秒）</span><input name="timeout_sec" type="number" min="10" step="1" defaultValue={captcha.timeout_sec || "180"} /></label>
+          <label><span>最大重试次数</span><input name="max_attempts" type="number" min="1" max="5" step="1" defaultValue={captcha.max_attempts || "3"} /></label>
+          <label><span>Scene ID</span><input name="scene_id" defaultValue={captcha.scene_id || "1mbz0gpl6"} /></label>
+          <label><span>Prefix</span><input name="prefix" defaultValue={captcha.prefix || "y1rdnbp"} /></label>
+          <label><span>Region</span><input name="region" defaultValue={captcha.region || "sgp"} /></label>
+          <label className="wide"><span>AliyunCaptcha.js URL</span><input name="api_get_lib" type="url" defaultValue={captcha.api_get_lib || "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"} /></label>
+        </div>
+        <Button type="submit" disabled={busy !== ""}><Settings2 className="mr-2 h-4 w-4" />保存人机验证配置</Button>
+      </form>
+    </Panel>}
+  </div>;
 }
 
 function TaskLogModal({ job, onClose }: { job: Row; onClose: () => void }) {

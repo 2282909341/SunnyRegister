@@ -3418,10 +3418,10 @@ button:not(:disabled):active { transform: translateY(0) scale(.985); }
 .gopay-row-actions,.gopay-panel-actions { display:flex; align-items:center; gap:5px; }
 .gopay-panel-actions select { width:112px; height:32px; padding:0 8px; font-size:11px; }
 .gopay-status { display:inline-flex; min-height:23px; align-items:center; border:1px solid transparent; border-radius:999px; padding:0 8px; background:var(--accent-soft); color:var(--accent-strong); font-size:10px; font-weight:850; white-space:nowrap; }
-.gopay-status.is-failed,.gopay-status.is-error { background:rgba(239,68,68,.10); color:#ef4444; }
-.gopay-status.is-waiting_otp,.gopay-status.is-unknown,.gopay-status.is-missing { background:rgba(245,158,11,.12); color:#d97706; }
+.gopay-status.is-failed,.gopay-status.is-fraud_denied,.gopay-status.is-error { background:rgba(239,68,68,.10); color:#ef4444; }
+.gopay-status.is-waiting_otp,.gopay-status.is-validating_otp,.gopay-status.is-awaiting_captcha,.gopay-status.is-interrupted_unknown,.gopay-status.is-unknown,.gopay-status.is-missing { background:rgba(245,158,11,.12); color:#d97706; }
 .gopay-status.is-running { background:rgba(59,130,246,.12); color:#3b82f6; }
-.gopay-status.is-success { background:rgba(16,185,129,.11); color:#059669; }
+.gopay-status.is-success,.gopay-status.is-success_unreconciled { background:rgba(16,185,129,.11); color:#059669; }
 .gopay-status.is-idle { background:rgba(100,116,139,.10); color:var(--text-secondary); }
 .gopay-status.is-done { background:rgba(100,116,139,.12); color:var(--text-secondary); }
 .gopay-empty { display:flex; min-height:150px; align-items:center; justify-content:center; flex-direction:column; gap:5px; padding:22px; color:var(--text-muted); text-align:center; }

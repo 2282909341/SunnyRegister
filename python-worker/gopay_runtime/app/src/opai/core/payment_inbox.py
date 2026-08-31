@@ -66,6 +66,7 @@ PIN_CHALLENGE_RETRY_DELAYS = tuple(
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 GPT_REGISTER_ROOT = Path(os.environ.get("OPAI_GPT_REGISTER_ROOT", str(PROJECT_ROOT / "gpt_register"))).expanduser()
 _GOPAY_ACCOUNTS_LOCK = threading.RLock()
+_SNAP_STATE_LOCK = threading.RLock()
 _SMS_CONSUMED_CODE_HASH_LIMIT = 20
 _SMS_CODE_HASH_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -841,6 +842,38 @@ class InboxStore:
         # rowcount=0:status 已不再 pending(被别人改过)→ 返回当前 job
         return self.get(job_id)
 
+    def release_claim(
+        self,
+        job_id: str,
+        *,
+        claimed_at: str = "",
+    ) -> "PaymentInboxJob | None":
+        """Release this caller's pending claim without cancelling the job.
+
+        ``claimed_at`` acts as a compare-and-swap token. A stale starter must
+        not clear a newer worker's claim after the original lease expired.
+        """
+        c = self._conn()
+        if claimed_at:
+            row = c.execute(
+                """
+                UPDATE jobs SET claimed_at=''
+                WHERE id=? AND status='pending' AND claimed_at=?
+                RETURNING *
+                """,
+                (job_id, claimed_at),
+            ).fetchone()
+        else:
+            row = c.execute(
+                """
+                UPDATE jobs SET claimed_at=''
+                WHERE id=? AND status='pending'
+                RETURNING *
+                """,
+                (job_id,),
+            ).fetchone()
+        return dict(row) if row else self.get(job_id)
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -944,6 +977,22 @@ def _gopay_envelope_store_path() -> Path:
     return _gopay_accounts_path().parent / "envelope_links.json"
 
 
+def _payment_task_state_path() -> Path:
+    override = (os.environ.get("OPAI_PAYMENT_TASK_STATE_FILE") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return _gopay_accounts_path().parent / "payment_tasks.json"
+
+
+def _gopay_inbox_claim_ttl_sec() -> float:
+    raw = (os.environ.get("OPAI_GOPAY_INBOX_CLAIM_TTL_SEC") or "3600").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 3600.0
+    return max(300.0, value)
+
+
 def _envelope_manager():
     from opai.core.envelope_manager import EnvelopeManager
 
@@ -989,23 +1038,50 @@ def _snap_state_path() -> Path:
 
 
 def _load_snap_states() -> dict[str, dict[str, Any]]:
-    path = _snap_state_path()
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        log.debug("payment_inbox: read snap states failed", exc_info=True)
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    with _SNAP_STATE_LOCK:
+        path = _snap_state_path()
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            log.debug("payment_inbox: read snap states failed", exc_info=True)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
 
 
 def _write_snap_states(states: dict[str, dict[str, Any]]) -> None:
-    path = _snap_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(states, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with _SNAP_STATE_LOCK:
+        path = _snap_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(states, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+
+
+def _update_persisted_snap_state(
+    snap: str,
+    status: str,
+    *,
+    job_id: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """Atomically journal a CLI payment phase before an irreversible request."""
+    if not snap:
+        raise ValueError("missing Midtrans snap token")
+    with _SNAP_STATE_LOCK:
+        states = _load_snap_states()
+        state = states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
+        if job_id:
+            state["job_id"] = job_id
+        state["status"] = status
+        if reason:
+            state["reason"] = reason
+        state["updated_at"] = _now_iso()
+        _write_snap_states(states)
+        return dict(state)
 
 
 def _worker_gopay_accounts_lock():
@@ -1053,7 +1129,7 @@ def _load_gopay_accounts() -> list[dict[str, Any]]:
         elif binding_status == "failed":
             use_status = "used_failed"
             use_label = "失败"
-        elif binding_status in {"reserved", "running", "linking", "waiting_otp"}:
+        elif binding_status in {"reserved", "running", "linking", "waiting_otp", "awaiting_captcha", "interrupted_unknown"}:
             use_status = "reserved"
             use_label = "已绑定/运行中"
         elif str(item.get("midtrans_binding_order_id") or item.get("midtrans_binding_job_id") or "").strip():
@@ -1228,10 +1304,10 @@ def _gopay_binding_block_reason(account: dict[str, Any], *, order_id: str = "", 
     message = str(account.get("midtrans_binding_message") or "").strip()
     if not (status or existing_job_id or existing_order_id):
         return ""
-    if status in {"reserved", "running", "linking", "waiting_otp"}:
-        if (order_id and existing_order_id == order_id) or (job_id and existing_job_id == job_id):
+    if status in {"reserved", "running", "linking", "waiting_otp", "awaiting_captcha", "interrupted_unknown"}:
+        if job_id and existing_job_id == job_id:
             return ""
-    if status == "success":
+    if status in {"success", "success_unreconciled"}:
         return f"GoPay 账号已支付成功，不能再次使用: {message or existing_order_id or existing_job_id}"
     if status == "failed":
         return f"GoPay 账号已有失败记录，不能再次使用: {message or existing_order_id or existing_job_id}"
@@ -1447,6 +1523,7 @@ def _reserve_gopay_midtrans_binding(
     order_id: str = "",
     midtrans_url: str = "",
     email: str = "",
+    expected_previous_job_id: str = "",
 ) -> bool:
     with _gopay_accounts_write_guard():
         accounts = _load_gopay_accounts_raw()
@@ -1456,13 +1533,17 @@ def _reserve_gopay_midtrans_binding(
             existing_job = str(account.get("midtrans_binding_job_id") or "")
             existing_order = str(account.get("midtrans_binding_order_id") or "")
             existing_status = str(account.get("midtrans_binding_status") or "").strip()
-            if existing_status in {"success", "failed"}:
+            if existing_status in {"success", "success_unreconciled", "failed", "interrupted_unknown"}:
                 return False
-            same_order = bool(order_id and existing_order and existing_order == order_id)
             same_job = bool(job_id and existing_job and existing_job == job_id)
+            expected_handoff = bool(
+                expected_previous_job_id
+                and existing_job == expected_previous_job_id
+                and (not existing_order or existing_order == order_id)
+            )
             if existing_order and existing_order != order_id:
                 return False
-            if existing_job and existing_job != job_id and not same_order:
+            if existing_job and not same_job and not expected_handoff:
                 return False
             account["midtrans_binding_status"] = "reserved"
             account["midtrans_binding_job_id"] = job_id
@@ -1476,18 +1557,30 @@ def _reserve_gopay_midtrans_binding(
     return False
 
 
-def _update_gopay_midtrans_binding_status(phone: str, status: str, *, message: str = "") -> None:
+def _update_gopay_midtrans_binding_status(
+    phone: str,
+    status: str,
+    *,
+    message: str = "",
+    job_id: str = "",
+) -> bool:
     with _gopay_accounts_write_guard():
         accounts = _load_gopay_accounts_raw()
+        changed = False
         for account in accounts:
             if str(account.get("phone") or "") != phone:
                 continue
+            if job_id and str(account.get("midtrans_binding_job_id") or "") != job_id:
+                return False
             account["midtrans_binding_status"] = status
             account["midtrans_binding_updated_at"] = _now_iso()
             if message:
                 account["midtrans_binding_message"] = message[:300]
+            changed = True
             break
-        _write_gopay_accounts_raw(accounts)
+        if changed:
+            _write_gopay_accounts_raw(accounts)
+        return changed
 
 
 def _is_prestart_binding_failure(message: str) -> bool:
@@ -1512,6 +1605,26 @@ def _clear_gopay_midtrans_binding(account: dict[str, Any], *, message: str = "")
     account["midtrans_binding_message"] = message or "预占未进入支付，已释放"
 
 
+def _release_gopay_midtrans_binding(phone: str, job_id: str, *, message: str = "") -> bool:
+    """Release only the reservation created by the matching pre-start job."""
+    with _gopay_accounts_write_guard():
+        accounts = _load_gopay_accounts_raw()
+        for account in accounts:
+            if str(account.get("phone") or "") != str(phone or ""):
+                continue
+            if str(account.get("midtrans_binding_job_id") or "") != str(job_id or ""):
+                return False
+            if str(account.get("midtrans_binding_status") or "") != "reserved":
+                return False
+            _clear_gopay_midtrans_binding(
+                account,
+                message=message or "支付任务启动失败，预占已释放，可重新使用",
+            )
+            _write_gopay_accounts_raw(accounts)
+            return True
+    return False
+
+
 def _normalize_gopay_binding_history() -> None:
     snap_states = _load_snap_states()
     auto_jobs: dict[str, dict[str, Any]] = {}
@@ -1527,7 +1640,7 @@ def _normalize_gopay_binding_history() -> None:
         except Exception:
             auto_jobs = {}
     payment_jobs: dict[str, dict[str, Any]] = {}
-    payment_path = PROJECT_ROOT / "config" / "payment_tasks.json"
+    payment_path = _payment_task_state_path()
     if payment_path.exists():
         try:
             raw = json.loads(payment_path.read_text(encoding="utf-8"))
@@ -1548,18 +1661,19 @@ def _normalize_gopay_binding_history() -> None:
                 _clear_gopay_midtrans_binding(account, message="预占未进入支付，已释放，可重新使用")
                 changed = True
                 continue
-            if status not in {"reserved", "running", "linking", "waiting_otp"}:
+            if status not in {"reserved", "running", "linking", "waiting_otp", "awaiting_captcha", "interrupted_unknown"}:
                 continue
             job_id = str(account.get("midtrans_binding_job_id") or "").strip()
             history_job = auto_jobs.get(job_id) or payment_jobs.get(job_id)
-            if history_job and str(history_job.get("status") or "") in {"failed", "success"}:
+            if history_job and str(history_job.get("status") or "") in {"failed", "success", "success_unreconciled"}:
                 final_status = str(history_job.get("status") or "")
                 final_message = str(history_job.get("payment_message") or history_job.get("message") or final_status)[:300]
-                if final_status != "success" and _is_prestart_binding_failure(final_message):
+                remote_success = final_status in {"success", "success_unreconciled"}
+                if not remote_success and _is_prestart_binding_failure(final_message):
                     _clear_gopay_midtrans_binding(account, message="预占未进入支付，已释放，可重新使用")
                     changed = True
                     continue
-                account["midtrans_binding_status"] = "success" if final_status == "success" else "failed"
+                account["midtrans_binding_status"] = "success" if remote_success else "failed"
                 account["midtrans_binding_message"] = final_message
                 account["midtrans_binding_updated_at"] = _now_iso()
                 changed = True
@@ -1567,8 +1681,13 @@ def _normalize_gopay_binding_history() -> None:
             snap = _extract_midtrans_snap_token(str(account.get("midtrans_binding_url") or ""))
             snap_state = snap_states.get(snap) if snap else None
             snap_status = str((snap_state or {}).get("status") or "").strip()
-            if snap_status in {"success", "failed", "fraud_denied"}:
-                account["midtrans_binding_status"] = "success" if snap_status == "success" else "failed"
+            if snap_status in {"success", "success_unreconciled", "failed", "fraud_denied", "interrupted_unknown"}:
+                if snap_status in {"success", "success_unreconciled"}:
+                    account["midtrans_binding_status"] = "success"
+                elif snap_status == "interrupted_unknown":
+                    account["midtrans_binding_status"] = "interrupted_unknown"
+                else:
+                    account["midtrans_binding_status"] = "failed"
                 account["midtrans_binding_message"] = str((snap_state or {}).get("reason") or snap_status)
                 account["midtrans_binding_updated_at"] = _now_iso()
                 changed = True
@@ -3116,7 +3235,7 @@ class _WebPaymentManager:
     def __init__(self, store: InboxStore):
         self._store = store
         self._lock = threading.RLock()
-        self._state_path = PROJECT_ROOT / "config" / "payment_tasks.json"
+        self._state_path = _payment_task_state_path()
         state = self._read_state()
         history_initialized = bool(state.get("history_initialized")) or isinstance(state.get("jobs"), list)
         self._jobs: dict[str, dict[str, Any]] = {
@@ -3126,12 +3245,15 @@ class _WebPaymentManager:
         }
         self._conds: dict[str, threading.Condition] = {}
         self._snap_states: dict[str, dict[str, Any]] = _load_snap_states()
+        self._recovery_job_ids: list[str] = []
         changed = self._normalize_loaded_jobs()
         if not self._jobs and not history_initialized:
             self._jobs.update(self._backfill_from_auto_flow_history())
             changed = bool(self._jobs) or changed
         if changed and self._jobs:
             self._save_state_locked()
+            self._save_snap_state_locked()
+        self._start_interrupted_recovery()
 
     def _read_state(self) -> dict[str, Any]:
         if not self._state_path.exists():
@@ -3191,22 +3313,277 @@ class _WebPaymentManager:
 
     def _normalize_loaded_jobs(self) -> bool:
         changed = False
-        for job in self._jobs.values():
+        for job_id, job in self._jobs.items():
             status = str(job.get("status") or "").strip()
-            if status in {"running", "waiting_otp"}:
-                job["status"] = "failed"
-                job["message"] = "服务重启中断，已保留为失败历史"
+            if status in {"running", "waiting_otp", "validating_otp", "awaiting_captcha", "linking"}:
+                job["interrupted_from_status"] = status
+                job["status"] = "interrupted_unknown"
+                job["message"] = "服务重启中断，正在核对 Midtrans 交易状态"
                 job["prompt"] = None
                 job["updated_at"] = _now_iso()
                 job.setdefault("logs", []).append({
                     "at": _now_iso(),
-                    "message": "服务重启后无法继续这个网页支付任务，已保留为失败历史",
+                    "message": "服务重启后正在核对 Midtrans 状态；核对完成前禁止重新扣款",
                 })
+                snap = str(job.get("snap_token") or "")
+                if snap:
+                    snap_state = self._snap_states.setdefault(
+                        snap,
+                        {"snap": snap, "created_at": str(job.get("created_at") or _now_iso())},
+                    )
+                    snap_state["status"] = "interrupted_unknown"
+                    snap_state["job_id"] = job_id
+                    snap_state["reason"] = "服务重启，交易状态待核对"
+                    snap_state["updated_at"] = _now_iso()
+                self._recovery_job_ids.append(job_id)
                 changed = True
+            elif status in {"interrupted_unknown", "success_unreconciled"}:
+                self._recovery_job_ids.append(job_id)
             if job.get("status") == "success" and job.get("message") == "payment completed":
                 job["message"] = "支付完成"
                 changed = True
         return changed
+
+    @staticmethod
+    def _challenge_ref_from_job(job: dict[str, Any]) -> str:
+        explicit = str(job.get("challenge_ref") or "").strip()
+        if explicit:
+            return explicit
+        for item in reversed(job.get("logs") or []):
+            if not isinstance(item, dict):
+                continue
+            match = re.search(
+                r"charge challenge_ref=([A-Za-z0-9_-]+)",
+                str(item.get("message") or ""),
+            )
+            if match:
+                return match.group(1)
+        return ""
+
+    @classmethod
+    def _job_charge_may_have_started(cls, job: dict[str, Any]) -> bool:
+        return bool(
+            job.get("charge_started_at")
+            or cls._challenge_ref_from_job(job)
+            or str(job.get("payment_phase") or "") in {"charge_started", "charged", "processing"}
+        )
+
+    def _start_interrupted_recovery(self) -> None:
+        job_ids = list(dict.fromkeys(self._recovery_job_ids))
+        self._recovery_job_ids.clear()
+        for job_id in job_ids:
+            threading.Thread(
+                target=self._resume_interrupted_job,
+                args=(job_id,),
+                daemon=True,
+                name=f"web-payment-recover-{job_id}",
+            ).start()
+
+    def _mark_recovery_unknown(self, job_id: str, message: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            snap = str(job.get("snap_token") or "")
+            phone = str(job.get("phone") or "")
+        try:
+            self._update_snap_state(
+                snap,
+                "interrupted_unknown",
+                reason=message,
+                job_id=job_id,
+            )
+        except Exception:
+            log.exception("Could not persist interrupted snap state for %s", job_id)
+        try:
+            _update_gopay_midtrans_binding_status(
+                phone,
+                "interrupted_unknown",
+                message=message,
+                job_id=job_id,
+            )
+        except Exception:
+            log.exception("Could not persist interrupted account binding for %s", job_id)
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job["status"] = "interrupted_unknown"
+            job["message"] = message
+            job["prompt"] = None
+            job["updated_at"] = _now_iso()
+            job.setdefault("logs", []).append({"at": _now_iso(), "message": message})
+            try:
+                self._save_state_locked()
+            except Exception:
+                log.exception("Could not persist interrupted payment task %s", job_id)
+
+    def _finalize_recovered_failure(
+        self,
+        job_id: str,
+        *,
+        transaction_status: str,
+    ) -> None:
+        label = f"transaction_status={transaction_status}"
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            snap = str(job.get("snap_token") or "")
+            phone = str(job.get("phone") or "")
+            inbox_job_id = str(job.get("inbox_job_id") or "")
+        try:
+            self._update_snap_state(snap, "failed", reason=label, job_id=job_id)
+        except Exception:
+            log.exception("Could not persist recovered failed snap %s", job_id)
+        try:
+            _update_gopay_midtrans_binding_status(
+                phone,
+                "failed",
+                message=label,
+                job_id=job_id,
+            )
+        except Exception:
+            log.exception("Could not persist recovered failed binding %s", job_id)
+        if inbox_job_id:
+            try:
+                self._store.set_status_if_pending(inbox_job_id, "cancelled")
+            except Exception:
+                log.exception("Could not reconcile failed inbox job %s", inbox_job_id)
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job["status"] = "failed"
+            job["message"] = label
+            job["result"] = {
+                "success": False,
+                "detail": label,
+                "transaction_status": transaction_status,
+            }
+            job["prompt"] = None
+            job["updated_at"] = _now_iso()
+            job.setdefault("logs", []).append({
+                "at": _now_iso(),
+                "message": f"服务重启后确认支付终态: {transaction_status}",
+            })
+            self._save_state_locked()
+
+    def _resume_interrupted_job(self, job_id: str) -> None:
+        with self._lock:
+            job = dict(self._jobs.get(job_id) or {})
+        if not job:
+            return
+        if str(job.get("status") or "") == "success_unreconciled":
+            result = job.get("result") if isinstance(job.get("result"), dict) else {}
+            result = {
+                **result,
+                "success": True,
+                "detail": str(result.get("detail") or job.get("message") or "支付完成"),
+            }
+            self._finalize_remote_success(
+                job_id=job_id,
+                phone=str(job.get("phone") or ""),
+                snap=str(job.get("snap_token") or ""),
+                inbox_job_id=str(job.get("inbox_job_id") or ""),
+                result=result,
+            )
+            return
+
+        try:
+            from opai.core.gopay_payment_protocol import GoPayPayment
+
+            phone = str(job.get("phone") or "")
+            account, _idx = _find_gopay_account(phone)
+            payment_profile = job.get("payment_fingerprint")
+            if not isinstance(payment_profile, dict) and account:
+                payment_profile = ensure_account_payment_fingerprint(account)
+            proxy = (
+                _normalize_proxy_url(str(job.get("proxy") or ""))
+                or _normalize_proxy_url(str((account or {}).get("proxy") or ""))
+                or _default_gopay_proxy()
+            )
+            payment = GoPayPayment(proxy=proxy, payment_fingerprint=payment_profile)
+            self._append_log(job_id, "服务重启：正在查询 Midtrans 交易状态")
+            status_result = payment.transaction_status(str(job.get("midtrans_url") or ""))
+            transaction_status = str(status_result.get("transaction_status") or "unknown").lower()
+            if status_result.get("ok") and transaction_status in {"settlement", "capture"}:
+                self._finalize_remote_success(
+                    job_id=job_id,
+                    phone=phone,
+                    snap=str(job.get("snap_token") or ""),
+                    inbox_job_id=str(job.get("inbox_job_id") or ""),
+                    result={
+                        "success": True,
+                        "detail": "服务重启后确认支付已完成",
+                        "transaction_status": transaction_status,
+                    },
+                )
+                return
+            if status_result.get("ok") and transaction_status in {
+                "deny",
+                "failure",
+                "cancel",
+                "expire",
+            }:
+                self._finalize_recovered_failure(
+                    job_id,
+                    transaction_status=transaction_status,
+                )
+                return
+
+            challenge_ref = self._challenge_ref_from_job(job)
+            if status_result.get("ok") and transaction_status in {"pending", "authorize"} and challenge_ref:
+                pin = str((account or {}).get("pin") or "").strip()
+                if not re.fullmatch(r"\d{6}", pin):
+                    self._mark_recovery_unknown(
+                        job_id,
+                        "交易仍为 pending，但账号没有可用 PIN，需人工核对；已禁止重新扣款",
+                    )
+                    return
+                self._append_log(job_id, f"检测到待完成交易，从支付 challenge 继续: {challenge_ref}")
+                result = payment.resume_payment_challenge(
+                    str(job.get("midtrans_url") or ""),
+                    challenge_ref,
+                    pin,
+                    progress=lambda message: self._append_log(job_id, message),
+                )
+                if result.get("success"):
+                    self._finalize_remote_success(
+                        job_id=job_id,
+                        phone=phone,
+                        snap=str(job.get("snap_token") or ""),
+                        inbox_job_id=str(job.get("inbox_job_id") or ""),
+                        result=result,
+                    )
+                    return
+                resumed_status = str(result.get("transaction_status") or "unknown").lower()
+                if resumed_status in {"deny", "failure", "cancel", "expire"}:
+                    self._finalize_recovered_failure(
+                        job_id,
+                        transaction_status=resumed_status,
+                    )
+                    return
+                self._mark_recovery_unknown(
+                    job_id,
+                    f"支付 challenge 恢复后状态仍为 {resumed_status}，需人工核对；已禁止重新扣款",
+                )
+                return
+
+            http_status = int(status_result.get("http_status") or 0)
+            self._mark_recovery_unknown(
+                job_id,
+                (
+                    f"Midtrans 状态暂时无法确认（HTTP {http_status or '-'} / {transaction_status}），"
+                    "需人工核对；已禁止重新扣款"
+                ),
+            )
+        except Exception as exc:
+            log.exception("web payment recovery failed: %s", job_id)
+            self._mark_recovery_unknown(
+                job_id,
+                f"重启恢复异常: {type(exc).__name__}: {str(exc)[:180]}；已禁止重新扣款",
+            )
 
     def _persistable_job(self, job: dict[str, Any]) -> dict[str, Any]:
         clean = dict(job)
@@ -3227,9 +3604,121 @@ class _WebPaymentManager:
         tmp.replace(self._state_path)
 
     def _public(self, job: dict[str, Any]) -> dict[str, Any]:
-        clean = dict(job)
-        clean.pop("_otp", None)
-        clean.pop("pin", None)
+        meta = job.get("midtrans_meta") if isinstance(job.get("midtrans_meta"), dict) else {}
+        public_meta = {
+            key: meta.get(key)
+            for key in (
+                "order_id",
+                "gross_amount",
+                "currency",
+                "expiry_time",
+                "account_status",
+                "transaction_status",
+                "is_setup_authorization",
+                "is_paid_invoice",
+            )
+            if key in meta
+        }
+
+        secrets = [
+            str(job.get("midtrans_url") or ""),
+            str(job.get("snap_token") or ""),
+            str(job.get("proxy") or ""),
+            str(job.get("pin") or ""),
+            str(job.get("challenge_ref") or ""),
+            str(meta.get("snap_token") or ""),
+            str(meta.get("midtrans_client_key") or ""),
+        ]
+        queued_otps = job.get("_otp") if isinstance(job.get("_otp"), list) else []
+        secrets.extend(str(value or "") for value in queued_otps)
+        secrets = sorted(
+            {secret for secret in secrets if len(secret) >= 4},
+            key=len,
+            reverse=True,
+        )
+
+        def redact(value: Any) -> str:
+            text = str(value or "")
+            for secret in secrets:
+                text = text.replace(secret, "[已隐藏]")
+            text = re.sub(
+                r"https://app\.midtrans\.com/snap/v[34]/redirection/[a-f0-9-]{36}(?:[?#][^\s]*)?",
+                "https://app.midtrans.com/snap/v4/redirection/[已隐藏]",
+                text,
+                flags=re.IGNORECASE,
+            )
+            text = re.sub(
+                r"(?i)\b(https?://)[^\s/@:]+:[^\s/@]+@",
+                r"\1[凭据已隐藏]@",
+                text,
+            )
+            return re.sub(
+                r"(?i)\b(linking reference|(?:linking|payment) challenge_id|charge challenge_ref)=([A-Za-z0-9_-]+)",
+                r"\1=[已隐藏]",
+                text,
+            )
+
+        clean = {
+            key: job.get(key)
+            for key in (
+                "id",
+                "phone",
+                "local",
+                "status",
+                "payment_phase",
+                "interrupted_from_status",
+                "balance_before",
+                "created_at",
+                "updated_at",
+                "charge_started_at",
+                "inbox_job_id",
+                "auto_flow_job_id",
+                "source",
+            )
+            if key in job
+        }
+        clean["message"] = redact(job.get("message"))
+        clean["midtrans_meta"] = public_meta
+        for key in ("order_id", "gross_amount", "currency"):
+            value = job.get(key) or public_meta.get(key)
+            if value not in (None, ""):
+                clean[key] = value
+
+        prompt = job.get("prompt")
+        if isinstance(prompt, dict):
+            clean["prompt"] = {
+                key: prompt.get(key)
+                for key in ("label", "phone", "timeout", "started_at")
+                if key in prompt
+            }
+        else:
+            clean["prompt"] = None
+
+        captcha = job.get("captcha")
+        if isinstance(captcha, dict):
+            clean["captcha"] = {
+                key: captcha.get(key)
+                for key in ("provider", "scene_id", "prefix", "region", "response_status")
+                if key in captcha
+            }
+
+        logs = job.get("logs") if isinstance(job.get("logs"), list) else []
+        clean["logs"] = [
+            {
+                "at": item.get("at"),
+                "message": redact(item.get("message")),
+            }
+            for item in logs
+            if isinstance(item, dict)
+        ]
+
+        result = job.get("result")
+        if isinstance(result, dict):
+            clean["result"] = {
+                key: redact(value) if key in {"detail", "failure_label"} else value
+                for key, value in result.items()
+                if key in {"success", "detail", "failure_label", "transaction_status"}
+            }
         return clean
 
     def list(self) -> list[dict[str, Any]]:
@@ -3238,8 +3727,30 @@ class _WebPaymentManager:
         jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
         return jobs
 
+    def _find_latest_job_id_by_midtrans_url(self, midtrans_url: str) -> str:
+        """Resolve an internal payment task without exposing its Midtrans URL."""
+        target = str(midtrans_url or "").strip()
+        if not target:
+            return ""
+        with self._lock:
+            matches = [
+                job
+                for job in self._jobs.values()
+                if str(job.get("midtrans_url") or "").strip() == target
+            ]
+            matches.sort(key=lambda job: str(job.get("created_at") or ""), reverse=True)
+            return str(matches[0].get("id") or "") if matches else ""
+
     def clear_finished(self) -> int:
-        terminal = {"success", "failed", "fraud_denied", "cancelled", "canceled", "done", "error"}
+        terminal = {
+            "success",
+            "failed",
+            "fraud_denied",
+            "cancelled",
+            "canceled",
+            "done",
+            "error",
+        }
         with self._lock:
             job_ids = [
                 job_id
@@ -3291,6 +3802,36 @@ class _WebPaymentManager:
         }
         self._save_snap_state_locked()
 
+    def _rollback_start_locked(
+        self,
+        *,
+        snap: str,
+        job_id: str,
+        phone: str,
+        previous_snap_state: dict[str, Any] | None,
+        binding_reserved: bool,
+    ) -> None:
+        """Undo a reservation when a task did not reach a running thread."""
+        self._jobs.pop(job_id, None)
+        self._conds.pop(job_id, None)
+        if previous_snap_state is None:
+            self._snap_states.pop(snap, None)
+        else:
+            self._snap_states[snap] = dict(previous_snap_state)
+        try:
+            self._save_snap_state_locked()
+        except Exception:
+            log.exception("Could not roll back Midtrans snap reservation %s", snap)
+        if binding_reserved:
+            try:
+                _release_gopay_midtrans_binding(phone, job_id)
+            except Exception:
+                log.exception("Could not roll back GoPay account reservation for %s", phone)
+        try:
+            self._save_state_locked()
+        except Exception:
+            log.exception("Could not persist payment task rollback for %s", job_id)
+
     def _update_snap_state(self, snap: str, status: str, *, reason: str = "", job_id: str = "") -> None:
         if not snap:
             return
@@ -3304,7 +3845,16 @@ class _WebPaymentManager:
             state["updated_at"] = _now_iso()
             self._save_snap_state_locked()
 
-    def start(self, *, phone: str, pin: str, midtrans_url: str, inbox_job_id: str = "", proxy: str = "") -> dict[str, Any]:
+    def start(
+        self,
+        *,
+        phone: str,
+        pin: str,
+        midtrans_url: str,
+        inbox_job_id: str = "",
+        proxy: str = "",
+        expected_previous_job_id: str = "",
+    ) -> dict[str, Any]:
         account, _idx = _find_gopay_account(phone)
         if account is None:
             raise ValueError(f"账号不存在: {phone}")
@@ -3320,7 +3870,7 @@ class _WebPaymentManager:
         payment_profile = ensure_account_payment_fingerprint(account)
         use_proxy = _normalize_proxy_url(proxy) or _normalize_proxy_url(account.get("proxy", "")) or _default_gopay_proxy()
         url = (midtrans_url or "").strip()
-        if "midtrans.com" not in url:
+        if not _is_valid_midtrans_redirect_url(url):
             raise ValueError("Midtrans 链接不正确")
         snap = _extract_midtrans_snap_token(url)
         if not snap:
@@ -3331,54 +3881,79 @@ class _WebPaymentManager:
         balance_info = _refresh_gopay_balance(account.get("phone") or phone)
         balance = int(balance_info.get("balance", 0) or 0)
         meta = _midtrans_transaction_meta(url, proxy=use_proxy, payment_fingerprint=payment_profile)
+        if not str(meta.get("midtrans_client_key") or "").strip():
+            raise ValueError(
+                "Midtrans 链接未返回 merchant.client_key，已拒绝使用 snap token 作为认证凭据"
+            )
         _validate_payment_midtrans_meta(meta, balance=balance)
-        block_reason = _gopay_binding_block_reason(account, order_id=str(meta.get("order_id") or ""))
+        block_reason = _gopay_binding_block_reason(
+            account,
+            order_id=str(meta.get("order_id") or ""),
+            job_id=expected_previous_job_id,
+        )
         if block_reason:
             raise ValueError(block_reason)
         job_id = uuid.uuid4().hex[:12]
         now = _now_iso()
         cond = threading.Condition(self._lock)
+        account_phone = str(account.get("phone") or phone)
+        previous_snap_state: dict[str, Any] | None = None
+        binding_reserved = False
         with self._lock:
-            self._reserve_snap_locked(snap, job_id=job_id, phone=account.get("phone", phone), midtrans_url=url)
-            if not _reserve_gopay_midtrans_binding(
-                account.get("phone", phone),
-                job_id=job_id,
-                order_id=str(meta.get("order_id") or ""),
-                midtrans_url=url,
-                email="",
-            ):
-                raise ValueError("这个 GoPay 账号已经绑定过其他 Midtrans 链，不能重复使用")
-            self._conds[job_id] = cond
-            self._jobs[job_id] = {
-                "id": job_id,
-                "phone": account.get("phone", phone),
-                "local": account.get("local", ""),
-                "pin": effective_pin,
-                "midtrans_url": url,
-                "snap_token": snap,
-                "midtrans_meta": meta,
-                "balance_before": balance,
-                "payment_fingerprint": payment_profile,
-                "proxy": use_proxy,
-                "inbox_job_id": inbox_job_id,
-                "status": "running",
-                "message": f"预检通过: {meta.get('order_id')} {meta.get('gross_amount')} {meta.get('currency')}，余额 {balance} Rp",
-                "created_at": now,
-                "updated_at": now,
-                "prompt": None,
-                "logs": [
-                    {"at": now, "message": f"代理预检通过: 出口 IP {probe.get('ip') or '-'}"},
-                    {"at": now, "message": f"预检通过: {meta.get('order_id')} {meta.get('gross_amount')} {meta.get('currency')}，余额 {balance} Rp"},
-                    {"at": now, "message": "GoPay 账号已预占；该号后续不会再绑定其他 Midtrans 链"},
-                ],
-                "_otp": [],
-            }
-            self._save_state_locked()
+            existing_snap = self._snap_states.get(snap)
+            previous_snap_state = dict(existing_snap) if existing_snap is not None else None
+            try:
+                self._reserve_snap_locked(snap, job_id=job_id, phone=account_phone, midtrans_url=url)
+                binding_reserved = _reserve_gopay_midtrans_binding(
+                    account_phone,
+                    job_id=job_id,
+                    order_id=str(meta.get("order_id") or ""),
+                    midtrans_url=url,
+                    email="",
+                    expected_previous_job_id=expected_previous_job_id,
+                )
+                if not binding_reserved:
+                    raise ValueError("这个 GoPay 账号已经绑定过其他 Midtrans 链，不能重复使用")
+                self._conds[job_id] = cond
+                self._jobs[job_id] = {
+                    "id": job_id,
+                    "phone": account_phone,
+                    "local": account.get("local", ""),
+                    "pin": effective_pin,
+                    "midtrans_url": url,
+                    "snap_token": snap,
+                    "midtrans_meta": meta,
+                    "balance_before": balance,
+                    "payment_fingerprint": payment_profile,
+                    "proxy": use_proxy,
+                    "inbox_job_id": inbox_job_id,
+                    "status": "running",
+                    "message": f"预检通过: {meta.get('order_id')} {meta.get('gross_amount')} {meta.get('currency')}，余额 {balance} Rp",
+                    "created_at": now,
+                    "updated_at": now,
+                    "prompt": None,
+                    "logs": [
+                        {"at": now, "message": f"代理预检通过: 出口 IP {probe.get('ip') or '-'}"},
+                        {"at": now, "message": f"预检通过: {meta.get('order_id')} {meta.get('gross_amount')} {meta.get('currency')}，余额 {balance} Rp"},
+                        {"at": now, "message": "GoPay 账号已预占；该号后续不会再绑定其他 Midtrans 链"},
+                    ],
+                    "_otp": [],
+                }
+                self._save_state_locked()
+            except Exception:
+                self._rollback_start_locked(
+                    snap=snap,
+                    job_id=job_id,
+                    phone=account_phone,
+                    previous_snap_state=previous_snap_state,
+                    binding_reserved=binding_reserved,
+                )
+                raise
         t = threading.Thread(
             target=self._run,
             kwargs={
                 "job_id": job_id,
-                "phone": account.get("phone", phone),
+                "phone": account_phone,
                 "local": account.get("local", ""),
                 "pin": effective_pin,
                 "midtrans_url": url,
@@ -3390,14 +3965,25 @@ class _WebPaymentManager:
             daemon=True,
             name=f"web-payment-{job_id}",
         )
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            with self._lock:
+                self._rollback_start_locked(
+                    snap=snap,
+                    job_id=job_id,
+                    phone=account_phone,
+                    previous_snap_state=previous_snap_state,
+                    binding_reserved=binding_reserved,
+                )
+            raise
         return self.get(job_id) or {}
 
     def claim_and_start(self, *, phone: str, pin: str, proxy: str = "") -> dict[str, Any]:
         job = self._store.claim_next_pending(
             prefer_paypal_url=True,
             prefer_oldest=True,
-            ttl_sec=60.0,
+            ttl_sec=_gopay_inbox_claim_ttl_sec(),
             provider="gopay",
         )
         if job is None:
@@ -3408,7 +3994,7 @@ class _WebPaymentManager:
         try:
             return self.start(phone=phone, pin=pin, midtrans_url=url, inbox_job_id=job["id"], proxy=proxy)
         except Exception:
-            self._store.set_status_if_pending(job["id"], "cancelled")
+            self._store.release_claim(job["id"], claimed_at=str(job.get("claimed_at") or ""))
             raise
 
     def submit_otp(self, job_id: str, code: str) -> dict[str, Any] | None:
@@ -3425,31 +4011,76 @@ class _WebPaymentManager:
                 or not isinstance(job.get("prompt"), dict)
             ):
                 return None
-            job.setdefault("_otp", []).append(code)
-            job["message"] = "已收到支付 OTP，继续执行"
+            job["_otp"] = [code]
+            job["prompt"] = None
+            job["status"] = "validating_otp"
+            job["message"] = "已收到支付 OTP，开始验证"
             job["updated_at"] = _now_iso()
             self._save_state_locked()
             cond.notify_all()
             return self._public(job)
+
+    def _set_captcha_state(self, job_id: str, status: str, challenge: dict[str, Any] | None = None) -> None:
+        """Expose CAPTCHA work without persisting solver tokens or cookies."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            if status == "awaiting_captcha":
+                job["status"] = status
+                if isinstance(challenge, dict):
+                    job["captcha"] = {
+                        key: challenge.get(key)
+                        for key in ("provider", "scene_id", "prefix", "region", "response_status")
+                        if challenge.get(key) not in (None, "")
+                    }
+                job["message"] = "等待人机验证服务返回结果"
+                job.setdefault("logs", []).append({
+                    "at": _now_iso(),
+                    "message": "Midtrans 要求人机验证，正在使用当前代理打开验证页面并求解",
+                })
+            elif job.get("status") == "awaiting_captcha":
+                job["status"] = "running"
+                job["message"] = "人机验证完成，继续支付"
+            job["updated_at"] = _now_iso()
+            snap = str(job.get("snap_token") or "")
+            if snap:
+                state = self._snap_states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
+                state["status"] = status if status == "awaiting_captcha" else "linking"
+                state["updated_at"] = _now_iso()
+                self._save_snap_state_locked()
+            self._save_state_locked()
 
     def _append_log(self, job_id: str, message: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
                 return
+            challenge_match = re.search(
+                r"charge challenge_ref=([A-Za-z0-9_-]+)",
+                str(message or ""),
+            )
+            if challenge_match:
+                job["challenge_ref"] = challenge_match.group(1)
+                job["payment_phase"] = "charged"
+                job["charge_started_at"] = job.get("charge_started_at") or _now_iso()
+            elif "Step 9: charge" in str(message or ""):
+                job["payment_phase"] = "charge_started"
+                job["charge_started_at"] = job.get("charge_started_at") or _now_iso()
             job.setdefault("logs", []).append({"at": _now_iso(), "message": message})
             job["message"] = message
             job["updated_at"] = _now_iso()
             self._save_state_locked()
 
     def _wait_otp(self, job_id: str, phone: str, timeout: int) -> str | None:
-        deadline = time.time() + max(1, timeout)
+        deadline = time.monotonic() + max(1, timeout)
         with self._lock:
             job = self._jobs.get(job_id)
             cond = self._conds.get(job_id)
             if not job or not cond:
                 return None
             job["status"] = "waiting_otp"
+            job["_otp"] = []
             snap = str(job.get("snap_token") or "")
             if snap:
                 state = self._snap_states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
@@ -3490,7 +4121,7 @@ class _WebPaymentManager:
         except Exception:
             log.debug("payment auto sms setup failed", exc_info=True)
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             with self._lock:
                 job = self._jobs.get(job_id)
                 cond = self._conds.get(job_id)
@@ -3506,14 +4137,14 @@ class _WebPaymentManager:
                     job["updated_at"] = _now_iso()
                     self._save_state_locked()
                     return code
-                if job.get("status") not in {"waiting_otp", "running"}:
+                if job.get("status") not in {"waiting_otp", "validating_otp", "running"}:
                     return None
 
             if api_key and aid:
                 try:
                     from opai.core.sms_helpers import sms_code_sha256, sms_wait_code
 
-                    remaining = max(0.0, deadline - time.time())
+                    remaining = max(0.0, deadline - time.monotonic())
                     if remaining <= 0:
                         break
                     if sms_provider == "smspool":
@@ -3563,18 +4194,164 @@ class _WebPaymentManager:
                     cond = self._conds.get(job_id)
                     if not job or not cond:
                         return None
-                    cond.wait(timeout=min(1.0, max(0.1, deadline - time.time())))
+                    cond.wait(timeout=min(1.0, max(0.1, deadline - time.monotonic())))
 
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
                 return None
+            codes = job.setdefault("_otp", [])
+            if codes:
+                code = str(codes.pop(0)).strip()
+                job["prompt"] = None
+                job["status"] = "running"
+                job["message"] = "支付 OTP 已提交"
+                job.setdefault("logs", []).append({
+                    "at": _now_iso(),
+                    "message": "在超时边界收到支付 OTP，开始验证",
+                })
+                job["updated_at"] = _now_iso()
+                self._save_state_locked()
+                return code
             job["prompt"] = None
             job["status"] = "failed"
             job["message"] = "支付 OTP 输入超时"
             job["updated_at"] = _now_iso()
             self._save_state_locked()
             return None
+
+    def _release_payment_sms_after_success(self, phone: str) -> str:
+        account, _idx = _find_gopay_account(phone)
+        if not account:
+            raise RuntimeError("GoPay account is missing after remote payment success")
+        activation_id = str(account.get("activation_id") or "").strip()
+        provider = str(account.get("sms_provider") or "smsbower").strip().lower()
+        if not activation_id or provider not in {"smsbower", "smspool"}:
+            return ""
+        provider_label = "SMSPool" if provider == "smspool" else "SMSBower"
+        if not _mark_gopay_sms_done(account):
+            raise RuntimeError(f"{provider_label} number release failed")
+        return f"付款完成，{provider_label} 号码已自动释放"
+
+    def _finalize_remote_success(
+        self,
+        *,
+        job_id: str,
+        phone: str,
+        snap: str,
+        inbox_job_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        """Persist an irreversible remote success without letting cleanup downgrade it."""
+        detail = str(result.get("detail") or "支付完成")
+        transaction_status = str(result.get("transaction_status") or "-")
+        reconciliation_errors: list[dict[str, str]] = []
+        cleanup_logs: list[str] = []
+
+        def record_error(component: str, exc: Exception) -> None:
+            message = f"{type(exc).__name__}: {str(exc)[:240]}"
+            reconciliation_errors.append({"component": component, "error": message})
+            log.exception(
+                "remote payment succeeded but %s reconciliation failed for %s",
+                component,
+                job_id,
+            )
+
+        # Write the irreversible fact first.  Keeping this provisional state
+        # makes a crash during later cleanup non-retryable after restart.
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job["result"] = dict(result)
+                job["status"] = "success_unreconciled"
+                job["remote_success_at"] = _now_iso()
+                job["message"] = detail
+                job["prompt"] = None
+                job.setdefault("logs", []).append({
+                    "at": _now_iso(),
+                    "message": f"支付成功: {detail}，交易状态 {transaction_status}",
+                })
+                job["updated_at"] = _now_iso()
+                try:
+                    self._save_state_locked()
+                except Exception:
+                    # A final save is attempted after the other durable stores
+                    # have been reconciled.  This failure must not escape.
+                    log.exception("Could not persist provisional remote success for %s", job_id)
+            else:
+                log.error("remote payment succeeded but payment job %s is missing", job_id)
+
+        try:
+            self._update_snap_state(snap, "success", reason=detail, job_id=job_id)
+        except Exception as exc:
+            record_error("snap_state", exc)
+
+        try:
+            binding_updated = _update_gopay_midtrans_binding_status(
+                phone,
+                "success",
+                message=f"支付成功: {detail}",
+                job_id=job_id,
+            )
+            if not binding_updated:
+                raise RuntimeError("GoPay account binding owner did not match the payment job")
+        except Exception as exc:
+            record_error("account_binding", exc)
+
+        if inbox_job_id:
+            try:
+                inbox_job = self._store.set_status_if_pending(inbox_job_id, "paid")
+                inbox_status = str((inbox_job or {}).get("status") or "")
+                if inbox_status != "paid":
+                    raise RuntimeError(f"inbox job remained in status {inbox_status or 'missing'}")
+            except Exception as exc:
+                record_error("inbox", exc)
+
+        try:
+            sms_message = self._release_payment_sms_after_success(phone)
+            if sms_message:
+                cleanup_logs.append(sms_message)
+        except Exception as exc:
+            record_error("sms_release", exc)
+            cleanup_logs.append("付款已完成，但短信号码自动释放失败，请在账号列表手动释放")
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            for message in cleanup_logs:
+                job.setdefault("logs", []).append({"at": _now_iso(), "message": message})
+            if reconciliation_errors:
+                job["status"] = "success_unreconciled"
+                job["reconciliation_errors"] = list(reconciliation_errors)
+                job["message"] = f"{detail}；本地收尾待补偿"
+                components = ", ".join(item["component"] for item in reconciliation_errors)
+                job.setdefault("logs", []).append({
+                    "at": _now_iso(),
+                    "message": f"远端支付已成功，本地收尾待补偿: {components}",
+                })
+            else:
+                job["status"] = "success"
+                job.pop("reconciliation_errors", None)
+                job["message"] = detail
+            job["prompt"] = None
+            job["updated_at"] = _now_iso()
+            try:
+                self._save_state_locked()
+            except Exception as exc:
+                job["status"] = "success_unreconciled"
+                job["message"] = f"{detail}；本地收尾待补偿"
+                persist_error = {
+                    "component": "payment_state",
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+                job["reconciliation_errors"] = [*reconciliation_errors, persist_error]
+                job.setdefault("logs", []).append({
+                    "at": _now_iso(),
+                    "message": "远端支付已成功，但支付任务状态持久化失败",
+                })
+                job["updated_at"] = _now_iso()
+                log.exception("Could not persist finalized remote success for %s", job_id)
 
     def _run(
         self,
@@ -3631,6 +4408,34 @@ class _WebPaymentManager:
             self._append_log(job_id, f"开始支付: {phone} -> {midtrans_url}")
             self._update_snap_state(snap, "linking", job_id=job_id)
             payment = GoPayPayment(proxy=proxy, payment_fingerprint=payment_fingerprint)
+
+            # Keep CAPTCHA dependencies lazy: normal GoPay payments must not
+            # require a browser or solver account unless Midtrans challenges
+            # the current linking session.
+            captcha_provider = None
+            try:
+                from opai.core.captcha_provider import build_captcha_token_provider
+
+                captcha_provider = build_captcha_token_provider(
+                    progress=lambda message: self._append_log(job_id, message),
+                    payment_fingerprint=payment_fingerprint,
+                )
+                if captcha_provider:
+                    self._append_log(job_id, "CAPTCHA provider 已配置，遇到 challenge 时自动求解")
+            except Exception as exc:
+                log.warning("captcha provider setup failed for payment %s: %s", job_id, exc)
+                self._append_log(job_id, f"CAPTCHA provider 配置读取失败，将在需要验证时提示: {exc}")
+
+            def solve_captcha(challenge: dict[str, Any]) -> Any:
+                self._set_captcha_state(job_id, "awaiting_captcha", challenge)
+                if captcha_provider is None:
+                    self._set_captcha_state(job_id, "running")
+                    raise RuntimeError("Midtrans 要求人机验证，但尚未配置 Solverify 或 2Captcha API Key")
+                try:
+                    return captcha_provider(challenge)
+                finally:
+                    self._set_captcha_state(job_id, "running")
+
             result = payment.pay(
                 midtrans_url=midtrans_url,
                 phone=local_phone,
@@ -3639,52 +4444,75 @@ class _WebPaymentManager:
                 wait_otp=lambda otp_phone, timeout: self._wait_otp(job_id, otp_phone, timeout),
                 progress=lambda message: self._append_log(job_id, message),
                 midtrans_client_key=midtrans_client_key,
+                captcha_token_provider=solve_captcha,
             )
-            payment_succeeded = bool(result.get("success"))
+            if result.get("success"):
+                try:
+                    self._finalize_remote_success(
+                        job_id=job_id,
+                        phone=phone,
+                        snap=snap,
+                        inbox_job_id=inbox_job_id,
+                        result=result,
+                    )
+                except Exception as exc:
+                    # This is the final guardrail: no local cleanup bug may
+                    # reach the generic failure handler after remote success.
+                    log.exception("remote payment success finalizer crashed for %s", job_id)
+                    with self._lock:
+                        job = self._jobs.get(job_id)
+                        if job:
+                            job["result"] = dict(result)
+                            job["status"] = "success_unreconciled"
+                            job["message"] = f"{result.get('detail') or '支付完成'}；本地收尾待补偿"
+                            job["prompt"] = None
+                            job["reconciliation_errors"] = [{
+                                "component": "success_finalizer",
+                                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                            }]
+                            job["updated_at"] = _now_iso()
+                            try:
+                                self._save_state_locked()
+                            except Exception:
+                                log.exception("Could not persist success finalizer fallback for %s", job_id)
+                return
+
+            label = _payment_failure_label(str(result.get("detail") or ""))
+            result["failure_label"] = label
+            with self._lock:
+                job = self._jobs.get(job_id)
+                charge_may_have_started = bool(job and self._job_charge_may_have_started(job))
+                if job:
+                    job["result"] = result
+            if charge_may_have_started:
+                self._mark_recovery_unknown(
+                    job_id,
+                    f"charge 已发起但最终状态未确认: {label}；已禁止重新扣款",
+                )
+                return
+
             with self._lock:
                 job = self._jobs.get(job_id)
                 if not job:
                     return
-                job["result"] = result
-                if result.get("success"):
-                    job["status"] = "success"
-                    job["message"] = result.get("detail") or "支付完成"
-                    job.setdefault("logs", []).append({
-                        "at": _now_iso(),
-                        "message": f"支付成功: {job['message']}，交易状态 {result.get('transaction_status', '-')}",
-                    })
-                    self._update_snap_state(snap, "success", reason=job["message"], job_id=job_id)
-                    _update_gopay_midtrans_binding_status(phone, "success", message=f"支付成功: {job['message']}")
-                    if inbox_job_id:
-                        self._store.set_status_if_pending(inbox_job_id, "paid")
-                else:
-                    label = _payment_failure_label(str(result.get("detail") or ""))
-                    job["status"] = "failed"
-                    job["message"] = label
-                    result["failure_label"] = label
-                    job.setdefault("logs", []).append({
-                        "at": _now_iso(),
-                        "message": f"支付失败: {label}，详情 {str(result.get('detail') or '')[:300]}",
-                    })
-                    self._update_snap_state(snap, "failed", reason=label, job_id=job_id)
-                    _update_gopay_midtrans_binding_status(phone, "failed", message=label)
-                    if inbox_job_id:
-                        self._store.set_status_if_pending(inbox_job_id, "cancelled")
+                job["status"] = "failed"
+                job["message"] = label
+                job.setdefault("logs", []).append({
+                    "at": _now_iso(),
+                    "message": f"支付失败: {label}，详情 {str(result.get('detail') or '')[:300]}",
+                })
+                self._update_snap_state(snap, "failed", reason=label, job_id=job_id)
+                _update_gopay_midtrans_binding_status(phone, "failed", message=label, job_id=job_id)
+                if inbox_job_id:
+                    self._store.set_status_if_pending(inbox_job_id, "cancelled")
                 job["prompt"] = None
                 job["updated_at"] = _now_iso()
                 self._save_state_locked()
-            if payment_succeeded:
-                account, _idx = _find_gopay_account(phone)
-                if account and str(account.get("activation_id") or "").strip() and str(account.get("sms_provider") or "smsbower").strip().lower() in {"smsbower", "smspool"}:
-                    if _mark_gopay_sms_done(account):
-                        self._append_log(job_id, f"付款完成，{('SMSPool' if str((account or {}).get('sms_provider') or '').lower() == 'smspool' else 'SMSBower')} 号码已自动释放")
-                    else:
-                        self._append_log(job_id, "付款完成，但短信号码自动释放失败，请在账号列表手动释放")
         except GoPayFraudDenyError as exc:
             label = _payment_failure_label(str(exc))
             log.exception("web payment fraud denied: %s", job_id)
             self._update_snap_state(snap, "fraud_denied", reason=label, job_id=job_id)
-            _update_gopay_midtrans_binding_status(phone, "failed", message=label)
+            _update_gopay_midtrans_binding_status(phone, "failed", message=label, job_id=job_id)
             with self._lock:
                 job = self._jobs.get(job_id)
                 if job:
@@ -3701,8 +4529,19 @@ class _WebPaymentManager:
         except Exception as exc:
             log.exception("web payment job failed: %s", job_id)
             label = _payment_failure_label(str(exc))
+            with self._lock:
+                job = self._jobs.get(job_id)
+                charge_may_have_started = bool(job and self._job_charge_may_have_started(job))
+                if job:
+                    job["result"] = {"success": False, "detail": str(exc), "failure_label": label}
+            if charge_may_have_started:
+                self._mark_recovery_unknown(
+                    job_id,
+                    f"charge 后发生异常且状态未确认: {label}；已禁止重新扣款",
+                )
+                return
             self._update_snap_state(snap, "failed", reason=label, job_id=job_id)
-            _update_gopay_midtrans_binding_status(phone, "failed", message=label)
+            _update_gopay_midtrans_binding_status(phone, "failed", message=label, job_id=job_id)
             with self._lock:
                 job = self._jobs.get(job_id)
                 if job:
@@ -3835,25 +4674,63 @@ class _AutoFlowManager:
 
     def _resume_interrupted_jobs(self) -> None:
         resumable: list[tuple[str, dict[str, Any], str, str]] = []
+        payment_recoveries: list[tuple[str, str]] = []
         with self._lock:
             jobs = list(self._jobs.values())
         for job in jobs:
-            if str(job.get("status") or "") != "running":
+            outer_status = str(job.get("status") or "")
+            if outer_status not in {"running", "interrupted_unknown"}:
                 continue
-            if str(job.get("stage") or "") not in {"gopay_account", "payment"}:
+            stage = str(job.get("stage") or "")
+            if stage not in {"gopay_account", "payment"}:
+                continue
+            if outer_status == "interrupted_unknown" and stage != "payment":
                 continue
             if not str(job.get("midtrans_url") or ""):
+                continue
+            job_id = str(job.get("id") or "")
+            # The inner payment can be created just before the outer task
+            # persists ``payment_task_id``.  Recover it by URL in either
+            # stage, otherwise a restart could issue a second charge.
+            payment_id = str(job.get("payment_task_id") or "").strip()
+            if not payment_id:
+                midtrans_url = str(job.get("midtrans_url") or "")
+                payment_id = self._web_payment._find_latest_job_id_by_midtrans_url(midtrans_url)
+            if payment_id:
+                try:
+                    self._update_job(job_id, payment_task_id=payment_id, stage="payment")
+                except Exception:
+                    # The watcher still has the inner id and must run even if
+                    # this outer bookkeeping write is temporarily unavailable.
+                    log.exception("auto flow could not persist recovered payment task link: %s", job_id)
+                payment_recoveries.append((job_id, payment_id))
+                continue
+            if stage == "payment":
+                self._update_job(
+                    job_id,
+                    status="interrupted_unknown",
+                    message="服务重启时未找到对应支付任务，需人工核对；已禁止重新扣款",
+                )
+                self._append_log(job_id, "没有足够恢复证据，未重新启动同一 Midtrans 支付")
                 continue
             email = str(job.get("email") or "").strip()
             record = self._record_for_email(email)
             if not record:
                 continue
             resumable.append((
-                str(job.get("id") or ""),
+                job_id,
                 record,
                 str(job.get("pin") or self._pin or "147258"),
                 str(job.get("proxy") or self._proxy or ""),
             ))
+        for job_id, payment_id in payment_recoveries:
+            self._append_log(job_id, f"服务重启后等待已有支付任务恢复: {payment_id}")
+            threading.Thread(
+                target=self._watch_recovered_payment,
+                args=(job_id, payment_id),
+                daemon=True,
+                name=f"auto-flow-payment-recover-{job_id}",
+            ).start()
         for job_id, record, pin, proxy in resumable:
             if not job_id:
                 continue
@@ -3864,6 +4741,59 @@ class _AutoFlowManager:
                 daemon=True,
                 name=f"auto-flow-resume-{job_id}",
             ).start()
+
+    def _watch_recovered_payment(self, job_id: str, payment_id: str) -> None:
+        timeout_sec = max(60, int(os.environ.get("OPAI_AUTO_FLOW_PAYMENT_TIMEOUT_SEC", "900")))
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            latest = self._web_payment.get(payment_id)
+            if latest:
+                status = str(latest.get("status") or "")
+                message = str(latest.get("message") or "")
+                try:
+                    self._update_job(job_id, payment_status=status, payment_message=message)
+                except Exception:
+                    log.exception("auto flow could not persist recovered payment progress: %s", job_id)
+                if status == "success":
+                    try:
+                        self._update_job(
+                            job_id,
+                            status="success",
+                            stage="done",
+                            message="全流程完成，GoPay 授权支付成功",
+                        )
+                        self._append_log(job_id, "已有支付任务恢复完成，未重复发起 charge")
+                    except Exception:
+                        log.exception("auto flow could not persist recovered payment success: %s", job_id)
+                    return
+                if status == "success_unreconciled":
+                    try:
+                        self._update_job(
+                            job_id,
+                            status="success_unreconciled",
+                            stage="done",
+                            message="GoPay 已支付成功，本地收尾待补偿",
+                        )
+                        self._append_log(job_id, "已有支付任务确认远端成功，本地收尾待补偿")
+                    except Exception:
+                        log.exception("auto flow could not persist recovered unreconciled success: %s", job_id)
+                    return
+                if status in {"failed", "fraud_denied"}:
+                    self._update_job(
+                        job_id,
+                        status="failed",
+                        stage="done",
+                        message=message or "GoPay 支付失败",
+                    )
+                    self._append_log(job_id, "已有支付任务已确认失败，未重新使用 Midtrans 链")
+                    return
+            time.sleep(2)
+        self._update_job(
+            job_id,
+            status="interrupted_unknown",
+            message="已有支付任务恢复超时，需人工核对；已禁止重新扣款",
+        )
+        self._append_log(job_id, "恢复等待超时，未重新启动同一 Midtrans 支付")
 
     def _watch_loop(self) -> None:
         while True:
@@ -3901,7 +4831,7 @@ class _AutoFlowManager:
         def reusable_existing_job(job: dict[str, Any]) -> bool:
             status = str(job.get("status") or "")
             message = str(job.get("message") or job.get("payment_message") or "")
-            if status == "success":
+            if status in {"success", "success_unreconciled", "interrupted_unknown"}:
                 return True
             if status == "running":
                 try:
@@ -3927,7 +4857,7 @@ class _AutoFlowManager:
                 if status == "running":
                     self._append_log(existing["id"], "已存在运行中的全流程任务，本次点击复用原任务，不重复生成 Midtrans")
                     return dict(existing)
-                if status == "success":
+                if status in {"success", "success_unreconciled", "interrupted_unknown"}:
                     return dict(existing)
                 if existing.get("midtrans_url"):
                     existing["status"] = "running"
@@ -4000,7 +4930,11 @@ class _AutoFlowManager:
             phone = str(account.get("phone") or "")
             if not phone:
                 continue
-            block_reason = _gopay_binding_block_reason(account)
+            block_reason = _gopay_binding_block_reason(
+                account,
+                order_id=order_id,
+                job_id=job_id,
+            )
             if block_reason:
                 self._append_log(job_id, f"账号 {phone} {block_reason}，跳过")
                 continue
@@ -4138,6 +5072,8 @@ class _AutoFlowManager:
             raise RuntimeError(f"自动补 GoPay 号失败，已尝试 {attempts} 次: {last_error or '无可用号码'}")
 
     def _run(self, *, job_id: str, record: dict[str, str], pin: str, proxy: str) -> None:
+        payment_id = ""
+        last_payment_status = ""
         try:
             self._update_job(job_id, stage="midtrans")
             with self._lock:
@@ -4187,44 +5123,145 @@ class _AutoFlowManager:
                 midtrans_url=str(midtrans.get("midtrans_url") or ""),
                 inbox_job_id=str(inbox_job.get("id") or ""),
                 proxy=proxy,
+                expected_previous_job_id=job_id,
             )
             payment_id = str(payment.get("id") or "")
-            self._update_job(job_id, payment_task_id=payment_id)
+            try:
+                self._update_job(job_id, payment_task_id=payment_id)
+            except Exception:
+                # The inner task is already running.  A local outer-state write
+                # failure must not enter the retry path and start another charge.
+                log.exception("auto flow could not persist started payment task: %s", job_id)
 
             deadline = time.time() + int(os.environ.get("OPAI_AUTO_FLOW_PAYMENT_TIMEOUT_SEC", "900"))
             while time.time() < deadline:
                 latest = self._web_payment.get(payment_id) if payment_id else None
                 if latest:
                     status = str(latest.get("status") or "")
-                    self._update_job(job_id, payment_status=status, payment_message=str(latest.get("message") or ""))
-                    if status in {"success", "failed"}:
-                        if status == "success":
-                            self._update_job(job_id, status="success", stage="done", message="全流程完成，GoPay 授权支付成功")
-                            self._append_log(job_id, "全流程完成，GoPay 授权支付成功")
-                            _update_gopay_midtrans_binding_status(phone, "success", message="授权支付成功")
+                    last_payment_status = status
+                    try:
+                        self._update_job(
+                            job_id,
+                            payment_status=status,
+                            payment_message=str(latest.get("message") or ""),
+                        )
+                    except Exception:
+                        log.exception("auto flow could not persist payment progress: %s", job_id)
+                    if status in {"success", "success_unreconciled", "interrupted_unknown", "failed"}:
+                        if status in {"success", "success_unreconciled"}:
+                            outer_message = (
+                                "全流程完成，GoPay 授权支付成功"
+                                if status == "success"
+                                else "GoPay 已支付成功，本地收尾待补偿"
+                            )
                             try:
-                                account, _ = _find_gopay_account(phone)
-                                if account:
-                                    _mark_gopay_sms_done(account)
+                                self._update_job(job_id, status=status, stage="done", message=outer_message)
                             except Exception:
-                                log.debug("auto flow mark sms done after payment failed", exc_info=True)
-                        else:
-                            _update_gopay_midtrans_binding_status(phone, "failed", message=str(latest.get("message") or "支付失败"))
-                            raise RuntimeError(str(latest.get("message") or "支付失败"))
-                        return
+                                log.exception("auto flow could not persist payment success: %s", job_id)
+                            try:
+                                self._append_log(
+                                    job_id,
+                                    "全流程完成，GoPay 授权支付成功"
+                                    if status == "success"
+                                    else "GoPay 远端支付已成功，本地收尾待补偿；不会自动重试",
+                                )
+                            except Exception:
+                                log.exception("auto flow could not persist payment success log: %s", job_id)
+                            if status == "success":
+                                try:
+                                    _update_gopay_midtrans_binding_status(
+                                        phone,
+                                        "success",
+                                        message="授权支付成功",
+                                        job_id=payment_id,
+                                    )
+                                except Exception:
+                                    log.exception("auto flow account success cleanup failed: %s", job_id)
+                                try:
+                                    account, _ = _find_gopay_account(phone)
+                                    if account:
+                                        _mark_gopay_sms_done(account)
+                                except Exception:
+                                    log.debug("auto flow mark sms done after payment failed", exc_info=True)
+                            return
+                        if status == "interrupted_unknown":
+                            unknown_message = str(
+                                latest.get("message")
+                                or "GoPay 交易状态待核对；已禁止重新扣款"
+                            )
+                            try:
+                                self._update_job(
+                                    job_id,
+                                    status="interrupted_unknown",
+                                    stage="payment",
+                                    message=unknown_message,
+                                )
+                                self._append_log(job_id, "GoPay 支付状态待核对，未重复发起 charge")
+                            except Exception:
+                                log.exception("auto flow could not persist unknown payment state: %s", job_id)
+                            return
+                        _update_gopay_midtrans_binding_status(
+                            phone,
+                            "failed",
+                            message=str(latest.get("message") or "支付失败"),
+                            job_id=payment_id,
+                        )
+                        raise RuntimeError(str(latest.get("message") or "支付失败"))
                 time.sleep(2)
+            if payment_id:
+                try:
+                    self._update_job(
+                        job_id,
+                        status="interrupted_unknown",
+                        stage="payment",
+                        message="已有 GoPay 支付任务恢复超时，需人工核对；已禁止重新扣款",
+                    )
+                    self._append_log(job_id, "已有支付任务轮询超时，未重新启动同一 Midtrans 支付")
+                except Exception:
+                    log.exception("auto flow could not persist payment timeout state: %s", job_id)
+                return
             raise TimeoutError("GoPay 支付任务超时")
         except Exception as exc:
             log.exception("auto flow failed: %s", job_id)
             reason = str(exc)
+            if payment_id and last_payment_status not in {
+                "success",
+                "success_unreconciled",
+                "failed",
+                "fraud_denied",
+            }:
+                try:
+                    self._update_job(
+                        job_id,
+                        status="interrupted_unknown",
+                        stage="payment",
+                        message="已有 GoPay 支付任务状态读取异常，需人工核对；已禁止重新扣款",
+                    )
+                    self._append_log(job_id, "已有支付任务状态读取异常，未重新启动同一 Midtrans 支付")
+                except Exception:
+                    log.exception("auto flow could not persist payment unknown state: %s", job_id)
+                return
             with self._lock:
                 failed_job = self._jobs.get(job_id) or {}
                 inbox_job_id = str(failed_job.get("inbox_job_id") or "")
                 email_key = str(failed_job.get("email") or "").strip().lower()
+                reserved_phone = str(failed_job.get("phone") or "").strip()
                 retry_count = int(failed_job.get("retry_count") or 0)
                 if email_key:
                     self._processed.discard(email_key)
-                self._save_state_locked()
+                try:
+                    self._save_state_locked()
+                except Exception:
+                    log.exception("auto flow could not persist failure pre-cleanup: %s", job_id)
+            try:
+                if reserved_phone:
+                    _release_gopay_midtrans_binding(
+                        reserved_phone,
+                        job_id,
+                        message="自动支付未启动，账号预占已释放，可重新使用",
+                    )
+            except Exception:
+                log.exception("auto flow could not release account reservation: %s", job_id)
             try:
                 if inbox_job_id and self._server.store is not None:
                     self._server.store.set_status_if_pending(inbox_job_id, "cancelled")
@@ -4676,8 +5713,35 @@ def _probe_checkout_egress(proxy: str, required_country: str = "") -> dict[str, 
     raise RuntimeError(f"checkout 代理出口检测失败: {last_error[:200]}")
 
 
+_MIDTRANS_REDIRECT_PATH_RE = re.compile(
+    r"^/snap/v[34]/redirection/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/?$",
+    re.IGNORECASE,
+)
+
+
+def _is_valid_midtrans_redirect_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and hostname == "app.midtrans.com"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and bool(_MIDTRANS_REDIRECT_PATH_RE.fullmatch(parsed.path))
+    )
+
+
 def _extract_midtrans_snap_token(url: str) -> str:
-    match = re.search(r"app\.midtrans\.com/snap/v[14]/redirection/([a-f0-9-]{36})", url or "")
+    if not _is_valid_midtrans_redirect_url(url):
+        return ""
+    parsed = urllib.parse.urlsplit(str(url or "").strip())
+    match = re.search(r"/snap/v[34]/redirection/([a-f0-9-]{36})", parsed.path, re.IGNORECASE)
     return match.group(1) if match else ""
 
 
@@ -4702,14 +5766,32 @@ def _midtrans_transaction_meta(
     snap = _extract_midtrans_snap_token(midtrans_url)
     if not snap:
         return {}
+    redirect_path = urllib.parse.urlsplit(str(midtrans_url or "").strip()).path
+    version_match = re.search(r"/snap/v([34])/redirection/", redirect_path, re.IGNORECASE)
+    redirect_version = version_match.group(1) if version_match else "4"
     import tls_client
 
     session = tls_client.Session(client_identifier="chrome130", random_tls_extension_order=True)
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
+    path = f"/snap/v1/transactions/{snap}"
+    timestamp = str(int(time.time()))
+    try:
+        from .gopay_payment_protocol import _snap_signature_hex
+    except ImportError:  # Allows running this file directly as a script.
+        from opai.core.gopay_payment_protocol import _snap_signature_hex
+    headers = payment_fingerprint_headers(payment_fingerprint)
+    headers.update({
+        "X-Snap-Signature": _snap_signature_hex(f"{path}:{timestamp}:"),
+        "X-Timestamp": timestamp,
+        "X-Source": "snap",
+        "X-Source-App-Type": "redirection",
+        "X-Source-Version": "2.3.0",
+        "Referer": f"https://app.midtrans.com/snap/v{redirect_version}/redirection/{snap}",
+    })
     resp = session.get(
-        f"https://app.midtrans.com/snap/v1/transactions/{snap}",
-        headers=payment_fingerprint_headers(payment_fingerprint),
+        f"https://app.midtrans.com{path}",
+        headers=headers,
         timeout_seconds=30,
     )
     try:

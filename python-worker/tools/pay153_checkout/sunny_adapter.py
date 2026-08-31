@@ -42,6 +42,7 @@ def start_checkout(payload: dict[str, Any]) -> str:
     default_country, default_currency = {
         "gcash": ("PH", "PHP"),
         "gopay": ("ID", "IDR"),
+        "momo": ("VN", "VND"),
         "blik": ("PL", "PLN"),
     }.get(link_type, ("US", "USD"))
     options = {

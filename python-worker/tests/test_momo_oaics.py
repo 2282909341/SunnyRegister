@@ -12,6 +12,7 @@ if str(PAY153_DIR) not in sys.path:
     sys.path.insert(0, str(PAY153_DIR))
 
 import app as checkout_app  # noqa: E402
+import provider_checkout as provider_checkout_module  # noqa: E402
 
 
 def test_momo_stage1_requests_custom_oaics_and_defers_trial_campaign() -> None:
@@ -317,6 +318,41 @@ def test_momo_native_method_detection_reads_har_observed_oaics_shapes() -> None:
     }
 
     assert checkout_app.oaics_native_payment_method_types(payload) == ["link", "card", "momo"]
+
+
+def test_native_snapshot_can_exclude_custom_payment_method_containers() -> None:
+    payload = {
+        "checkout_session": {
+            "payment_method_types": ["link", "card", "momo"],
+            "custom_payment_methods": [{"id": "cpmt_unrelated", "type": "wallet"}],
+        },
+    }
+
+    assert provider_checkout_module.published_payment_method_snapshot(payload) == (
+        ["link", "card", "momo", "wallet"],
+        True,
+    )
+    assert provider_checkout_module.published_payment_method_snapshot(
+        payload,
+        include_custom_methods=False,
+    ) == (["link", "card", "momo"], True)
+
+
+def test_custom_only_snapshot_is_absent_when_native_parser_excludes_custom_methods() -> None:
+    payload = {
+        "checkout_session": {
+            "customPaymentMethods": [{"id": "cpmt_momo", "type": "momo"}],
+        },
+    }
+
+    assert provider_checkout_module.published_payment_method_snapshot(payload) == (
+        ["momo"],
+        True,
+    )
+    assert provider_checkout_module.published_payment_method_snapshot(
+        payload,
+        include_custom_methods=False,
+    ) == ([], False)
 
 
 def test_momo_stage_uses_latest_explicit_methods_instead_of_stale_history() -> None:

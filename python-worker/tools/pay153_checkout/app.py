@@ -34,6 +34,7 @@ from provider_checkout import (
     is_gopay_promo_amount,
     is_momo_promo_amount,
     is_valid_ideal_payment_url,
+    published_payment_method_snapshot,
     stripe_to_provider,
 )
 from paypal_routing import reconcile_checkout_mode, session_checkout_kind
@@ -41,6 +42,23 @@ from proxy_routing import checkout_route_proxy, promotion_route_proxy, shares_ch
 from sentinel_fallback import resolve_payment_sentinel_headers
 from billing_address_resolver import resolve_cached_country_address
 from sentinel_token import SentinelTokenProvider as BaseSentinel
+from checkout_identity import (
+    CheckoutSessionIdentityConflictError,
+    classify_checkout_session_identity,
+)
+from payment_proof_contracts import (
+    CheckoutClientContext,
+    PaymentEndpoint,
+    PaymentFlowError,
+    ProofBundle,
+    ProofPolicy,
+    ProofProviderKind,
+    SentinelFlow,
+    flow_for_endpoint,
+    payment_endpoint as normalize_payment_endpoint,
+    render_payment_diagnostic_event,
+    sentinel_flow,
+)
 from upi_go_runner import available as upi_go_available, run_upi as run_upi_go
 from ph_short_extractor import (
     CheckoutExtractor as PhShortCheckoutExtractor,
@@ -306,11 +324,39 @@ STRIPE_CHECKOUT_FRAGMENT = (
 def normalize_hosted_checkout_url(url: str, session_id: str = "") -> str:
     """Return an OpenAI hosted Checkout URL that can be opened directly."""
     value = str(url or "").strip()
-    if not value and session_id:
-        value = f"https://pay.openai.com/c/pay/{session_id}"
-    if value.startswith("https://checkout.stripe.com/c/pay/"):
-        value = "https://pay.openai.com" + value[len("https://checkout.stripe.com"):]
-    return value
+    expected_session = str(session_id or "").strip()
+    if not expected_session.startswith(("cs_live_", "cs_test_")):
+        return ""
+    if value:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            try:
+                port = parsed.port
+            except ValueError:
+                port = -1
+            host = (parsed.hostname or "").lower().rstrip(".")
+            parts = [unquote(part) for part in parsed.path.split("/") if part]
+            if (
+                parsed.scheme.lower() == "https"
+                and host in {"checkout.stripe.com", "pay.openai.com"}
+                and parsed.username is None
+                and parsed.password is None
+                and port in {None, 443}
+                and len(parts) == 3
+                and [part.lower() for part in parts[:2]] == ["c", "pay"]
+                and parts[2] == expected_session
+            ):
+                if host == "checkout.stripe.com":
+                    return "https://pay.openai.com" + parsed.path + (
+                        f"?{parsed.query}" if parsed.query else ""
+                    ) + (f"#{parsed.fragment}" if parsed.fragment else "")
+                return value
+    # Never surface an untrusted or stale URL.  The canonical URL is derived
+    # only from the authoritative, already-classified Checkout ID.
+    return f"https://pay.openai.com/c/pay/{expected_session}"
 
 
 def is_valid_oaics_blik_payment_url(url: str, session_id: str) -> bool:
@@ -701,8 +747,63 @@ async def sentinel_headers(
     *,
     use_sen: bool = True,
     use_so: bool = True,
+    client_context: CheckoutClientContext | None = None,
+    proof_policy: ProofPolicy | None = None,
+    payment_endpoint: PaymentEndpoint | str | None = None,
 ) -> dict[str, str]:
+    # The legacy provider remains available for compatibility, but protected
+    # GoPay routes must pass through the explicit contract.  The policy owns
+    # the required-proof decision so request options cannot silently disable it.
+    contract_request = None
+    if proof_policy is not None:
+        if client_context is None:
+            raise PaymentFlowError(
+                "CHECKOUT_CLIENT_CONTEXT_REQUIRED",
+                "protected Sentinel proof generation requires the bound Checkout context",
+                phase="proof",
+            )
+        flow_value = sentinel_flow(flow)
+        if payment_endpoint is None:
+            raise PaymentFlowError(
+                "PAYMENT_ENDPOINT_REQUIRED",
+                "protected Sentinel proof generation requires an explicit payment endpoint",
+                phase="configuration",
+            )
+        endpoint = normalize_payment_endpoint(payment_endpoint)
+        if flow_for_endpoint(endpoint) is not flow_value:
+            raise PaymentFlowError(
+                "ENDPOINT_FLOW_MISMATCH",
+                "Sentinel flow does not match the protected payment endpoint",
+                phase="configuration",
+            )
+        contract_request = client_context.proof_request(endpoint)
+        # GoPay's policy is authoritative.  ``use_sen/use_so`` are retained in
+        # the public signature for older callers but cannot turn off required
+        # proof generation on this path.
+        if proof_policy.payment_provider == "gopay":
+            use_sen = True
+            use_so = True
+        if client_context.proof_issuer is not None:
+            try:
+                bundle = await client_context.proof_issuer.issue(contract_request)
+                proof_policy.validate(client_context, contract_request, bundle)
+                return bundle.http_headers()
+            except PaymentFlowError:
+                raise
+            except Exception as exc:
+                raise PaymentFlowError(
+                    "PROOF_PROVIDER_FAILED",
+                    f"configured proof provider failed: {type(exc).__name__}",
+                    phase="proof",
+                    retryable=True,
+                ) from exc
     if not use_sen and not use_so:
+        if proof_policy is not None and not proof_policy.allow_empty_fallback:
+            raise PaymentFlowError(
+                "SENTINEL_PROOF_REQUIRED",
+                "the protected payment route cannot disable all Sentinel proofs",
+                phase="proof",
+            )
         return {}
     last_error = "empty token"
     for attempt in range(2):
@@ -724,13 +825,45 @@ async def sentinel_headers(
                     out["OpenAI-Sentinel-Token"] = json.dumps(token, separators=(",", ":"))
                 if use_so and so:
                     out["OpenAI-Sentinel-SO-Token"] = json.dumps(so, separators=(",", ":"))
+                if proof_policy is not None and contract_request is not None and client_context is not None:
+                    bundle = ProofBundle(
+                        endpoint=contract_request.endpoint,
+                        flow=contract_request.flow,
+                        payment_provider=contract_request.payment_provider,
+                        proof_provider=client_context.proof_provider,
+                        device_id=contract_request.device_id,
+                        did=contract_request.did,
+                        user_agent=contract_request.user_agent,
+                        proxy_route=contract_request.proxy_route,
+                        session_owner=contract_request.session_owner,
+                        headers=out,
+                        turnstile_required=bool(diag.get("turnstile_required")),
+                        session_observer_required=bool(diag.get("so_required")),
+                        cookie_identity=contract_request.cookie_identity,
+                    )
+                    proof_policy.validate(client_context, contract_request, bundle)
+                    return bundle.http_headers()
                 return out
+        except PaymentFlowError:
+            raise
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
         finally:
-            await provider.close()
+            # Cleanup failures must not replace a typed proof-policy failure.
+            # The proof outcome is authoritative; provider cleanup is best effort.
+            try:
+                await provider.close()
+            except Exception:
+                pass
         if attempt == 0:
             await asyncio.sleep(0.6)
+    if proof_policy is not None:
+        raise PaymentFlowError(
+            "SENTINEL_PROOF_GENERATION_FAILED",
+            f"Sentinel token generation failed after fresh-session retry: {last_error[:320]}",
+            phase="proof",
+            retryable=True,
+        )
     raise RuntimeError(f"Sentinel token generation failed after fresh-session retry: {last_error[:320]}")
 
 
@@ -786,6 +919,71 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
     return common
 
 
+def _verify_checkout_context_cookies(
+    http,
+    client_context: CheckoutClientContext,
+    *,
+    phase: str,
+) -> None:
+    cookie_jar = getattr(http, "cookies", None)
+    get_dict = getattr(cookie_jar, "get_dict", None)
+    if not callable(get_dict):
+        raise PaymentFlowError(
+            "CLIENT_COOKIE_IDENTITY_UNVERIFIABLE",
+            "protected Checkout session cookie identity cannot be read",
+            phase=phase,
+        )
+    try:
+        session_cookies = get_dict()
+    except Exception as exc:
+        raise PaymentFlowError(
+            "CLIENT_COOKIE_IDENTITY_UNVERIFIABLE",
+            "protected Checkout session cookie identity cannot be read",
+            phase=phase,
+        ) from exc
+    if not isinstance(session_cookies, dict):
+        raise PaymentFlowError(
+            "CLIENT_COOKIE_IDENTITY_UNVERIFIABLE",
+            "protected Checkout session returned an invalid cookie snapshot",
+            phase=phase,
+        )
+    if any(
+        str(session_cookies.get(name) or "") != value
+        for name, value in client_context.cookies.items()
+    ):
+        raise PaymentFlowError(
+            "CLIENT_CONTEXT_MISMATCH",
+            "protected Checkout session cookie identity differs from its creation context",
+            phase=phase,
+        )
+
+
+def _bind_checkout_context_cookies(
+    http,
+    client_context: CheckoutClientContext,
+    *,
+    phase: str,
+) -> None:
+    cookie_jar = getattr(http, "cookies", None)
+    setter = getattr(cookie_jar, "set", None)
+    if not callable(setter):
+        raise PaymentFlowError(
+            "CLIENT_COOKIE_BINDING_FAILED",
+            "protected Checkout session cannot bind its required cookies",
+            phase=phase,
+        )
+    try:
+        for cookie_name, cookie_value in client_context.cookies.items():
+            setter(cookie_name, cookie_value, domain="chatgpt.com")
+    except Exception as exc:
+        raise PaymentFlowError(
+            "CLIENT_COOKIE_BINDING_FAILED",
+            "protected Checkout session cannot bind its required cookies",
+            phase=phase,
+        ) from exc
+    _verify_checkout_context_cookies(http, client_context, phase=phase)
+
+
 def _create_checkout_unmanaged(
     token: str,
     payload: dict,
@@ -799,35 +997,110 @@ def _create_checkout_unmanaged(
     allow_sentinel_fallback: bool = False,
     diagnostic_label: str = "",
     _session_holder: list[Any] | None = None,
+    client_context: CheckoutClientContext | None = None,
+    proof_policy: ProofPolicy | None = None,
 ) -> dict:
     http = sc.build_http(proxy or None)
     if _session_holder is not None:
         _session_holder.append(http)
-    try:
-        http.cookies.set("oai-did", did, domain="chatgpt.com")
-    except Exception:
-        pass
+    is_gopay = str(diagnostic_label or "").strip().lower() == "gopay"
+    if is_gopay:
+        # GoPay always uses a strict proof policy.  The legacy boolean flags
+        # remain for generic callers but cannot disable a protected route.
+        if str(device_id or "").strip() != str(did or "").strip():
+            raise PaymentFlowError(
+                "CLIENT_IDENTITY_MISMATCH",
+                "GoPay requires oai-did and OAI-Device-Id to be identical",
+                phase="configuration",
+            )
+        if client_context is None:
+            client_context = CheckoutClientContext(
+                payment_provider="gopay",
+                device_id=device_id,
+                did=did,
+                user_agent=sc.CHROME_UA,
+                proxy_route=proxy,
+                session_owner=f"checkout-http:{id(http)}",
+                proof_provider=ProofProviderKind.LEGACY_PYTHON_NODE.value,
+                cookies={"oai-did": did},
+            )
+        else:
+            expected_session_owner = f"checkout-http:{id(http)}"
+            if client_context.session_owner != expected_session_owner:
+                raise PaymentFlowError(
+                    "CLIENT_CONTEXT_MISMATCH",
+                    "GoPay Checkout context is not bound to the HTTP session used for creation",
+                    phase="configuration",
+                )
+            expected = CheckoutClientContext(
+                payment_provider="gopay",
+                device_id=device_id,
+                did=did,
+                user_agent=client_context.user_agent,
+                proxy_route=proxy,
+                session_owner=client_context.session_owner,
+                proof_provider=client_context.proof_provider,
+                cookies=client_context.cookies,
+            )
+            client_context.validate_request(
+                expected.proof_request(PaymentEndpoint.CHECKOUT_CREATE)
+            )
+        proof_policy = proof_policy or ProofPolicy.strict_gopay()
+        if proof_policy.payment_provider != "gopay":
+            raise PaymentFlowError(
+                "PROOF_POLICY_PROVIDER_MISMATCH",
+                "GoPay Checkout must use the GoPay proof policy",
+                phase="configuration",
+            )
+        use_sen = True
+        use_so = True
+        allow_sentinel_fallback = False
+    if is_gopay and client_context is not None:
+        _bind_checkout_context_cookies(http, client_context, phase="checkout")
+    else:
+        try:
+            http.cookies.set("oai-did", did, domain="chatgpt.com")
+            if client_context is not None:
+                for cookie_name, cookie_value in client_context.cookies.items():
+                    http.cookies.set(cookie_name, cookie_value, domain="chatgpt.com")
+        except Exception:
+            pass
     try:
         http.get(
             "https://chatgpt.com/api/auth/csrf",
-            headers={"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+            headers={
+                "User-Agent": client_context.user_agent if client_context is not None else sc.CHROME_UA,
+                "Accept": "application/json,text/plain,*/*",
+            },
             timeout=20,
         )
     except Exception as exc:
         log(f"ChatGPT 暖身提示：{type(exc).__name__}")
+    proof_started_at = time.monotonic()
     s_headers = resolve_payment_sentinel_headers(
         sentinel_headers, proxy, "chatgpt_checkout", device_id, did,
         use_sen=use_sen, use_so=use_so,
         allow_fallback=allow_sentinel_fallback, log=log,
+        client_context=client_context,
+        proof_policy=proof_policy,
+        payment_endpoint=PaymentEndpoint.CHECKOUT_CREATE if proof_policy is not None else None,
     )
     if diagnostic_label:
-        identity_hash = hashlib.sha256(str(device_id or "").encode("utf-8")).hexdigest()[:10]
         log(
             f"{diagnostic_label} 客户端证明：flow=chatgpt_checkout，"
             f"SEN={'yes' if s_headers.get('OpenAI-Sentinel-Token') else 'no'}，"
             f"SO={'yes' if s_headers.get('OpenAI-Sentinel-SO-Token') else 'no'}，"
-            f"identity={identity_hash}"
+            f"identity={(client_context.identity_hash if client_context is not None else hashlib.sha256(str(device_id or '').encode('utf-8')).hexdigest()[:12])}"
         )
+        if client_context is not None:
+            log(render_payment_diagnostic_event(
+                client_context,
+                phase="checkout_create_proof",
+                flow=SentinelFlow.CHATGPT_CHECKOUT,
+                sen_present=bool(s_headers.get("OpenAI-Sentinel-Token")),
+                so_present=bool(s_headers.get("OpenAI-Sentinel-SO-Token")),
+                elapsed_ms=(time.monotonic() - proof_started_at) * 1000,
+            ))
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -835,7 +1108,7 @@ def _create_checkout_unmanaged(
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
-        "User-Agent": sc.CHROME_UA,
+        "User-Agent": client_context.user_agent if client_context is not None else sc.CHROME_UA,
         "OAI-Language": "zh-CN",
         "OAI-Device-Id": device_id,
         **s_headers,
@@ -854,45 +1127,104 @@ def _create_checkout_unmanaged(
         if resp.status_code in {400, 403} and any(
             marker in lowered for marker in ("device", "oai-did", "oai_device", "device_id")
         ):
-            raise RuntimeError(
-                f"DEVICE_SESSION_MISMATCH: OpenAI Checkout HTTP {resp.status_code}: {text[:500]}"
+            raise PaymentFlowError(
+                "DEVICE_SESSION_MISMATCH",
+                f"OpenAI Checkout HTTP {resp.status_code}: device identity was rejected",
+                phase="checkout",
+                http_status=resp.status_code,
             )
         if resp.status_code in {400, 403} and any(
             marker in lowered for marker in ("sentinel", "proof", "blocked", "challenge")
         ):
-            raise RuntimeError(
-                f"SENTINEL_PROOF_REJECTED: OpenAI Checkout HTTP {resp.status_code}: {text[:500]}"
+            raise PaymentFlowError(
+                "SENTINEL_PROOF_REJECTED",
+                f"OpenAI Checkout HTTP {resp.status_code}: client proof was rejected",
+                phase="checkout",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            )
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_CHECKOUT_HTTP_ERROR",
+                f"GoPay Checkout creation failed: HTTP {resp.status_code}",
+                phase="checkout",
+                http_status=resp.status_code,
+                retryable=(
+                    resp.status_code in {408, 425, 429}
+                    or resp.status_code >= 500
+                ),
             )
         raise RuntimeError(f"OpenAI Checkout HTTP {resp.status_code}: {text[:500]}")
     try:
         data = resp.json()
     except Exception:
-        raise RuntimeError(f"OpenAI Checkout 返回非 JSON：{text[:300]}")
-    raw_sid = str(data.get("checkout_session_id") or "")
-    sid_match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", raw_sid)
-    sid = sid_match.group(0) if sid_match else ""
+        raise PaymentFlowError(
+            "CHECKOUT_RESPONSE_INVALID",
+            "OpenAI Checkout returned a non-JSON response",
+            phase="checkout",
+            http_status=resp.status_code,
+            retryable=True,
+            rebuild_checkout=True,
+        )
+    if not isinstance(data, dict):
+        raise PaymentFlowError(
+            "CHECKOUT_RESPONSE_INVALID",
+            "OpenAI Checkout response must be a JSON object",
+            phase="checkout",
+            http_status=resp.status_code,
+            retryable=True,
+            rebuild_checkout=True,
+        )
     url = data.get("url") or ""
-    if not sid and url:
-        match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", url)
-        sid = match.group(0) if match else ""
-    if not sid:
-        match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", text)
-        sid = match.group(0) if match else ""
-    if not sid:
-        custom_match = re.search(r"oaics_[A-Za-z0-9]+", "\n".join((raw_sid, str(url), text)))
-        if custom_match:
-            custom_id = custom_match.group(0)
-            processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
-            data["checkout_session_id"] = custom_id
-            data["checkout_provider"] = str(data.get("checkout_provider") or "open_ai")
-            data["processor_entity"] = processor
-            data["is_custom_checkout"] = True
-            data["source_checkout_url"] = str(url or "")
-            data["checkout_url"] = f"https://chatgpt.com/checkout/{processor}/{custom_id}"
-            return {"data": data, "http": http}
+    try:
+        identity = classify_checkout_session_identity(data, text)
+    except CheckoutSessionIdentityConflictError as exc:
+        raise PaymentFlowError(
+            "CHECKOUT_SESSION_ID_CONFLICT",
+            str(exc),
+            phase="checkout",
+            retryable=True,
+            rebuild_checkout=True,
+        ) from exc
+    if identity is None:
+        raise PaymentFlowError(
+            "CHECKOUT_SESSION_ID_MISSING",
+            "Checkout response did not contain a recognized session identity",
+            phase="checkout",
+            retryable=True,
+            rebuild_checkout=True,
+        )
+    sid = identity.session_id
+    if diagnostic_label and client_context is not None:
+        log(render_payment_diagnostic_event(
+            client_context,
+            phase="checkout_create_result",
+            flow=SentinelFlow.CHATGPT_CHECKOUT,
+            sen_present=bool(s_headers.get("OpenAI-Sentinel-Token")),
+            so_present=bool(s_headers.get("OpenAI-Sentinel-SO-Token")),
+            checkout_type=identity.kind,
+            payment_method_source="checkout_response",
+            elapsed_ms=(time.monotonic() - proof_started_at) * 1000,
+        ))
+    if identity.kind == "oaics":
+        processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
+        data["checkout_session_id"] = sid
+        data["checkout_provider"] = str(data.get("checkout_provider") or "open_ai")
+        data["processor_entity"] = processor
+        data["is_custom_checkout"] = True
+        data["source_checkout_url"] = str(url or "")
+        data["checkout_url"] = f"https://chatgpt.com/checkout/{processor}/{sid}"
+        result = {"data": data, "http": http}
+        if client_context is not None:
+            result["client_context"] = client_context
+        return result
     data["checkout_session_id"] = sid
     data["checkout_url"] = normalize_hosted_checkout_url(url, sid)
-    return {"data": data, "http": http}
+    result = {"data": data, "http": http}
+    if client_context is not None:
+        result["client_context"] = client_context
+    return result
 
 
 def create_checkout(
@@ -907,6 +1239,8 @@ def create_checkout(
     use_so: bool = True,
     allow_sentinel_fallback: bool = False,
     diagnostic_label: str = "",
+    client_context: CheckoutClientContext | None = None,
+    proof_policy: ProofPolicy | None = None,
 ) -> dict:
     """Create a Checkout and close its HTTP session when creation fails.
 
@@ -928,6 +1262,8 @@ def create_checkout(
             allow_sentinel_fallback=allow_sentinel_fallback,
             diagnostic_label=diagnostic_label,
             _session_holder=session_holder,
+            client_context=client_context,
+            proof_policy=proof_policy,
         )
     except BaseException:
         close_http_sessions(session_holder)
@@ -950,6 +1286,7 @@ def create_local_method_cs_live_checkout(
     allow_sentinel_fallback: bool = True,
     creation_budget: CheckoutCreationBudget | None = None,
     cancel_check=None,
+    proof_policy: ProofPolicy | None = None,
 ) -> tuple[dict, str, str]:
     """Rebuild redirect Checkouts until a local method receives CS Live."""
     max_attempts = max(1, min(int(attempts or 10), 10))
@@ -979,12 +1316,23 @@ def create_local_method_cs_live_checkout(
                 use_so=use_so,
                 allow_sentinel_fallback=allow_sentinel_fallback,
                 diagnostic_label=method_name if error_prefix == "GOPAY" else "",
+                proof_policy=(
+                    proof_policy
+                    if proof_policy is not None
+                    else (ProofPolicy.strict_gopay() if error_prefix == "GOPAY" else None)
+                ),
             )
         except Exception as exc:
             message = str(exc)
-            retryable = bool(_proxy_transport_error_kind(message)) or bool(
-                re.search(r"OpenAI Checkout HTTP (?:429|5\d\d)\b", message)
-            ) or message.startswith("Sentinel token generation failed")
+            retryable = (
+                exc.retryable
+                if isinstance(exc, PaymentFlowError)
+                else (
+                    bool(_proxy_transport_error_kind(message))
+                    or bool(re.search(r"OpenAI Checkout HTTP (?:429|5\d\d)\b", message))
+                    or message.startswith("Sentinel token generation failed")
+                )
+            )
             if not retryable:
                 raise
             log(
@@ -992,9 +1340,12 @@ def create_local_method_cs_live_checkout(
                 f"临时失败 {type(exc).__name__}: {message[:180]}"
             )
             if attempt >= max_attempts:
-                raise RuntimeError(
-                    f"{error_prefix}_CS_LIVE_CREATE_RETRY_EXHAUSTED: 连续 {max_attempts} 次创建均未完成；"
-                    f"最后错误={message[:240]}"
+                raise PaymentFlowError(
+                    f"{error_prefix}_CS_LIVE_CREATE_RETRY_EXHAUSTED",
+                    f"连续 {max_attempts} 次创建均未完成；最后错误类型={type(exc).__name__}",
+                    phase="checkout",
+                    retryable=True,
+                    rebuild_checkout=True,
                 ) from exc
             next_identity = str(uuid.uuid4())
             current_device_id = next_identity
@@ -1014,9 +1365,12 @@ def create_local_method_cs_live_checkout(
 
         close_http_sessions([created.get("http")])
         if last_kind != "oaics":
-            raise RuntimeError(
-                f"{error_prefix}_CHECKOUT_TYPE_UNKNOWN: {method_name} redirect Checkout "
-                "未返回可识别的 cs_live/oaics 会话"
+            raise PaymentFlowError(
+                f"{error_prefix}_CHECKOUT_TYPE_UNKNOWN",
+                f"{method_name} redirect Checkout 未返回可识别的 cs_live/oaics 会话",
+                phase="checkout",
+                retryable=True,
+                rebuild_checkout=True,
             )
         if attempt < max_attempts:
             log(f"{method_name} 当前返回 OAICS；丢弃该会话并刷新设备标识，继续强制重建 CS Live")
@@ -1024,9 +1378,12 @@ def create_local_method_cs_live_checkout(
             current_device_id = next_identity
             current_did = next_identity if error_prefix == "GOPAY" else str(uuid.uuid4())
 
-    raise RuntimeError(
-        f"{error_prefix}_CS_LIVE_REBUILD_EXHAUSTED: 同一 Checkout 代理连续 {max_attempts} 次返回 "
-        f"{last_kind.upper()}，将切换代理后继续重建"
+    raise PaymentFlowError(
+        f"{error_prefix}_CS_LIVE_REBUILD_EXHAUSTED",
+        f"同一 Checkout 代理连续 {max_attempts} 次返回 {last_kind.upper()}，将切换代理后继续重建",
+        phase="checkout",
+        retryable=True,
+        rebuild_checkout=True,
     )
 
 
@@ -1043,14 +1400,18 @@ def create_gopay_cs_live_checkout(
     use_so: bool = True,
     creation_budget: CheckoutCreationBudget | None = None,
     cancel_check=None,
+    proof_policy: ProofPolicy | None = None,
 ) -> tuple[dict, str, str]:
+    # Never derive GoPay proof requirements from user-controlled booleans.
+    strict_policy = proof_policy or ProofPolicy.strict_gopay()
     return create_local_method_cs_live_checkout(
         token, payload, proxy, device_id, did, log,
-        attempts=attempts, use_sen=use_sen, use_so=use_so,
+        attempts=attempts, use_sen=True, use_so=True,
         method_name="GoPay", error_prefix="GOPAY",
         allow_sentinel_fallback=False,
         creation_budget=creation_budget,
         cancel_check=cancel_check,
+        proof_policy=strict_policy,
     )
 
 
@@ -1473,34 +1834,8 @@ def oaics_stage_native_payment_method_types(
 
 
 def oaics_payload_declares_payment_methods(value: Any, depth: int = 0) -> bool:
-    if depth > 6:
-        return False
-    method_keys = {
-        "custom_payment_methods",
-        "customPaymentMethods",
-        "payment_methods",
-        "paymentMethods",
-        "payment_method_types",
-        "paymentMethodTypes",
-        "available_payment_methods",
-        "availablePaymentMethods",
-        "payment_method_specs",
-        "paymentMethodSpecs",
-    }
-    if isinstance(value, dict):
-        if any(key in value for key in method_keys):
-            return True
-        return any(
-            oaics_payload_declares_payment_methods(item, depth + 1)
-            for item in value.values()
-            if isinstance(item, (dict, list, tuple))
-        )
-    if isinstance(value, (list, tuple)):
-        return any(
-            oaics_payload_declares_payment_methods(item, depth + 1)
-            for item in value
-        )
-    return False
+    del depth  # Retained for compatibility with older direct callers.
+    return published_payment_method_snapshot(value)[1]
 
 
 def oaics_nested_custom_payment_method_id(
@@ -1935,60 +2270,16 @@ def submit_custom_checkout_taxes(
 
 
 def oaics_native_payment_method_types(*payloads: Any) -> list[str]:
-    """Collect native Stripe method types published by an OAICS response."""
-    container_keys = {
-        "payment_method_types",
-        "paymentMethodTypes",
-        "available_payment_methods",
-        "availablePaymentMethods",
-        "payment_method_specs",
-        "paymentMethodSpecs",
-        "payment_methods",
-        "paymentMethods",
-    }
-    type_keys = {
-        "type", "name", "payment_method_type", "paymentMethodType", "method_type",
-    }
+    """Collect enabled OAICS types through the shared OAICS/CS Live contract."""
     found: list[str] = []
-
-    def add(value: Any) -> None:
-        normalized = str(value or "").strip().lower().replace("-", "_")
-        if normalized and normalized not in found and not normalized.startswith("cpmt_"):
-            found.append(normalized)
-
-    def collect_methods(value: Any, depth: int = 0) -> None:
-        if depth > 5:
-            return
-        if isinstance(value, str):
-            add(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect_methods(item, depth + 1)
-        elif isinstance(value, dict):
-            for key in type_keys:
-                if key in value:
-                    candidate = value.get(key)
-                    if isinstance(candidate, (str, int, float)):
-                        add(candidate)
-            for key, nested in value.items():
-                if key in container_keys:
-                    collect_methods(nested, depth + 1)
-
-    def walk(value: Any, depth: int = 0) -> None:
-        if depth > 6:
-            return
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                if key in container_keys:
-                    collect_methods(nested, depth + 1)
-                elif isinstance(nested, (dict, list, tuple)):
-                    walk(nested, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for nested in value:
-                walk(nested, depth + 1)
-
     for payload in payloads:
-        walk(payload)
+        methods, _explicit = published_payment_method_snapshot(
+            payload,
+            include_custom_methods=False,
+        )
+        for method in methods:
+            if method not in found:
+                found.append(method)
     return found
 
 
@@ -2422,6 +2713,44 @@ def poll_oaics_momo_intent(
     return last
 
 
+def validate_bound_checkout_context(
+    client_context: CheckoutClientContext | None,
+    http,
+    *,
+    expected_provider: str,
+    proxy: str,
+    device_id: str,
+    did: str,
+    phase: str,
+) -> CheckoutClientContext:
+    """Fail closed when a protected stage drifts from its creation session."""
+    if client_context is None or http is None:
+        raise PaymentFlowError(
+            "CHECKOUT_CLIENT_CONTEXT_REQUIRED",
+            "protected payment stages require the creation context and HTTP session",
+            phase=phase,
+        )
+    mismatches: list[str] = []
+    if client_context.payment_provider != str(expected_provider or "").strip().lower():
+        mismatches.append("payment_provider")
+    if client_context.device_id != str(device_id or "").strip():
+        mismatches.append("device_id")
+    if client_context.did != str(did or "").strip():
+        mismatches.append("did")
+    if client_context.proxy_route != str(proxy or "").strip():
+        mismatches.append("proxy_route")
+    if client_context.session_owner != f"checkout-http:{id(http)}":
+        mismatches.append("session_owner")
+    if mismatches:
+        raise PaymentFlowError(
+            "CLIENT_CONTEXT_MISMATCH",
+            "protected payment stage differs from creation context: " + ", ".join(mismatches),
+            phase=phase,
+        )
+    _verify_checkout_context_cookies(http, client_context, phase=phase)
+    return client_context
+
+
 def confirm_custom_checkout_method(
     http,
     token: str,
@@ -2436,13 +2765,49 @@ def confirm_custom_checkout_method(
     use_so: bool = True,
     method_name: str = "GCash",
     allow_sentinel_fallback: bool = False,
+    client_context: CheckoutClientContext | None = None,
+    proof_policy: ProofPolicy | None = None,
     log=lambda _message: None,
 ) -> dict[str, Any]:
+    is_gopay = (
+        str(method_name or "").strip().lower() == "gopay"
+        or (proof_policy is not None and proof_policy.payment_provider == "gopay")
+    )
+    if is_gopay:
+        proof_policy = proof_policy or ProofPolicy.strict_gopay()
+        client_context = validate_bound_checkout_context(
+            client_context,
+            http,
+            expected_provider="gopay",
+            proxy=proxy,
+            device_id=device_id,
+            did=did,
+            phase="confirm",
+        )
+        use_sen = True
+        use_so = True
+        allow_sentinel_fallback = False
+        device_id = client_context.device_id
+        did = client_context.did
+        proxy = client_context.proxy_route
+    proof_started_at = time.monotonic()
     sentinel = resolve_payment_sentinel_headers(
         sentinel_headers, proxy, "checkout_session_approval", device_id, did,
         use_sen=use_sen, use_so=use_so,
         allow_fallback=allow_sentinel_fallback, log=log,
+        client_context=client_context,
+        proof_policy=proof_policy,
+        payment_endpoint=PaymentEndpoint.CHECKOUT_CONFIRM if proof_policy is not None else None,
     )
+    if client_context is not None and proof_policy is not None:
+        log(render_payment_diagnostic_event(
+            client_context,
+            phase="checkout_confirm_proof",
+            flow=SentinelFlow.CHECKOUT_SESSION_APPROVAL,
+            sen_present=bool(sentinel.get("OpenAI-Sentinel-Token")),
+            so_present=bool(sentinel.get("OpenAI-Sentinel-SO-Token")),
+            elapsed_ms=(time.monotonic() - proof_started_at) * 1000,
+        ))
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/confirm",
         json={
@@ -2456,7 +2821,7 @@ def confirm_custom_checkout_method(
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Origin": "https://chatgpt.com",
             "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
-            "User-Agent": sc.CHROME_UA,
+            "User-Agent": client_context.user_agent if client_context is not None else sc.CHROME_UA,
             "OAI-Language": "zh-CN",
             "OAI-Device-Id": device_id,
             "x-openai-target-path": "/backend-api/payments/checkout/confirm",
@@ -2469,9 +2834,21 @@ def confirm_custom_checkout_method(
     payload: dict[str, Any] = {}
     json_error: Exception | None = None
     try:
-        value = resp.json() or {}
-        payload = value if isinstance(value, dict) else {}
+        value = resp.json()
+        if isinstance(value, dict):
+            payload = value
+        elif is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_CONFIRM_RESPONSE_INVALID",
+                "GoPay confirmation response must be a JSON object",
+                phase="confirm",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            )
     except Exception as exc:
+        if isinstance(exc, PaymentFlowError):
+            raise
         json_error = exc
     if checkout_confirmation_is_blocked(payload, text):
         detail = ""
@@ -2483,16 +2860,47 @@ def confirm_custom_checkout_method(
         detail = re.sub(r"eyJ[A-Za-z0-9_.-]{40,}", "[TOKEN]", detail)[:240]
         if log:
             log(f"{method_name} confirm 被上游标记 blocked" + (f"：{detail}" if detail else "，响应未提供原因"))
-        raise RuntimeError(
-            f"CUSTOM_CONFIRM_BLOCKED: {method_name} 支付方式确认被上游拦截"
-            + (f"（{detail}）" if detail else "")
+        raise PaymentFlowError(
+            "GOPAY_CONFIRM_BLOCKED_REBUILD_REQUIRED" if is_gopay else "CUSTOM_CONFIRM_BLOCKED",
+            f"{method_name} 支付方式确认被上游拦截"
+            + (f"：{detail}" if detail else ""),
+            phase="confirm",
+            retryable=True,
+            rebuild_checkout=is_gopay,
+            http_status=resp.status_code,
         )
     if resp.status_code != 200:
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_CONFIRM_HTTP_ERROR",
+                f"GoPay 支付方式确认失败：HTTP {resp.status_code}",
+                phase="confirm",
+                http_status=resp.status_code,
+                retryable=resp.status_code == 429 or resp.status_code >= 500,
+            )
         raise RuntimeError(f"确认 {method_name} 支付方式失败：HTTP {resp.status_code} {text[:300]}")
     if json_error is not None:
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_CONFIRM_RESPONSE_INVALID",
+                "GoPay confirmation returned a non-JSON response",
+                phase="confirm",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            ) from json_error
         raise RuntimeError(f"确认 {method_name} 支付方式返回非 JSON：{text[:300]}") from json_error
     status = str(payload.get("status") or payload.get("result") or "unknown").lower()
     if status != "success":
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_CONFIRM_REJECTED",
+                f"GoPay confirmation returned status={status[:40]}",
+                phase="confirm",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            )
         raise RuntimeError(f"确认 {method_name} 支付方式失败：status={status}；{text[:300]}")
     return payload
 
@@ -2514,6 +2922,8 @@ def confirm_custom_checkout_method_with_retry(
     max_retries: int = 2,
     delay_seconds: float = 1.2,
     rebuild_on_blocked: bool = False,
+    client_context: CheckoutClientContext | None = None,
+    proof_policy: ProofPolicy | None = None,
     log=lambda _message: None,
 ) -> dict[str, Any]:
     """Retry only upstream ``blocked`` confirmations within one Checkout.
@@ -2537,12 +2947,23 @@ def confirm_custom_checkout_method_with_retry(
                 use_so=True if attempt else use_so,
                 method_name=method_name,
                 allow_sentinel_fallback=allow_sentinel_fallback,
+                client_context=client_context,
+                proof_policy=proof_policy,
                 log=log,
             )
         except RuntimeError as exc:
-            if "CUSTOM_CONFIRM_BLOCKED" not in str(exc):
+            if isinstance(exc, PaymentFlowError):
+                blocked_error = exc.code in {
+                    "CUSTOM_CONFIRM_BLOCKED",
+                    "GOPAY_CONFIRM_BLOCKED_REBUILD_REQUIRED",
+                }
+            else:
+                blocked_error = "CUSTOM_CONFIRM_BLOCKED" in str(exc)
+            if not blocked_error:
                 raise
-            if rebuild_on_blocked:
+            if rebuild_on_blocked or (
+                isinstance(exc, PaymentFlowError) and exc.rebuild_checkout
+            ):
                 raise
             last_error = exc
     if last_error:
@@ -2559,7 +2980,22 @@ def start_custom_checkout_method(
     device_id: str,
     *,
     method_name: str = "GCash",
+    proxy: str = "",
+    did: str = "",
+    client_context: CheckoutClientContext | None = None,
 ) -> dict[str, Any]:
+    is_gopay = str(method_name or "").strip().lower() == "gopay"
+    if is_gopay:
+        client_context = validate_bound_checkout_context(
+            client_context,
+            http,
+            expected_provider="gopay",
+            proxy=proxy,
+            device_id=device_id,
+            did=did,
+            phase="start",
+        )
+        device_id = client_context.device_id
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/start",
         json={
@@ -2572,7 +3008,7 @@ def start_custom_checkout_method(
             "Accept": "application/json",
             "Origin": "https://chatgpt.com",
             "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
-            "User-Agent": sc.CHROME_UA,
+            "User-Agent": client_context.user_agent if client_context is not None else sc.CHROME_UA,
             "OAI-Device-Id": device_id,
             "x-openai-target-path": "/backend-api/payments/checkout/custom_payment_method/start",
             "x-openai-target-route": "/backend-api/payments/checkout/custom_payment_method/start",
@@ -2581,13 +3017,61 @@ def start_custom_checkout_method(
     )
     text = resp.text or ""
     if resp.status_code != 200:
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_START_HTTP_ERROR",
+                f"GoPay payment start failed: HTTP {resp.status_code}",
+                phase="start",
+                http_status=resp.status_code,
+                retryable=resp.status_code == 429 or resp.status_code >= 500,
+            )
         raise RuntimeError(f"启动 {method_name} 支付失败：HTTP {resp.status_code} {text[:300]}")
     try:
-        payload = resp.json() or {}
-    except Exception:
+        payload = resp.json()
+    except Exception as exc:
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_START_RESPONSE_INVALID",
+                "GoPay payment start returned a non-JSON response",
+                phase="start",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            ) from exc
         raise RuntimeError(f"启动 {method_name} 支付返回非 JSON：{text[:300]}")
+    if not isinstance(payload, dict):
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_START_RESPONSE_INVALID",
+                "GoPay payment start response must be a JSON object",
+                phase="start",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            )
+        raise RuntimeError(f"启动 {method_name} 支付返回无效 JSON：{text[:300]}")
     action = payload.get("next_action") or {}
+    if not isinstance(action, dict):
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_START_RESPONSE_INVALID",
+                "GoPay payment start next_action must be a JSON object",
+                phase="start",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            )
+        action = {}
     if str(payload.get("status") or "").lower() != "requires_action" or not action.get("url"):
+        if is_gopay:
+            raise PaymentFlowError(
+                "GOPAY_START_REDIRECT_MISSING",
+                "GoPay payment start did not return a redirect action",
+                phase="start",
+                http_status=resp.status_code,
+                retryable=True,
+                rebuild_checkout=True,
+            )
         raise RuntimeError(f"{method_name} 未返回跳转链接：{text[:300]}")
     return payload
 
@@ -2643,8 +3127,12 @@ def require_gopay_midtrans_result(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize a generic GoPay result to the final Midtrans handoff URL."""
     redirect_url = gopay_midtrans_url(payload)
     if not redirect_url:
-        raise RuntimeError(
-            "GOPAY_MIDTRANS_LINK_MISSING: GoPay 未返回有效的 Midtrans Snap v3/v4 跳转链接"
+        raise PaymentFlowError(
+            "GOPAY_MIDTRANS_LINK_MISSING",
+            "GoPay 未返回有效的 Midtrans Snap v3/v4 跳转链接",
+            phase="start",
+            retryable=True,
+            rebuild_checkout=True,
         )
     normalized = dict(payload)
     normalized.update({
@@ -3164,18 +3652,58 @@ def approve_checkout(
     log=lambda _message: None,
     allow_sentinel_fallback: bool = False,
     require_explicit_result: bool = False,
+    client_context: CheckoutClientContext | None = None,
+    proof_policy: ProofPolicy | None = None,
 ) -> dict:
-    headers = resolve_payment_sentinel_headers(
-        sentinel_headers, proxy, "checkout_session_approval", device_id, did,
-        allow_fallback=allow_sentinel_fallback, log=log,
+    strict_gopay = (
+        (proof_policy is not None and proof_policy.payment_provider == "gopay")
+        or (
+            isinstance(client_context, CheckoutClientContext)
+            and client_context.payment_provider == "gopay"
+        )
     )
+    if strict_gopay:
+        proof_policy = proof_policy or ProofPolicy.strict_gopay()
+    if strict_gopay and http is None:
+        raise PaymentFlowError(
+            "CHECKOUT_CLIENT_CONTEXT_REQUIRED",
+            "GoPay approval must reuse the HTTP session that created the Checkout",
+            phase="approval",
+        )
     owns_http = http is None
     http = http or sc.build_http(proxy or None)
     try:
-        try:
-            http.cookies.set("oai-did", did, domain="chatgpt.com")
-        except Exception:
-            pass
+        if strict_gopay:
+            allow_sentinel_fallback = False
+            client_context = validate_bound_checkout_context(
+                client_context,
+                http,
+                expected_provider="gopay",
+                proxy=proxy,
+                device_id=device_id,
+                did=did,
+                phase="approval",
+            )
+            device_id = client_context.device_id
+            did = client_context.did
+            proxy = client_context.proxy_route
+        proof_started_at = time.monotonic()
+        headers = resolve_payment_sentinel_headers(
+            sentinel_headers, proxy, "checkout_session_approval", device_id, did,
+            allow_fallback=allow_sentinel_fallback, log=log,
+            client_context=client_context,
+            proof_policy=proof_policy,
+            payment_endpoint=PaymentEndpoint.CHECKOUT_APPROVE if strict_gopay else None,
+        )
+        if strict_gopay and client_context is not None:
+            log(render_payment_diagnostic_event(
+                client_context,
+                phase="checkout_approval_proof",
+                flow=SentinelFlow.CHECKOUT_SESSION_APPROVAL,
+                sen_present=bool(headers.get("OpenAI-Sentinel-Token")),
+                so_present=bool(headers.get("OpenAI-Sentinel-SO-Token")),
+                elapsed_ms=(time.monotonic() - proof_started_at) * 1000,
+            ))
         body = {"checkout_session_id": session_id, "processor_entity": processor}
         resp = http.post(
             "https://chatgpt.com/backend-api/payments/checkout/approve",
@@ -3187,7 +3715,7 @@ def approve_checkout(
                 "Origin": "https://chatgpt.com",
                 "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
                 "OAI-Device-Id": device_id,
-                "User-Agent": sc.CHROME_UA,
+                "User-Agent": client_context.user_agent if client_context is not None else sc.CHROME_UA,
                 "OAI-Language": "zh-CN",
                 "x-openai-target-path": "/backend-api/payments/checkout/approve",
                 "x-openai-target-route": "/backend-api/payments/checkout/approve",
@@ -3196,18 +3724,44 @@ def approve_checkout(
             timeout=40,
         )
         text = resp.text or ""
-        log(f"[stripe] manual_approval approve+sentinel: {resp.status_code} {text[:160]}")
+        log(f"[stripe] manual_approval approve+sentinel: HTTP {resp.status_code}")
         if resp.status_code != 200:
+            if strict_gopay:
+                raise PaymentFlowError(
+                    "GOPAY_APPROVAL_HTTP_ERROR",
+                    f"Checkout approve HTTP {resp.status_code}",
+                    phase="approval",
+                    http_status=resp.status_code,
+                    retryable=resp.status_code == 429 or resp.status_code >= 500,
+                )
             raise RuntimeError(f"Checkout approve HTTP {resp.status_code}: {text[:300]}")
         try:
-            payload = resp.json() or {}
+            payload = resp.json()
         except Exception as exc:
+            if strict_gopay:
+                raise PaymentFlowError(
+                    "GOPAY_APPROVAL_RESPONSE_INVALID",
+                    "GoPay approval returned a non-JSON response",
+                    phase="approval",
+                    http_status=resp.status_code,
+                    retryable=True,
+                    rebuild_checkout=True,
+                ) from exc
             if require_explicit_result:
                 raise CheckoutApprovalRejectedError(
                     f"MANUAL_APPROVAL_RESPONSE_INVALID: {text[:300]}"
                 ) from exc
             payload = {}
         if not isinstance(payload, dict):
+            if strict_gopay:
+                raise PaymentFlowError(
+                    "GOPAY_APPROVAL_RESPONSE_INVALID",
+                    "GoPay approval response must be a JSON object",
+                    phase="approval",
+                    http_status=resp.status_code,
+                    retryable=True,
+                    rebuild_checkout=True,
+                )
             if require_explicit_result:
                 raise CheckoutApprovalRejectedError(
                     "MANUAL_APPROVAL_RESPONSE_INVALID: approval response must be an object"
@@ -3219,12 +3773,29 @@ def approve_checkout(
                 raise RuntimeError(f"manual_approval approve blocked: result={result}")
             return payload
         status = approval_result_status(payload)
+        log(f"[stripe] manual_approval result={status}")
         if status == "approved":
             return payload
         raw_result = str(payload.get("result") or "").strip().lower() or "<missing>"
         if status == "blocked":
             raise CheckoutApprovalBlockedError(
                 "MANUAL_APPROVAL_BLOCKED: result=blocked"
+            )
+        if strict_gopay:
+            code_by_status = {
+                "invalid_promotion": "GOPAY_APPROVAL_INVALID_PROMOTION",
+                "failed": "GOPAY_APPROVAL_FAILED",
+                "missing": "GOPAY_APPROVAL_MISSING_RESULT",
+                "unknown": "GOPAY_APPROVAL_UNKNOWN_RESULT",
+            }
+            retryable = status in {"missing", "unknown"}
+            raise PaymentFlowError(
+                code_by_status.get(status, "GOPAY_APPROVAL_REJECTED"),
+                f"GoPay approval returned status={status}",
+                phase="approval",
+                http_status=resp.status_code,
+                retryable=retryable,
+                rebuild_checkout=retryable,
             )
         raise CheckoutApprovalRejectedError(
             f"MANUAL_APPROVAL_{status.upper()}: result={raw_result}"
@@ -3241,8 +3812,17 @@ def approve_gopay_checkout_or_rebuild(
 ) -> dict:
     """Submit one GoPay approval and invalidate this Checkout when blocked."""
     session_id = str(args[1] if len(args) > 1 else kwargs.get("session_id") or "")
+    if kwargs.get("http") is None or not isinstance(
+        kwargs.get("client_context"), CheckoutClientContext,
+    ):
+        raise PaymentFlowError(
+            "CHECKOUT_CLIENT_CONTEXT_REQUIRED",
+            "GoPay approval requires the Checkout creation context and HTTP session",
+            phase="approval",
+        )
     kwargs["allow_sentinel_fallback"] = False
     kwargs["require_explicit_result"] = True
+    kwargs["proof_policy"] = ProofPolicy.strict_gopay()
     try:
         return approve_checkout(*args, log=log, **kwargs)
     except CheckoutApprovalBlockedError as exc:
@@ -3250,9 +3830,13 @@ def approve_gopay_checkout_or_rebuild(
             f"GoPay approval 返回 blocked；当前 {session_id or 'CS Live'} 已失效，"
             "停止复用并重建完整支付提链"
         )
-        raise RuntimeError(
-            "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED: 当前 GoPay CS Live approval 被 blocked；"
-            "必须重新创建 Checkout、应用优惠并生成新的 cs_live_*"
+        raise PaymentFlowError(
+            "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED",
+            "当前 GoPay CS Live approval 被 blocked；必须重新创建 Checkout、"
+            "应用优惠并生成新的 cs_live_*",
+            phase="approval",
+            retryable=True,
+            rebuild_checkout=True,
         ) from exc
 
 
@@ -3877,6 +4461,7 @@ class JobStore:
                         pair = (secrets.choice(entry_pool), secrets.choice(exit_pool))
             used_pairs.add(pair)
             current["fixed_entry_proxy"], current["fixed_exit_proxy"] = pair
+            current["_proxy_round"] = attempt
             self.log(
                 job_id,
                 f"本轮代理路由：Promotion={proxy_route_label(pair[0])}；Checkout={proxy_route_label(pair[1])}",
@@ -3970,6 +4555,7 @@ class JobStore:
                 job_id, status="running", percent=4,
                 text=f"第 {attempt}/{max_attempts} 次尝试：正在准备任务",
                 error="",
+                payment_error=None,
             )
             self.log(job_id, f"========== 提链尝试 {attempt}/{max_attempts} ==========")
             if current.get("link_type") == "paypal" and current.get("use_promo"):
@@ -4030,13 +4616,31 @@ class JobStore:
                 if state.get("status") in {"done", "cancelled"}:
                     break
                 inner_error = str(state.get("error") or "")
+                inner_payment_error = (
+                    state.get("payment_error")
+                    if isinstance(state.get("payment_error"), dict)
+                    else {}
+                )
+                inner_error_code = str(inner_payment_error.get("code") or "").upper()
                 gopay_blocked = (
                     current.get("link_type") == "gopay"
-                    and "gopay_approval_blocked_rebuild_required" in inner_error.lower()
+                    and bool(inner_payment_error.get("retryable"))
+                    and bool(inner_payment_error.get("rebuild_checkout"))
+                    and inner_error_code in {
+                        "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED",
+                        "GOPAY_CONFIRM_BLOCKED_REBUILD_REQUIRED",
+                    }
                 )
                 momo_rebuild = (
                     current.get("link_type") == "momo"
-                    and momo_checkout_requires_rebuild(inner_error)
+                    and (
+                        (
+                            bool(inner_payment_error.get("retryable"))
+                            and bool(inner_payment_error.get("rebuild_checkout"))
+                        )
+                        if inner_payment_error
+                        else momo_checkout_requires_rebuild(inner_error)
+                    )
                 )
                 if not gopay_blocked and not momo_rebuild:
                     break
@@ -4075,6 +4679,7 @@ class JobStore:
                         f"{next_text}"
                     ),
                     error="",
+                    payment_error=None,
                 )
             state = self.get(job_id) or {}
             if state.get("status") in {"done", "cancelled"}:
@@ -4086,17 +4691,27 @@ class JobStore:
                     self._record_success(job_id, result)
                 return
             last_error = str(state.get("error") or "")
+            payment_error = (
+                state.get("payment_error")
+                if isinstance(state.get("payment_error"), dict)
+                else {}
+            )
+            payment_error_code = str(payment_error.get("code") or "").upper()
             if last_error:
                 self.update(job_id, last_retry_error=last_error[:500])
             lowered = last_error.lower()
             gopay_oaics_rebuild_exhausted = (
-                "gopay_cs_live_rebuild_exhausted" in lowered
-                and "oaics" in lowered
+                payment_error_code == "GOPAY_CS_LIVE_REBUILD_EXHAUSTED"
             )
             if current.get("link_type") != "momo" and (
-                "custom_checkout_rebuild_required" in lowered
-                or "oaics_" in lowered
-                or gopay_oaics_rebuild_exhausted
+                gopay_oaics_rebuild_exhausted
+                or (
+                    not payment_error
+                    and (
+                        "custom_checkout_rebuild_required" in lowered
+                        or "oaics_" in lowered
+                    )
+                )
             ):
                 oaics_hits += 1
                 self.log(job_id, f"OAICS Checkout 命中 {oaics_hits}/3；PayPal/本地支付将重建 Checkout")
@@ -4112,14 +4727,22 @@ class JobStore:
                         last_retry_error=last_error[:500],
                     )
                     return
-            non_retryable = any(marker in lowered for marker in (
-                "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
-                "openai checkout http 401", "unauthorized_unknown",
-                "计划类型", "提取方式", "任务已停止", "promotion_not_available",
-                "gopay_checkout_creation_budget_exhausted",
-                "gopay_checkout_creation_deadline_exceeded",
-            ))
-            transport_kind = _proxy_transport_error_kind(last_error)
+            non_retryable = (
+                not bool(payment_error.get("retryable"))
+                if payment_error
+                else any(marker in lowered for marker in (
+                    "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
+                    "openai checkout http 401", "unauthorized_unknown",
+                    "计划类型", "提取方式", "任务已停止", "promotion_not_available",
+                    "gopay_checkout_creation_budget_exhausted",
+                    "gopay_checkout_creation_deadline_exceeded",
+                ))
+            )
+            transport_kind = (
+                _proxy_transport_error_kind(last_error)
+                if not payment_error or bool(payment_error.get("retryable"))
+                else ""
+            )
             if transport_kind:
                 if proxy_transport_retries >= 3:
                     self.log(job_id, f"{transport_kind}已达到 3 次代理切换上限，停止继续尝试")
@@ -4133,7 +4756,10 @@ class JobStore:
                 return
             if (
                 options.get("link_type") == "gopay"
-                and "gopay_approval_blocked_rebuild_required" in lowered
+                and payment_error_code in {
+                    "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED",
+                    "GOPAY_CONFIRM_BLOCKED_REBUILD_REQUIRED",
+                }
             ):
                 self.log(
                     job_id,
@@ -4538,6 +5164,10 @@ class JobStore:
             return self._run_kakao_pidan(job_id, options)
         transport_stage = "初始化"
         http_sessions = HttpSessionRegistry()
+        flow_started_at = time.monotonic()
+        provider = str(options.get("link_type") or "").strip().lower()
+        client_context: CheckoutClientContext | None = None
+        actual_checkout_kind = "unknown"
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
             raw_token = options.pop("token_raw")
@@ -4570,6 +5200,7 @@ class JobStore:
                     f"{provider.upper()} 会话身份已锁定："
                     f"oai-did=OAI-Device-Id，identity={identity_hash}",
                 )
+            client_context = None
 
             if provider == "ph_short":
                 short_country = country if country in {"PH", "GB", "US"} else "PH"
@@ -4932,6 +5563,7 @@ class JobStore:
                     use_so=bool(options.get("use_so", True)),
                     creation_budget=options.get("_gopay_creation_budget"),
                     cancel_check=lambda: self.ensure_not_cancelled(job_id),
+                    proof_policy=ProofPolicy.strict_gopay(),
                 )
             else:
                 try:
@@ -4962,11 +5594,47 @@ class JobStore:
                         if rebuild_error:
                             raise RuntimeError(rebuild_error) from exc
                     raise
+            if provider == "gopay":
+                if not isinstance(created, dict):
+                    raise PaymentFlowError(
+                        "CHECKOUT_RESPONSE_INVALID",
+                        "GoPay Checkout creation did not return a result object",
+                        phase="checkout",
+                        retryable=True,
+                        rebuild_checkout=True,
+                    )
+                created_http = created.get("http")
+                created_data = created.get("data")
+                created_context = created.get("client_context")
+                if created_http is None or not isinstance(created_data, dict):
+                    raise PaymentFlowError(
+                        "CHECKOUT_RESPONSE_INVALID",
+                        "GoPay Checkout creation did not return its HTTP session and response object",
+                        phase="checkout",
+                        retryable=True,
+                        rebuild_checkout=True,
+                    )
+                validate_bound_checkout_context(
+                    created_context if isinstance(created_context, CheckoutClientContext) else None,
+                    created_http,
+                    expected_provider="gopay",
+                    proxy=checkout_proxy,
+                    device_id=device_id,
+                    did=did,
+                    phase="checkout",
+                )
             http_sessions.track((created or {}).get("http"))
             self.ensure_not_cancelled(job_id)
             self.update(job_id, percent=44, text="Checkout 创建完成，正在准备支付方式")
             checkout_data = created["data"]
             chatgpt_http = created["http"]
+            client_context = created.get("client_context")
+            if provider == "gopay" and not isinstance(client_context, CheckoutClientContext):
+                raise PaymentFlowError(
+                    "CHECKOUT_CLIENT_CONTEXT_REQUIRED",
+                    "GoPay Checkout creation did not return its bound client context",
+                    phase="checkout",
+                )
             stage1_campaign = promo_campaign_from_payload(checkout_data)
             if checkout_data.get("one_click_trial_eligible") is True:
                 options["promo_marker_eligible"] = True
@@ -5292,17 +5960,24 @@ class JobStore:
                     confirmed = confirm_custom_checkout_method_with_retry(
                         chatgpt_http, token, session_id, custom_processor,
                         custom_method_id, checkout_proxy, device_id, did,
-                        use_sen=bool(options.get("use_sen", True)),
-                        use_so=bool(options.get("use_so", True)),
+                        use_sen=True,
+                        use_so=True,
                         method_name="GoPay",
-                        allow_sentinel_fallback=True,
-                        max_retries=int(options.get("gopay_confirm_retries") or 2),
+                        allow_sentinel_fallback=False,
+                        max_retries=0,
+                        rebuild_on_blocked=True,
+                        client_context=client_context,
+                        proof_policy=ProofPolicy.strict_gopay(),
                         log=lambda message: self.log(job_id, message),
                     )
                     self.update(job_id, percent=90, text="正在生成 GoPay Midtrans 跳转链接")
                     started = start_custom_checkout_method(
                         chatgpt_http, token, session_id, custom_processor,
-                        custom_method_id, device_id, method_name="GoPay",
+                        custom_method_id, device_id,
+                        method_name="GoPay",
+                        proxy=checkout_proxy,
+                        did=did,
+                        client_context=client_context,
                     )
                     action = started.get("next_action") or {}
                     normalized_gopay = require_gopay_midtrans_result({
@@ -6409,6 +7084,9 @@ class JobStore:
                     # turns proof failures into misleading business blocks.
                     "allow_sentinel_fallback": provider == "paypal",
                 }
+                if provider == "gopay":
+                    approval_kwargs["client_context"] = client_context
+                    approval_kwargs["proof_policy"] = ProofPolicy.strict_gopay()
                 approval_fn(
                     token,
                     session_id,
@@ -6527,6 +7205,17 @@ class JobStore:
             if provider_result.get("checkout_currency"):
                 result["currency"] = str(provider_result["checkout_currency"]).upper()
                 result["checkout_currency"] = result["currency"]
+            if provider == "gopay" and client_context is not None:
+                self.log(job_id, render_payment_diagnostic_event(
+                    client_context,
+                    phase="payment_result",
+                    checkout_type=actual_checkout_kind or "unknown",
+                    payment_method_source=str(
+                        provider_result.get("payment_method_source") or "unknown"
+                    ),
+                    elapsed_ms=(time.monotonic() - flow_started_at) * 1000,
+                    proxy_round=int(options.get("_proxy_round") or 1),
+                ))
             done_text = "第 7/7 步：PIX 二维码生成完成" if provider == "pix" else (
                 "第 7/7 步：MoMo 支付结果生成完成" if provider == "momo" else (
                 "第 7/7 步：PayPal agreements/approve 链接生成完成" if provider == "paypal" else f"{provider.upper()} 提取完成"
@@ -6534,10 +7223,18 @@ class JobStore:
             )
             self.update(job_id, percent=100, text=done_text, status="done", result=result)
         except InterruptedError as exc:
-            self.update(job_id, status="cancelled", percent=100, text=str(exc), error=str(exc))
+            self.update(
+                job_id,
+                status="cancelled",
+                percent=100,
+                text=str(exc),
+                error=str(exc),
+                payment_error=None,
+            )
         except Exception as exc:
             raw_error = str(exc)
             error_text = raw_error
+            payment_error = exc.as_dict() if isinstance(exc, PaymentFlowError) else None
             lowered = raw_error.lower()
             if "token_invalidated" in lowered or "authentication token has been invalidated" in lowered:
                 error_text = "Access Token 已失效，请重新登录 ChatGPT 获取新的 Session JSON 或 AT。"
@@ -6558,11 +7255,34 @@ class JobStore:
                 )
                 self.log(job_id, diagnostic)
                 error_text = f"{error_text}（{diagnostic}）"
+            if isinstance(exc, PaymentFlowError) and client_context is not None:
+                self.log(job_id, render_payment_diagnostic_event(
+                    client_context,
+                    phase="failure",
+                    failure=exc,
+                    checkout_type=actual_checkout_kind or "unknown",
+                    elapsed_ms=(time.monotonic() - flow_started_at) * 1000,
+                    proxy_round=int(options.get("_proxy_round") or 1),
+                ))
             self.log(job_id, f"错误：{type(exc).__name__}: {error_text}")
             if options.get("retry_wrapper"):
-                self.update(job_id, status="running", percent=8, text="本次未成功，正在更换代理重试", error=error_text[:1200])
+                self.update(
+                    job_id,
+                    status="running",
+                    percent=8,
+                    text="本次未成功，正在更换代理重试",
+                    error=error_text[:1200],
+                    payment_error=payment_error,
+                )
             else:
-                self.update(job_id, status="error", percent=100, text="任务失败", error=error_text[:1200])
+                self.update(
+                    job_id,
+                    status="error",
+                    percent=100,
+                    text="任务失败",
+                    error=error_text[:1200],
+                    payment_error=payment_error,
+                )
         finally:
             http_sessions.close()
 

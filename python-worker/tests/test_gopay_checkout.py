@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,21 @@ MIDTRANS_V4 = "https://app.midtrans.com/snap/v4/redirection/123e4567-e89b-12d3-a
 MIDTRANS_V4_LINKING = MIDTRANS_V4 + "#/gopay-tokenization/linking"
 
 
+def bound_gopay_context(
+    http: object,
+    proxy: str = "http://proxy",
+) -> checkout_app.CheckoutClientContext:
+    return checkout_app.CheckoutClientContext(
+        payment_provider="gopay",
+        device_id="device",
+        did="device",
+        user_agent="Mozilla/5.0 test-agent",
+        proxy_route=proxy,
+        session_owner=f"checkout-http:{id(http)}",
+        cookies={"oai-did": "device"},
+    )
+
+
 def test_gopay_midtrans_url_accepts_reference_snap_versions() -> None:
     assert checkout_app.is_valid_gopay_midtrans_url(MIDTRANS_V3)
     assert checkout_app.is_valid_gopay_midtrans_url(MIDTRANS_V4 + "?source=chatgpt")
@@ -44,6 +60,23 @@ def test_gopay_midtrans_url_rejects_non_provider_and_lookalike_urls() -> None:
     assert not checkout_app.is_valid_gopay_midtrans_url(
         "https://chatgpt.com/checkout/openai_ie/oaics_example"
     )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://checkout.stripe.com.evil.example/c/pay/cs_live_expected",
+        "https://checkout.stripe.com/c/pay/cs_live_stale",
+        "http://checkout.stripe.com/c/pay/cs_live_expected",
+    ],
+)
+def test_hosted_checkout_url_rebuilds_untrusted_or_cross_session_urls(
+    candidate: str,
+) -> None:
+    assert checkout_app.normalize_hosted_checkout_url(
+        candidate,
+        "cs_live_expected",
+    ) == "https://pay.openai.com/c/pay/cs_live_expected"
 
 
 def test_gopay_midtrans_url_finds_nested_and_encoded_handoff() -> None:
@@ -149,6 +182,8 @@ def test_gopay_confirm_does_not_retry_non_blocked_errors() -> None:
 
 def test_gopay_approval_blocked_invalidates_current_checkout() -> None:
     logs: list[str] = []
+    http = object()
+    context = bound_gopay_context(http)
     with patch.object(
         checkout_app,
         "approve_checkout",
@@ -158,8 +193,11 @@ def test_gopay_approval_blocked_invalidates_current_checkout() -> None:
     ) as approve:
         with pytest.raises(RuntimeError, match="GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED"):
             checkout_app.approve_gopay_checkout_or_rebuild(
-                "token", "cs_live_test", "openai_ie", "http://proxy", "device", "did",
-                log=logs.append, allow_sentinel_fallback=True,
+                "token", "cs_live_test", "openai_ie", "http://proxy", "device", "device",
+                http=http,
+                client_context=context,
+                log=logs.append,
+                allow_sentinel_fallback=True,
             )
 
     approve.assert_called_once()
@@ -168,6 +206,8 @@ def test_gopay_approval_blocked_invalidates_current_checkout() -> None:
 
 
 def test_gopay_approval_does_not_retry_non_blocked_errors() -> None:
+    http = object()
+    context = bound_gopay_context(http)
     with patch.object(
         checkout_app,
         "approve_checkout",
@@ -175,7 +215,9 @@ def test_gopay_approval_does_not_retry_non_blocked_errors() -> None:
     ) as approve:
         try:
             checkout_app.approve_gopay_checkout_or_rebuild(
-                "token", "cs_live_test", "openai_ie", "http://proxy", "device", "did",
+                "token", "cs_live_test", "openai_ie", "http://proxy", "device", "device",
+                http=http,
+                client_context=context,
                 log=lambda _message: None,
             )
         except RuntimeError as exc:
@@ -186,14 +228,210 @@ def test_gopay_approval_does_not_retry_non_blocked_errors() -> None:
 
 
 def test_gopay_approval_success_returns_after_one_submission() -> None:
+    http = object()
+    context = bound_gopay_context(http)
     with patch.object(checkout_app, "approve_checkout", return_value={"result": "approved"}) as approve:
         result = checkout_app.approve_gopay_checkout_or_rebuild(
-            "token", "cs_live_test", "openai_ie", "http://proxy", "device", "did",
+            "token", "cs_live_test", "openai_ie", "http://proxy", "device", "device",
+            http=http,
+            client_context=context,
             log=lambda _message: None,
         )
 
     assert result == {"result": "approved"}
     approve.assert_called_once()
+
+
+@pytest.mark.parametrize("missing", ["context", "http"])
+def test_gopay_approval_fails_closed_without_creation_context_or_session(
+    missing: str,
+) -> None:
+    http = object()
+    context = bound_gopay_context(http)
+    kwargs = {"http": http, "client_context": context}
+    kwargs.pop("client_context" if missing == "context" else "http")
+
+    with pytest.raises(checkout_app.PaymentFlowError) as caught:
+        checkout_app.approve_gopay_checkout_or_rebuild(
+            "token",
+            "cs_live_test",
+            "openai_ie",
+            "http://proxy",
+            "device",
+            "device",
+            **kwargs,
+        )
+
+    assert caught.value.code == "CHECKOUT_CLIENT_CONTEXT_REQUIRED"
+
+
+def test_gopay_proof_options_cannot_disable_required_sen_or_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSentinel:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def get_token_pair(self, flow: str, device_id: str):
+            return (
+                {"p": "proof", "c": "challenge", "id": device_id, "flow": flow},
+                {"so": "observer", "c": "challenge", "id": device_id, "flow": flow},
+                {},
+            )
+
+        async def close(self) -> None:
+            pass
+
+    http = object()
+    context = bound_gopay_context(http)
+    monkeypatch.setattr(checkout_app, "ProxySentinel", FakeSentinel)
+
+    headers = asyncio.run(checkout_app.sentinel_headers(
+        context.proxy_route,
+        "chatgpt_checkout",
+        context.device_id,
+        context.did,
+        use_sen=False,
+        use_so=False,
+        client_context=context,
+        proof_policy=checkout_app.ProofPolicy.strict_gopay(),
+        payment_endpoint=checkout_app.PaymentEndpoint.CHECKOUT_CREATE,
+    ))
+
+    assert set(headers) == {
+        "OpenAI-Sentinel-Token",
+        "OpenAI-Sentinel-SO-Token",
+    }
+
+
+def test_provider_payment_flow_error_is_not_rewrapped() -> None:
+    expected = checkout_app.PaymentFlowError(
+        "PROOF_BINDING_MISMATCH",
+        "provider returned a proof for a different client",
+    )
+
+    class FailingProvider:
+        name = checkout_app.ProofProviderKind.SUPPORTED_BROWSER.value
+
+        async def issue(self, _request):
+            raise expected
+
+    http = object()
+    base = bound_gopay_context(http)
+    context = checkout_app.CheckoutClientContext(
+        payment_provider=base.payment_provider,
+        device_id=base.device_id,
+        did=base.did,
+        user_agent=base.user_agent,
+        proxy_route=base.proxy_route,
+        session_owner=base.session_owner,
+        proof_provider=FailingProvider.name,
+        cookies=base.cookies,
+        proof_issuer=FailingProvider(),
+    )
+
+    with pytest.raises(checkout_app.PaymentFlowError) as caught:
+        asyncio.run(checkout_app.sentinel_headers(
+            context.proxy_route,
+            "chatgpt_checkout",
+            context.device_id,
+                context.did,
+                client_context=context,
+                proof_policy=checkout_app.ProofPolicy.strict_gopay(),
+                payment_endpoint=checkout_app.PaymentEndpoint.CHECKOUT_CREATE,
+            ))
+
+    assert caught.value is expected
+
+
+def test_gopay_confirm_proof_uses_the_confirm_endpoint_contract() -> None:
+    captured = []
+
+    class RecordingProvider:
+        name = checkout_app.ProofProviderKind.SUPPORTED_BROWSER.value
+
+        async def issue(self, request):
+            captured.append(request)
+            return checkout_app.ProofBundle(
+                endpoint=request.endpoint,
+                flow=request.flow,
+                payment_provider=request.payment_provider,
+                proof_provider=request.proof_provider,
+                device_id=request.device_id,
+                did=request.did,
+                user_agent=request.user_agent,
+                proxy_route=request.proxy_route,
+                session_owner=request.session_owner,
+                cookie_identity=request.cookie_identity,
+                headers={
+                    "OpenAI-Sentinel-Token": (
+                        '{"p":"proof","id":"device",'
+                        '"flow":"checkout_session_approval"}'
+                    ),
+                },
+            )
+
+    http = object()
+    context = checkout_app.CheckoutClientContext(
+        payment_provider="gopay",
+        device_id="device",
+        did="device",
+        user_agent="Mozilla/5.0 test-agent",
+        proxy_route="http://proxy",
+        session_owner=f"checkout-http:{id(http)}",
+        proof_provider=RecordingProvider.name,
+        cookies={"oai-did": "device"},
+        proof_issuer=RecordingProvider(),
+    )
+
+    asyncio.run(checkout_app.sentinel_headers(
+        context.proxy_route,
+        "checkout_session_approval",
+        context.device_id,
+        context.did,
+        client_context=context,
+        proof_policy=checkout_app.ProofPolicy.strict_gopay(),
+        payment_endpoint=checkout_app.PaymentEndpoint.CHECKOUT_CONFIRM,
+    ))
+
+    assert len(captured) == 1
+    assert captured[0].endpoint is checkout_app.PaymentEndpoint.CHECKOUT_CONFIRM
+    assert captured[0].flow is checkout_app.SentinelFlow.CHECKOUT_SESSION_APPROVAL
+
+
+def test_gopay_proof_rejects_endpoint_flow_mismatch() -> None:
+    http = object()
+    context = bound_gopay_context(http)
+
+    with pytest.raises(checkout_app.PaymentFlowError) as caught:
+        asyncio.run(checkout_app.sentinel_headers(
+            context.proxy_route,
+            "chatgpt_checkout",
+            context.device_id,
+            context.did,
+            client_context=context,
+            proof_policy=checkout_app.ProofPolicy.strict_gopay(),
+            payment_endpoint=checkout_app.PaymentEndpoint.CHECKOUT_CONFIRM,
+        ))
+
+    assert caught.value.code == "ENDPOINT_FLOW_MISMATCH"
+
+
+def test_gopay_proof_requires_explicit_endpoint() -> None:
+    http = object()
+    context = bound_gopay_context(http)
+
+    with pytest.raises(checkout_app.PaymentFlowError) as caught:
+        asyncio.run(checkout_app.sentinel_headers(
+            context.proxy_route,
+            "chatgpt_checkout",
+            context.device_id,
+            context.did,
+            client_context=context,
+            proof_policy=checkout_app.ProofPolicy.strict_gopay(),
+        ))
+
+    assert caught.value.code == "PAYMENT_ENDPOINT_REQUIRED"
 
 
 def test_gopay_checkout_preserves_method_when_refresh_omits_method_fields() -> None:
@@ -307,8 +545,14 @@ def test_gopay_preflight_falls_back_to_account_management_coupon_protocol() -> N
             return self._payload
 
     class FakeCookies:
-        def set(self, *_args, **_kwargs) -> None:
-            pass
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+
+        def set(self, name: str, value: str, **_kwargs) -> None:
+            self.values[name] = value
+
+        def get_dict(self) -> dict[str, str]:
+            return dict(self.values)
 
     class FakeHttp:
         cookies = FakeCookies()
@@ -470,7 +714,7 @@ def test_gopay_initial_missing_current_method_fields_falls_back_to_stage1() -> N
     assert methods == ["gopay"]
 
 
-@pytest.mark.parametrize("phase", ["post_promo", "post_taxes"])
+@pytest.mark.parametrize("phase", ["initial", "post_promo", "post_taxes"])
 def test_gopay_current_explicit_empty_methods_do_not_revive_stage1(phase: str) -> None:
     stage1 = {
         "payment_method_types": ["card", "gopay"],
@@ -555,6 +799,133 @@ def test_gopay_method_snapshot_handles_camel_case_and_saved_method_boundaries(
     assert provider_checkout_module._published_payment_method_types(payload) == expected
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "payment_method_types": ["card"],
+                "history": [{"payment_method_types": ["card", "gopay"]}],
+            },
+            (["card"], True),
+        ),
+        (
+            {
+                "payment_method_types": [],
+                "previous": {"payment_method_types": ["gopay"]},
+            },
+            ([], True),
+        ),
+        (
+            {
+                "checkout_session": {"payment_method_types": []},
+                "previous_checkout_session": {
+                    "payment_method_types": ["gopay"],
+                },
+            },
+            ([], True),
+        ),
+        (
+            {
+                "data": {
+                    "checkout_session": {"payment_method_types": ["card"]},
+                },
+                "history": {"payment_method_types": ["gopay"]},
+            },
+            (["card"], True),
+        ),
+    ],
+)
+def test_gopay_current_snapshot_overrides_stale_nested_methods(
+    payload: dict,
+    expected: tuple[list[str], bool],
+) -> None:
+    assert provider_checkout_module.published_payment_method_snapshot(payload) == expected
+
+
+def test_gopay_snapshot_uses_stale_data_only_when_current_fields_are_missing() -> None:
+    payload = {
+        "checkout_session": {"currency": "idr", "amount_total": 0},
+        "previous": {"payment_method_types": ["card", "gopay"]},
+    }
+
+    assert provider_checkout_module.published_payment_method_snapshot(payload) == (
+        ["card", "gopay"],
+        True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_code", "expected_phase"),
+    [
+        ("initial", "GOPAY_METHOD_UNAVAILABLE", "checkout"),
+        ("post_promo", "GOPAY_PROMO_METHOD_INCOMPATIBLE", "promotion"),
+        ("post_taxes", "GOPAY_METHOD_UNAVAILABLE_AFTER_TAXES", "taxes"),
+        ("amount", "GOPAY_PROMO_AMOUNT_REQUIRED", "promotion"),
+    ],
+)
+def test_gopay_provider_failures_expose_structured_retry_metadata(
+    scenario: str,
+    expected_code: str,
+    expected_phase: str,
+) -> None:
+    methods_by_scenario = {
+        "initial": [[]],
+        "post_promo": [["gopay"], []],
+        "post_taxes": [["gopay"], []],
+        "amount": [["gopay"], ["gopay"]],
+    }
+    init_responses = [
+        (
+            {"return_url": ""},
+            "2026-test",
+            {"checkout_amount": 100, "currency": "idr"},
+        ),
+        (
+            {"return_url": ""},
+            "2026-test",
+            {"checkout_amount": 100, "currency": "idr"},
+        ),
+    ]
+    apply_promo = (lambda _processor: None) if scenario == "post_promo" else None
+
+    with (
+        patch.object(provider_checkout_module.sc, "_profile", return_value={}),
+        patch.object(
+            provider_checkout_module.sc,
+            "init_checkout",
+            side_effect=init_responses,
+        ),
+        patch.object(provider_checkout_module.sc, "update_tax_region"),
+        patch.object(
+            provider_checkout_module,
+            "_prepare_gopay_payment_methods",
+            side_effect=methods_by_scenario[scenario],
+        ),
+        pytest.raises(provider_checkout_module.PaymentFlowError) as caught,
+    ):
+        stripe_to_provider(
+            object(),
+            "cs_live_fixture",
+            "gopay",
+            billing={"address": {"country": "ID"}},
+            country="ID",
+            stage1={
+                "publishable_key": "pk_live_fixture",
+                "processor_entity": "openai_llc",
+            },
+            apply_promo_callback=apply_promo,
+            require_zero_due=scenario == "amount",
+        )
+
+    error = caught.value
+    assert error.code == expected_code
+    assert error.phase == expected_phase
+    assert error.http_status is None
+    assert error.retryable is True
+    assert error.rebuild_checkout is True
+
+
 def test_gopay_method_snapshot_treats_null_container_as_missing() -> None:
     for malformed in (None, "", "gopay"):
         snapshot = provider_checkout_module._published_payment_method_snapshot({
@@ -594,6 +965,34 @@ def test_gopay_method_snapshot_rejects_false_availability_flags(
     assert methods == []
 
 
+def test_gopay_method_snapshot_handles_boolean_availability_map() -> None:
+    methods = provider_checkout_module._published_payment_method_types({
+        "availablePaymentMethods": {
+            "gopay": False,
+            "card": True,
+            "link": {"eligible": False},
+        },
+    })
+
+    assert methods == ["card"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"type": "gopay", "blocked": True},
+        {"type": "gopay", "isUnavailable": True},
+        {"type": "gopay", "status": "temporarilyUnavailableByCountry"},
+        {"type": "gopay", "eligibility": "not_eligible"},
+        {"type": "gopay", "provider": {"isAvailable": False}},
+    ],
+)
+def test_gopay_method_snapshot_rejects_negative_entry_markers(entry: dict) -> None:
+    assert provider_checkout_module._published_payment_method_types({
+        "paymentMethodTypes": [entry],
+    }) == []
+
+
 @pytest.mark.parametrize(
     ("response_text", "expected_code"),
     [
@@ -610,8 +1009,14 @@ def test_gopay_checkout_classifies_proof_and_identity_rejections(
         text = response_text
 
     class FakeCookies:
-        def set(self, *_args, **_kwargs) -> None:
-            pass
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+
+        def set(self, name: str, value: str, **_kwargs) -> None:
+            self.values[name] = value
+
+        def get_dict(self) -> dict[str, str]:
+            return dict(self.values)
 
     class FakeHttp:
         cookies = FakeCookies()
@@ -718,6 +1123,11 @@ def test_gopay_blocked_approval_rebuilds_inside_one_outer_attempt() -> None:
             state.update(
                 status="error",
                 error="GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED: rebuild current checkout",
+                payment_error={
+                    "code": "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED",
+                    "retryable": True,
+                    "rebuild_checkout": True,
+                },
             )
 
     store._run_single = run_single
@@ -804,6 +1214,11 @@ def test_gopay_ten_blocked_chains_consume_one_outer_attempt() -> None:
             state.update(
                 status="error",
                 error="GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED: rebuild current checkout",
+                payment_error={
+                    "code": "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED",
+                    "retryable": True,
+                    "rebuild_checkout": True,
+                },
             )
 
     store._run_single = run_single

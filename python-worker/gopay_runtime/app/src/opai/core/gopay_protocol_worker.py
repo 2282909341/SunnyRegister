@@ -1813,16 +1813,131 @@ def _get_envelope_did() -> str:
 # Payment
 # ---------------------------------------------------------------------------
 
+def _cli_payment_state(midtrans_url: str) -> tuple[str, dict]:
+    from .payment_inbox import _extract_midtrans_snap_token, _load_snap_states
+
+    snap = _extract_midtrans_snap_token(midtrans_url)
+    return snap, dict(_load_snap_states().get(snap) or {}) if snap else {}
+
+
+def _persist_cli_payment_state(snap: str, status: str, *, job_id: str, reason: str = "") -> dict:
+    from .payment_inbox import _update_persisted_snap_state
+
+    return _update_persisted_snap_state(snap, status, job_id=job_id, reason=reason)
+
+
+def _start_claim_heartbeat(inbox_client, job_id: str) -> tuple[threading.Event, threading.Thread]:
+    raw_interval = str(os.environ.get("OPAI_GOPAY_CLAIM_HEARTBEAT_SEC") or "60").strip()
+    try:
+        interval = max(5.0, float(raw_interval))
+    except ValueError:
+        interval = 60.0
+    stop = threading.Event()
+
+    def renew() -> None:
+        while not stop.wait(interval):
+            try:
+                inbox_client._req("PUT", f"/api/jobs/{job_id}/claim")
+            except Exception as exc:
+                log.warning("[job:%s] Claim heartbeat failed: %s", job_id[:8], exc)
+
+    thread = threading.Thread(
+        target=renew,
+        daemon=True,
+        name=f"gopay-claim-heartbeat-{job_id[:8]}",
+    )
+    thread.start()
+    return stop, thread
+
+
 def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, proxy: str = "") -> tuple[bool, str]:
     job_id = job["id"]
     midtrans_url = job.get("provider_url") or job.get("paypal_url") or ""
     phone = account["local"]
+    snap = ""
+    charge_started = False
     log.info("[job:%s] Paying with %s (protocol)", job_id[:8], account["phone"])
 
     try:
-        payment_profile = ensure_account_payment_fingerprint(account)
+        from .payment_inbox import (
+            _find_gopay_account,
+            _load_gopay_accounts,
+            _midtrans_transaction_meta,
+            _preflight_gopay_proxy,
+            _proxy_preflight_error,
+            _validate_payment_midtrans_meta,
+        )
+
+        # A freshly registered worker result omits account/customer ids. Read
+        # back the just-persisted account so immediate and resumed payments use
+        # the exact same stable fingerprint.
+        _load_gopay_accounts()
+        saved_account, _saved_index = _find_gopay_account(
+            str(account.get("phone") or account.get("local") or "")
+        )
+        profile_account = saved_account or account
+        payment_profile = ensure_account_payment_fingerprint(profile_account)
         log.info("[job:%s] payment profile_id=%s", job_id[:8], payment_profile.get("profile_id", ""))
+        probe = _preflight_gopay_proxy(proxy)
+        if not probe.get("ok"):
+            raise RuntimeError(_proxy_preflight_error(proxy, probe))
+        log.info("[job:%s] payment proxy egress=%s", job_id[:8], probe.get("ip") or "-")
         payment = GoPayPayment(proxy=proxy, payment_fingerprint=payment_profile)
+
+        # The Snap token is not a valid Basic Auth credential for linking.
+        # Read the merchant client key from the same transaction metadata used
+        # by the embedded payment manager before starting the protocol flow.
+        midtrans_meta = _midtrans_transaction_meta(
+            midtrans_url,
+            proxy=proxy,
+            payment_fingerprint=payment_profile,
+        )
+        try:
+            balance = int(profile_account.get("balance", 0) or 0)
+        except (TypeError, ValueError):
+            balance = 0
+        _validate_payment_midtrans_meta(midtrans_meta, balance=balance)
+        midtrans_client_key = str(midtrans_meta.get("midtrans_client_key") or "").strip()
+        if not midtrans_client_key:
+            raise RuntimeError("Midtrans metadata did not return merchant.client_key")
+
+        snap, existing_state = _cli_payment_state(midtrans_url)
+        if not snap:
+            raise RuntimeError("Midtrans URL did not contain a valid snap token")
+        existing_status = str(existing_state.get("status") or "").strip()
+        if existing_status in {"success", "success_unreconciled"}:
+            log.warning("[job:%s] Reconciled previously successful snap without charging again", job_id[:8])
+            try:
+                inbox_client._req("PUT", f"/api/jobs/{job_id}/paid")
+            except Exception as exc:
+                log.error("[job:%s] Mark paid reconciliation failed: %s", job_id[:8], exc)
+            return True, "payment was already completed; inbox reconciliation requested"
+        if existing_status and existing_status != "failed":
+            log.error(
+                "[job:%s] Refusing snap already journaled as %s; no new charge was sent",
+                job_id[:8],
+                existing_status,
+            )
+            try:
+                inbox_client._req("PUT", f"/api/jobs/{job_id}/cancel")
+            except Exception:
+                pass
+            return False, f"Midtrans transaction requires manual review (state={existing_status})"
+
+        # Persist before linking. A crash anywhere after this point makes the
+        # same snap non-retryable, even if the process dies during charge.
+        _persist_cli_payment_state(snap, "linking", job_id=job_id)
+
+        captcha_provider = None
+        try:
+            from .captcha_provider import build_captcha_token_provider
+
+            captcha_provider = build_captcha_token_provider(
+                progress=lambda message: log.info("[job:%s] %s", job_id[:8], message),
+                payment_fingerprint=payment_profile,
+            )
+        except Exception:
+            log.debug("[job:%s] CAPTCHA provider setup failed", job_id[:8], exc_info=True)
 
         def wait_otp(ph: str, timeout: int = 120) -> Optional[str]:
             try:
@@ -1832,16 +1947,40 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
             time.sleep(2)
             return sms_wait_code(api_key, account["aid"], timeout=timeout)
 
-        result = payment.pay(
-            midtrans_url=midtrans_url,
-            phone=phone,
-            country_code="62",
-            pin=pin,
-            wait_otp=wait_otp,
-        )
+        def payment_progress(message: str) -> None:
+            nonlocal charge_started
+            text = str(message or "")
+            if "Step 9: charge" in text:
+                charge_started = True
+                _persist_cli_payment_state(snap, "charge_started", job_id=job_id)
+            elif "charge challenge_ref=" in text:
+                charge_started = True
+                _persist_cli_payment_state(snap, "charged", job_id=job_id)
+
+        heartbeat_stop, heartbeat_thread = _start_claim_heartbeat(inbox_client, job_id)
+        try:
+            result = payment.pay(
+                midtrans_url=midtrans_url,
+                phone=phone,
+                country_code="62",
+                pin=pin,
+                wait_otp=wait_otp,
+                progress=payment_progress,
+                midtrans_client_key=midtrans_client_key,
+                captcha_token_provider=captcha_provider,
+            )
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
 
         detail = result.get("detail", "")
         if result.get("success"):
+            try:
+                _persist_cli_payment_state(snap, "success", job_id=job_id, reason="remote payment succeeded")
+            except Exception:
+                # Remote success is irreversible. A local journal failure must
+                # never route through the generic failure/cancel handler.
+                log.exception("[job:%s] Could not persist successful payment journal", job_id[:8])
             log.info("[job:%s] Payment SUCCESS!", job_id[:8])
             try:
                 inbox_client._req("PUT", f"/api/jobs/{job_id}/paid")
@@ -1849,6 +1988,21 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
                 log.error("[job:%s] Mark paid failed: %s", job_id[:8], e)
             return True, detail
         else:
+            if charge_started:
+                _persist_cli_payment_state(
+                    snap,
+                    "interrupted_unknown",
+                    job_id=job_id,
+                    reason="protocol returned failure after charge started",
+                )
+                detail = f"交易已进入扣款阶段，状态需人工核对；已禁止重试: {detail}"
+            else:
+                _persist_cli_payment_state(
+                    snap,
+                    "failed",
+                    job_id=job_id,
+                    reason="protocol failed before charge",
+                )
             log.warning("[job:%s] Payment failed: %s", job_id[:8], detail)
             try:
                 inbox_client._req("PUT", f"/api/jobs/{job_id}/cancel")
@@ -1857,6 +2011,11 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
             return False, detail
 
     except GoPayFraudDenyError as e:
+        if snap:
+            try:
+                _persist_cli_payment_state(snap, "fraud_denied", job_id=job_id, reason="remote fraud denial")
+            except Exception:
+                log.exception("[job:%s] Could not persist fraud-denial journal", job_id[:8])
         log.warning("[job:%s] FRAUD DENIED: %s", job_id[:8], e)
         try:
             inbox_client._req("PUT", f"/api/jobs/{job_id}/cancel")
@@ -1865,6 +2024,13 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
         return False, "fraud_deny -- phone burned"
 
     except Exception as e:
+        if snap:
+            state = "interrupted_unknown" if charge_started else "failed"
+            reason = "exception after charge started" if charge_started else "exception before charge"
+            try:
+                _persist_cli_payment_state(snap, state, job_id=job_id, reason=reason)
+            except Exception:
+                log.exception("[job:%s] Could not persist payment failure journal", job_id[:8])
         log.exception("[job:%s] Payment exception: %s", job_id[:8], e)
         try:
             inbox_client._req("PUT", f"/api/jobs/{job_id}/cancel")
@@ -1874,9 +2040,14 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
 
 
 def _claim_job(inbox, min_remaining: float = MIN_REMAINING_SEC) -> Optional[dict]:
+    from .payment_inbox import _gopay_inbox_claim_ttl_sec
+
     try:
         job = inbox._req("POST", "/api/jobs/claim_next", data={
-            "prefer_paypal_url": False, "prefer_oldest": True, "provider": "gopay",
+            "prefer_paypal_url": False,
+            "prefer_oldest": True,
+            "provider": "gopay",
+            "ttl_sec": _gopay_inbox_claim_ttl_sec(),
         })
     except RuntimeError as e:
         if "HTTP 404" not in str(e):
