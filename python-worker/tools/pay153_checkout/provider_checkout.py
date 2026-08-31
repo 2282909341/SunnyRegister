@@ -31,6 +31,32 @@ PROVIDER_DEFAULTS = {
 GOPAY_PROMO_AMOUNT_LIMIT_IDR = 50
 MOMO_PROMO_AMOUNT_LIMIT_VND = 50
 
+_METHOD_CONTAINER_KEYS = frozenset({
+    "custom_payment_methods",
+    "payment_methods",
+    "payment_method_types",
+    "available_payment_methods",
+    "payment_method_specs",
+})
+_METHOD_TYPE_KEYS = frozenset({
+    "type",
+    "name",
+    "label",
+    "display_name",
+    "provider",
+    "payment_method_type",
+    "method_type",
+    "custom_payment_method_type",
+    "method",
+})
+_SAVED_METHOD_PARENT_KEYS = frozenset({
+    "checkout_customer",
+    "customer",
+    "legacy_customer",
+    "customer_info",
+    "customer_session",
+})
+
 
 def is_gopay_promo_amount(amount: Any, currency: str) -> bool:
     """Accept GoPay's discounted IDR amount, including the observed 1 IDR authorization."""
@@ -54,10 +80,17 @@ def is_momo_promo_amount(amount: Any, currency: str) -> bool:
     return parsed.is_finite() and Decimal(0) <= parsed <= Decimal(MOMO_PROMO_AMOUNT_LIMIT_VND)
 
 
+def _canonical_method_key(value: Any) -> str:
+    """Normalize snake/camel response keys without changing method labels."""
+    text = str(value or "").strip()
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
+
+
 def _provider_method_aliases(provider: str) -> set[str]:
-    name = str(provider or "").strip().lower().replace("-", "_")
+    name = _canonical_method_key(provider)
     return {
-        "gopay": {"gopay", "gopay_wallet", "gopay_tokenization", "gopay_tokenization_linking"},
+        "gopay": {"gopay", "go_pay", "gopay_wallet", "gopay_tokenization", "gopay_tokenization_linking"},
         "gcash": {"gcash", "gcash_wallet"},
     }.get(name, {name})
 
@@ -65,7 +98,7 @@ def _provider_method_aliases(provider: str) -> set[str]:
 def _has_provider_method(methods: list[Any], provider: str) -> bool:
     aliases = _provider_method_aliases(provider)
     for method in methods:
-        token = str(method or "").strip().lower().replace("-", "_")
+        token = _canonical_method_key(method)
         if token in aliases:
             return True
     return False
@@ -84,23 +117,93 @@ def _merge_payment_method_types(*sources: Any) -> list[str]:
     return merged
 
 
-def _published_payment_method_types(payload: Any) -> list[str]:
-    """Collect method types from Checkout method containers only."""
-    container_keys = {
-        "custom_payment_methods",
-        "payment_methods",
-        "payment_method_types",
-        "available_payment_methods",
-        "payment_method_specs",
-    }
-    type_keys = {
-        "type", "name", "label", "payment_method_type", "paymentMethodType", "method_type",
-    }
+_UNAVAILABLE_METHOD_MARKERS = {
+    "blocked",
+    "deprecated",
+    "disabled",
+    "hidden",
+    "inactive",
+    "ineligible",
+    "not_available",
+    "not_eligible",
+    "not_enabled",
+    "not_supported",
+    "removed",
+    "unavailable",
+    "unsupported",
+}
+
+
+def _normalized_method_marker(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _method_entry_is_available(entry: dict[str, Any]) -> bool:
+    """Honor common availability flags before reading a method label/type."""
+
+    false_values = {"0", "false", "no", "off", "disabled", "unavailable", "inactive"}
+    disabled_values = {"1", "true", "yes", "on"}
+    for raw_key, value in entry.items():
+        key = _canonical_method_key(raw_key)
+        normalized = _normalized_method_marker(value)
+        if key in {
+            "enabled", "available", "active", "eligible", "supported", "visible",
+            "is_enabled", "is_available", "is_active", "is_eligible", "is_supported",
+            "is_visible",
+        }:
+            if value is False or value == 0:
+                return False
+            if normalized in false_values:
+                return False
+        elif key in {"disabled", "is_disabled"}:
+            if value is True or value == 1:
+                return False
+            if isinstance(value, str) and normalized in disabled_values:
+                return False
+        elif key in {"status", "availability", "eligibility", "state"}:
+            if value is False or value == 0 or normalized in false_values:
+                return False
+        else:
+            continue
+        if normalized in _UNAVAILABLE_METHOD_MARKERS or any(
+            normalized.startswith(f"{marker}_") or normalized.endswith(f"_{marker}")
+            for marker in _UNAVAILABLE_METHOD_MARKERS
+        ):
+            return False
+    return True
+
+
+def _method_label_is_available(value: Any) -> bool:
+    normalized = _normalized_method_marker(value)
+    return not any(
+        normalized == marker
+        or normalized.startswith(f"{marker}_")
+        or normalized.endswith(f"_{marker}")
+        or f"_{marker}_" in normalized
+        for marker in _UNAVAILABLE_METHOD_MARKERS
+    )
+
+
+def _published_payment_method_snapshot(payload: Any) -> tuple[list[str], bool]:
+    """Return normalized methods plus whether the response explicitly listed them."""
     found: list[str] = []
+    explicit = False
 
     def add(value: Any) -> None:
-        normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-        if normalized.startswith("gopay"):
+        if not _method_label_is_available(value):
+            return
+        normalized = _canonical_method_key(value)
+        if (
+            normalized in {
+                "go_pay",
+                "go_pay_wallet",
+                "gopay_wallet",
+                "gopay_tokenization",
+                "gopay_tokenization_linking",
+            }
+            or normalized.startswith("gopay")
+            or normalized.startswith("go_pay_")
+        ):
             normalized = "gopay"
         if normalized and normalized not in found and not normalized.startswith("cpmt_"):
             found.append(normalized)
@@ -114,20 +217,47 @@ def _published_payment_method_types(payload: Any) -> list[str]:
             for item in value:
                 collect(item, depth + 1)
         elif isinstance(value, dict):
-            for key in type_keys:
-                candidate = value.get(key)
+            if not _method_entry_is_available(value):
+                return
+            has_type = False
+            for raw_key, candidate in value.items():
+                key = _canonical_method_key(raw_key)
+                if key not in _METHOD_TYPE_KEYS:
+                    continue
                 if isinstance(candidate, (str, int, float)):
+                    has_type = True
                     add(candidate)
-            for key, nested in value.items():
-                if key in container_keys:
+            if not has_type:
+                # Some responses use a mapping such as
+                # {"gopay": {"available": false}, "card": {"available": true}}.
+                for raw_key, nested in value.items():
+                    key = _canonical_method_key(raw_key)
+                    if key in _METHOD_TYPE_KEYS or key in _METHOD_CONTAINER_KEYS or not isinstance(nested, dict):
+                        continue
+                    if _method_entry_is_available(nested):
+                        add(raw_key)
+            for raw_key, nested in value.items():
+                if _canonical_method_key(raw_key) in _METHOD_CONTAINER_KEYS:
                     collect(nested, depth + 1)
 
     def walk(value: Any, depth: int = 0) -> None:
+        nonlocal explicit
         if depth > 6:
             return
         if isinstance(value, dict):
-            for key, nested in value.items():
-                if key in container_keys:
+            for raw_key, nested in value.items():
+                key = _canonical_method_key(raw_key)
+                if key in _SAVED_METHOD_PARENT_KEYS:
+                    # Saved customer PaymentMethods do not describe the
+                    # channels currently published by this Checkout.
+                    continue
+                if key in _METHOD_CONTAINER_KEYS:
+                    # Empty lists are valid explicit snapshots.  A malformed
+                    # null/scalar field is treated as absent so a delayed
+                    # response may still use the prior snapshot.
+                    if not isinstance(nested, (list, tuple, set, dict)):
+                        continue
+                    explicit = True
                     collect(nested, depth + 1)
                 elif isinstance(nested, (dict, list, tuple)):
                     walk(nested, depth + 1)
@@ -136,7 +266,12 @@ def _published_payment_method_types(payload: Any) -> list[str]:
                 walk(nested, depth + 1)
 
     walk(payload)
-    return found
+    return found, explicit
+
+
+def _published_payment_method_types(payload: Any) -> list[str]:
+    """Collect enabled method types from explicit Checkout method containers."""
+    return _published_payment_method_snapshot(payload)[0]
 
 
 def _prepare_gopay_payment_methods(
@@ -150,20 +285,51 @@ def _prepare_gopay_payment_methods(
     log,
     *,
     phase: str,
+    init_payload: dict[str, Any] | None = None,
 ) -> list[str]:
     stage1_methods = _published_payment_method_types(stage1)
-    init_methods = _merge_payment_method_types(ctx.get("payment_method_types") or [])
-    # Seed Elements with every method published during Checkout creation/init.
-    # Otherwise a card-only init request can make Elements echo only card.
-    ctx["payment_method_types"] = _merge_payment_method_types(stage1_methods, init_methods)
-    sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
-    elements_methods = _merge_payment_method_types(ctx.get("elements_payment_method_types") or [])
-    merged = _merge_payment_method_types(stage1_methods, init_methods, elements_methods)
+    payload_init_methods, init_explicit = _published_payment_method_snapshot(init_payload)
+    ctx_init_methods = _merge_payment_method_types(ctx.get("payment_method_types") or [])
+    init_methods = _merge_payment_method_types(
+        payload_init_methods if init_explicit else ctx_init_methods
+    )
+    initial_phase = phase == "initial"
+
+    # The initial Elements query may use Stage1 as a compatibility seed. After
+    # promo/taxes mutate the Checkout, an explicit current list must not be
+    # repopulated from the stale creation response.
+    if initial_phase or not init_explicit:
+        elements_seed = _merge_payment_method_types(stage1_methods, init_methods)
+    else:
+        elements_seed = init_methods
+    ctx["payment_method_types"] = elements_seed
+    elements_payload = sc.fetch_elements_session(
+        http, pk, session_id, ctx, version, profile, log
+    )
+    payload_elements_methods, elements_explicit = _published_payment_method_snapshot(
+        elements_payload
+    )
+    ctx_elements_methods = _merge_payment_method_types(
+        ctx.get("elements_payment_method_types") or []
+    )
+    elements_methods = _merge_payment_method_types(
+        payload_elements_methods if elements_explicit else ctx_elements_methods
+    )
+
+    if initial_phase:
+        merged = _merge_payment_method_types(stage1_methods, init_methods, elements_methods)
+    elif elements_explicit:
+        merged = elements_methods
+    elif init_explicit:
+        merged = init_methods
+    else:
+        merged = _merge_payment_method_types(elements_methods, init_methods, stage1_methods)
     ctx["payment_method_types"] = merged
     log(
         f"[gopay] 支付方式来源（{phase}）："
         f"checkout={stage1_methods or []}，stripe_init={init_methods or []}，"
-        f"elements={elements_methods or []}，merged={merged or []}"
+        f"elements={elements_methods or []}，merged={merged or []}，"
+        f"explicit(init={init_explicit},elements={elements_explicit})"
     )
     return merged
 
@@ -1393,7 +1559,8 @@ def stripe_to_provider(
     init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
     if provider == "gopay":
         methods = _prepare_gopay_payment_methods(
-            http, pk, session_id, stage1, ctx, version, profile, log, phase="initial",
+            http, pk, session_id, stage1, ctx, version, profile, log,
+            phase="initial", init_payload=init_data,
         )
     else:
         methods = ctx.get("payment_method_types") or []
@@ -1434,7 +1601,8 @@ def stripe_to_provider(
             ctx["original_checkout_amount"] = original_checkout_amount
             if provider == "gopay":
                 methods = _prepare_gopay_payment_methods(
-                    http, pk, session_id, stage1, ctx, version, profile, log, phase="post_promo",
+                    http, pk, session_id, stage1, ctx, version, profile, log,
+                    phase="post_promo", init_payload=init_data,
                 )
             else:
                 methods = ctx.get("payment_method_types") or []
@@ -1466,7 +1634,8 @@ def stripe_to_provider(
         ctx["billing"] = billing
         ctx["original_checkout_amount"] = original_checkout_amount
         methods = _prepare_gopay_payment_methods(
-            http, pk, session_id, stage1, ctx, version, profile, log, phase="post_taxes",
+            http, pk, session_id, stage1, ctx, version, profile, log,
+            phase="post_taxes", init_payload=init_data,
         )
         if not _has_provider_method(methods, "gopay"):
             raise RuntimeError(

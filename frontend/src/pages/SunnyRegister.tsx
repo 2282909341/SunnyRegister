@@ -3484,12 +3484,12 @@ function Sub2APIConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
       <div><Label>{t.priority}</Label><Input type="number" value={cfg.priority||50} onChange={(e)=>setCfg({...cfg,priority:Number(e.target.value||50)})}/></div>
       <div className="md:col-span-2">
         <Label>{t.notesContent}</Label>
-        <div className="mt-2 space-y-3">
+        <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2">
           <label className="flex min-h-8 items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={cfg.notes_include_sk === true} onChange={(e)=>setCfg({...cfg,notes_include_sk:e.target.checked})}/><span>{t.addSKInfo}</span></label>
           <label className="flex min-h-8 items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={cfg.notes_include_ls === true} onChange={(e)=>setCfg({...cfg,notes_include_ls:e.target.checked})}/><span>{t.addLSInfo}</span></label>
-          <div className="flex min-h-11 flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="flex min-h-11 min-w-0 flex-1 basis-full items-center gap-2 sm:basis-auto">
             <label className="flex shrink-0 items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={cfg.notes_include_custom === true} onChange={(e)=>setCfg({...cfg,notes_include_custom:e.target.checked})}/><span>{t.addCustomInfo}</span></label>
-            {cfg.notes_include_custom === true && <Input className="min-w-0 flex-1" placeholder={t.customNotesPlaceholder} value={cfg.notes_custom_text||""} onChange={(e)=>setCfg({...cfg,notes_custom_text:e.target.value})}/>}
+            {cfg.notes_include_custom === true && <Input className="min-w-0 flex-1 sm:w-64 sm:flex-none" placeholder={t.customNotesPlaceholder} value={cfg.notes_custom_text||""} onChange={(e)=>setCfg({...cfg,notes_custom_text:e.target.value})}/>}
           </div>
         </div>
       </div>

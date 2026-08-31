@@ -395,6 +395,71 @@ class LoginSecretTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertIn(("password", "new-password"), saved)
 
+    def test_browser_password_is_persisted_inside_confirmed_remote_step(self):
+        class Flow(LoginSecretSetupFlow):
+            def _dismiss_continue_gate(self, _page):
+                return False
+
+            def _reauth_for_password(self, _page, _password, **_kwargs):
+                return None
+
+            def _add_password_via_protocol(self, _page, _password):
+                return {"ok": True, "status": 200, "data": {"success": True}}
+
+        saved = []
+        account = self._account()
+        account.chatgpt_password = ""
+        flow = Flow(
+            account,
+            {},
+            "",
+            on_credential_saved=lambda kind, value: saved.append((kind, value)),
+        )
+
+        password = flow._add_password(Mock())
+
+        self.assertEqual(account.chatgpt_password, password)
+        self.assertEqual(saved, [("password", password)])
+
+    def test_browser_totp_is_persisted_before_session_refresh_failure(self):
+        class Flow(LoginSecretSetupFlow):
+            def __init__(self, account, saved):
+                super().__init__(
+                    account,
+                    {},
+                    "",
+                    on_credential_saved=lambda kind, value: saved.append((kind, value)),
+                )
+                self.info_calls = 0
+
+            def _mfa_info(self, _page, _access_token):
+                self.info_calls += 1
+                enabled = self.info_calls > 1
+                factors = [{"id": "factor-id", "factor_type": "totp"}] if enabled else []
+                return {"ok": True, "status": 200, "data": {"mfa_enabled": enabled, "factors": {"totp": factors}}}
+
+            def _enroll_totp(self, _page, _access_token):
+                return {"ok": True, "status": 200, "data": {"secret": "NEW-TOTP", "session_id": "session-id", "factor": {"id": "factor-id"}}}
+
+            def _activate_totp(self, _page, _access_token, _code, _session_id):
+                return {"ok": True, "status": 200, "data": {"success": True}}
+
+            def _fresh_totp_code(self, _secret, **_kwargs):
+                return "123456"
+
+            def _session_json(self, _page):
+                raise RuntimeError("session unavailable after MFA activation")
+
+        saved = []
+        account = self._account()
+        account.totp_secret = ""
+
+        with self.assertRaisesRegex(RuntimeError, "session unavailable"):
+            Flow(account, saved)._setup_2fa_protocol(Mock(), "access-token")
+
+        self.assertEqual(account.totp_secret, "NEW-TOTP")
+        self.assertEqual(saved, [("totp_secret", "NEW-TOTP")])
+
     def test_protocol_partial_security_change_skips_access_token_refresh(self):
         class Flow(ProtocolLoginSecretSetupFlow):
             def _session_json(self):
@@ -416,6 +481,33 @@ class LoginSecretTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertFalse(result["access_token_refreshed"])
         self.assertTrue(any("添加2FA失败" in error for error in result["errors"]))
+
+    def test_protocol_password_is_persisted_before_session_refresh_failure(self):
+        class Flow(ProtocolLoginSecretSetupFlow):
+            def _reauthenticate(self, *_args, **_kwargs):
+                return {"accessToken": "access-token"}
+
+            def _request(self, *_args, **_kwargs):
+                return 200, {"success": True}, ""
+
+            def _session_json(self):
+                raise RuntimeError("session unavailable after password creation")
+
+        saved = []
+        account = self._account()
+        account.chatgpt_password = ""
+        flow = Flow(
+            account,
+            {},
+            object(),
+            on_credential_saved=lambda kind, value: saved.append((kind, value)),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "session unavailable"):
+            flow._add_password("new-password")
+
+        self.assertEqual(account.chatgpt_password, "new-password")
+        self.assertEqual(saved, [("password", "new-password")])
 
     def test_protocol_totp_success_updates_shared_account_for_browser_takeover(self):
         class Flow(ProtocolLoginSecretSetupFlow):

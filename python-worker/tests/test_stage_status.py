@@ -899,6 +899,30 @@ class StageStatusTests(unittest.TestCase):
         self.assertEqual(len(db.sessions), 1)
         self.assertEqual(db.password_updates, [{"mailbox_id": 1, "password": "generated-password"}])
 
+    def test_registration_password_checkpoint_survives_later_flow_failure(self):
+        db = FakeDB()
+
+        def execute(*_args, **kwargs):
+            kwargs["on_progress"](
+                "password_created",
+                {"generated_chatgpt_password": "generated-password"},
+            )
+            raise RuntimeError("browser disconnected after password creation")
+
+        payload = {
+            "registration_stage": worker.REGISTER_ONLY,
+            "execution_mode": "background",
+        }
+        with (
+            patch.object(worker, "_prepare_register_proxy", return_value={"register": "", "mode": "direct"}),
+            patch.object(worker, "login_or_register", side_effect=execute),
+        ):
+            ok, _result = worker._run_one(db, "sunny_register", payload, mailbox(), 1, 1)
+
+        self.assertFalse(ok)
+        self.assertEqual(db.password_updates, [{"mailbox_id": 1, "password": "generated-password"}])
+        self.assertTrue(any("立即保存" in str(args[0]) for args, _kwargs in db.events if args))
+
     def test_login_secret_flow_persists_first_at_then_replaces_it_with_second_at(self):
         db = FakeDB()
         first_session = {
