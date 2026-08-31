@@ -152,7 +152,9 @@ def test_gopay_approval_blocked_invalidates_current_checkout() -> None:
     with patch.object(
         checkout_app,
         "approve_checkout",
-        side_effect=RuntimeError("manual_approval approve blocked: result=blocked"),
+        side_effect=checkout_app.CheckoutApprovalBlockedError(
+            "MANUAL_APPROVAL_BLOCKED: result=blocked"
+        ),
     ) as approve:
         with pytest.raises(RuntimeError, match="GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED"):
             checkout_app.approve_gopay_checkout_or_rebuild(
@@ -161,7 +163,7 @@ def test_gopay_approval_blocked_invalidates_current_checkout() -> None:
             )
 
     approve.assert_called_once()
-    assert approve.call_args.kwargs["allow_sentinel_fallback"] is True
+    assert approve.call_args.kwargs["allow_sentinel_fallback"] is False
     assert any("停止复用并重建完整支付提链" in message for message in logs)
 
 
@@ -194,7 +196,35 @@ def test_gopay_approval_success_returns_after_one_submission() -> None:
     approve.assert_called_once()
 
 
-def test_gopay_checkout_preserves_method_from_creation_response() -> None:
+def test_gopay_checkout_preserves_method_when_refresh_omits_method_fields() -> None:
+    creation = {
+        "custom_payment_methods": [
+            {"id": "cpmt_card", "name": "Card"},
+            {"id": "cpmt_gopay", "name": "GoPay"},
+        ],
+    }
+    refreshed = {
+        "amount_total": 0,
+        "currency": "IDR",
+    }
+    with patch.object(
+        checkout_app,
+        "fetch_custom_checkout_session",
+        return_value=refreshed,
+    ) as fetch:
+        result = checkout_app.fetch_custom_checkout_session_with_retry(
+            object(), "token", "oaics_test", "openai_ie", "device",
+            attempts=3,
+            required_provider="gopay",
+            preserve_payment_methods_from=creation,
+        )
+
+    fetch.assert_called_once()
+    assert checkout_app.custom_payment_method_id_for(result, "gopay") == "cpmt_gopay"
+    assert result["amount_total"] == 0
+
+
+def test_gopay_checkout_does_not_revive_stale_method_from_explicit_snapshot() -> None:
     creation = {
         "custom_payment_methods": [
             {"id": "cpmt_card", "name": "Card"},
@@ -213,14 +243,15 @@ def test_gopay_checkout_preserves_method_from_creation_response() -> None:
     ) as fetch:
         result = checkout_app.fetch_custom_checkout_session_with_retry(
             object(), "token", "oaics_test", "openai_ie", "device",
-            attempts=3,
+            attempts=1,
             required_provider="gopay",
             preserve_payment_methods_from=creation,
         )
 
     fetch.assert_called_once()
-    assert checkout_app.custom_payment_method_id_for(result, "gopay") == "cpmt_gopay"
-    assert result["amount_total"] == 0
+    assert checkout_app.custom_payment_methods_for(result, "gopay") == []
+    assert checkout_app.custom_payment_method_id_for(result, "gopay") == ""
+    assert result["custom_payment_methods"] == refreshed["custom_payment_methods"]
 
 
 def test_gopay_checkout_payload_delays_promo_until_method_is_published() -> None:
@@ -411,6 +442,156 @@ def test_gopay_merges_checkout_init_and_elements_method_sources() -> None:
     assert methods == ["gopay", "card"]
     assert ctx["payment_method_types"] == ["gopay", "card"]
     assert any("checkout=['gopay']" in message and "elements=['card', 'gopay']" in message for message in logs)
+
+
+def test_gopay_initial_missing_current_method_fields_falls_back_to_stage1() -> None:
+    stage1 = {
+        "custom_payment_methods": [
+            {"id": "cpmt_gopay", "name": "GoPay wallet"},
+        ],
+    }
+    ctx = {"payment_method_types": []}
+
+    def fetch_elements(_http, _pk, _session_id, current, _version, _profile, _log):
+        assert current["payment_method_types"] == ["gopay"]
+        return {"session_id": "elements_without_method_fields"}
+
+    with patch.object(checkout_app.sc, "fetch_elements_session", side_effect=fetch_elements):
+        methods = provider_checkout_module._prepare_gopay_payment_methods(
+            object(), "pk_live", "cs_live_test", stage1, ctx, "2026-test", {},
+            lambda _message: None,
+            phase="initial",
+            init_payload={
+                "currency": "idr",
+                "customer": {"payment_methods": [{"type": "card", "id": "pm_saved"}]},
+            },
+        )
+
+    assert methods == ["gopay"]
+
+
+@pytest.mark.parametrize("phase", ["post_promo", "post_taxes"])
+def test_gopay_current_explicit_empty_methods_do_not_revive_stage1(phase: str) -> None:
+    stage1 = {
+        "payment_method_types": ["card", "gopay"],
+    }
+    ctx = {"payment_method_types": ["card", "gopay"]}
+
+    with patch.object(
+        checkout_app.sc,
+        "fetch_elements_session",
+        return_value={"payment_method_specs": []},
+    ):
+        methods = provider_checkout_module._prepare_gopay_payment_methods(
+            object(), "pk_live", "cs_live_test", stage1, ctx, "2026-test", {},
+            lambda _message: None,
+            phase=phase,
+            init_payload={"payment_method_types": ["card", "gopay"]},
+        )
+
+    assert methods == []
+    assert ctx["payment_method_types"] == []
+
+
+def test_gopay_post_taxes_explicit_current_list_without_gopay_wins() -> None:
+    stage1 = {"payment_method_types": ["card", "gopay"]}
+    ctx = {"payment_method_types": ["card"]}
+
+    with patch.object(
+        checkout_app.sc,
+        "fetch_elements_session",
+        return_value={"session_id": "elements_without_method_fields"},
+    ):
+        methods = provider_checkout_module._prepare_gopay_payment_methods(
+            object(), "pk_live", "cs_live_test", stage1, ctx, "2026-test", {},
+            lambda _message: None,
+            phase="post_taxes",
+            init_payload={"payment_method_types": ["card"]},
+        )
+
+    assert methods == ["card"]
+
+
+def test_gopay_method_normalization_excludes_disabled_and_unavailable_entries() -> None:
+    payload = {
+        "custom_payment_methods": [
+            {"type": "gopay", "enabled": False},
+            {"type": "gopay", "available": "false"},
+            {"name": "GoPay", "status": "disabled"},
+            {"label": "GoPay unavailable"},
+            {"type": "card", "available": True, "status": "available"},
+            {"type": "link", "enabled": "true"},
+        ],
+        "available_payment_methods": {
+            "gopay": {"availability": "unavailable_by_country"},
+            "card": {"available": True},
+        },
+    }
+
+    methods = provider_checkout_module._published_payment_method_types(payload)
+
+    assert methods == ["card", "link"]
+    assert "gopay" not in methods
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"paymentMethodTypes": ["card", "gopay"]}, ["card", "gopay"]),
+        ({"customPaymentMethods": [{"type": "gopay"}]}, ["gopay"]),
+        ({"checkoutSession": {"paymentMethodTypes": ["gopay"]}}, ["gopay"]),
+        ({"legacyCustomer": {"paymentMethods": [{"type": "gopay"}]}}, []),
+        ({"checkoutCustomer": {"paymentMethods": [{"type": "gopay"}]}}, []),
+        (
+            {"payment_method_types": [], "paymentMethodTypes": ["gopay"]},
+            ["gopay"],
+        ),
+    ],
+)
+def test_gopay_method_snapshot_handles_camel_case_and_saved_method_boundaries(
+    payload: dict,
+    expected: list[str],
+) -> None:
+    assert provider_checkout_module._published_payment_method_types(payload) == expected
+
+
+def test_gopay_method_snapshot_treats_null_container_as_missing() -> None:
+    for malformed in (None, "", "gopay"):
+        snapshot = provider_checkout_module._published_payment_method_snapshot({
+            "paymentMethodTypes": malformed,
+        })
+        assert snapshot == ([], False)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["not_enabled", "not_eligible", "removed", "deprecated"],
+)
+def test_gopay_method_snapshot_rejects_explicit_unavailable_status(status: str) -> None:
+    methods = provider_checkout_module._published_payment_method_types({
+        "paymentMethodTypes": [{"type": "gopay", "status": status}],
+    })
+
+    assert methods == []
+
+
+@pytest.mark.parametrize(
+    "availability",
+    [
+        {"availability": False},
+        {"eligible": False},
+        {"isEligible": False},
+        {"supported": "false"},
+    ],
+)
+def test_gopay_method_snapshot_rejects_false_availability_flags(
+    availability: dict,
+) -> None:
+    methods = provider_checkout_module._published_payment_method_types({
+        "availablePaymentMethods": {"gopay": availability},
+    })
+
+    assert methods == []
 
 
 @pytest.mark.parametrize(
