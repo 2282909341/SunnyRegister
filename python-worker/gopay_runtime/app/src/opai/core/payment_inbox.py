@@ -7565,6 +7565,10 @@ class _InboxHandler(BaseHTTPRequestHandler):
             jid = path.split("/")[3]
             data = self._read_json_body()
             claimed_at = str(data.get("claimed_at") or "").strip()
+            job_for_ttl = store.get(jid)
+            claim_ttl_sec = float(self.server.claim_ttl_sec)
+            if str((job_for_ttl or {}).get("provider") or "").strip().lower() == "gopay":
+                claim_ttl_sec = max(claim_ttl_sec, _gopay_inbox_claim_ttl_sec())
             if claimed_at:
                 renewed_at = store.renew_claim(jid, claimed_at=claimed_at)
                 if renewed_at is None:
@@ -7576,10 +7580,10 @@ class _InboxHandler(BaseHTTPRequestHandler):
                     return
                 renewed = store.get(jid) or {"id": jid}
                 renewed["claimed_at"] = renewed_at
-                renewed["ttl_sec"] = self.server.claim_ttl_sec
+                renewed["ttl_sec"] = claim_ttl_sec
                 self._send_json(HTTPStatus.OK, renewed)
                 return
-            j = store.claim_pending(jid, ttl_sec=self.server.claim_ttl_sec)
+            j = store.claim_pending(jid, ttl_sec=claim_ttl_sec)
             if j is None:
                 current = store.get(jid)
                 if current is None:
@@ -7588,7 +7592,7 @@ class _InboxHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.CONFLICT, {"error": "claim_unavailable"})
                 return
             response = dict(j)
-            response["ttl_sec"] = self.server.claim_ttl_sec
+            response["ttl_sec"] = claim_ttl_sec
             self._send_json(HTTPStatus.OK, response)
             return
         # /api/jobs/<id>/paid 或 /cancel —— 用 set_status_if_pending 走幂等 SQL

@@ -4,6 +4,7 @@ import json
 import sys
 import threading
 from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -74,7 +75,7 @@ def test_browser_claim_is_atomic_and_respects_claim_ttl(tmp_path):
     assert replacement and replacement["claimed_at"] != "2000-01-01T00:00:00+00:00"
 
 
-def test_browser_claim_endpoint_returns_conflict_for_live_claim(tmp_path):
+def test_browser_gopay_claim_endpoint_uses_payment_ttl(monkeypatch, tmp_path):
     payment_inbox = _payment_inbox_module()
     store = payment_inbox.InboxStore(tmp_path / "payment_inbox.db")
     job = store.create(
@@ -90,13 +91,22 @@ def test_browser_claim_endpoint_returns_conflict_for_live_claim(tmp_path):
     def invoke_claim() -> None:
         handler = object.__new__(payment_inbox._InboxHandler)
         handler.path = f"/api/jobs/{job['id']}/claim"
-        handler.server = SimpleNamespace(store=store, claim_ttl_sec=3600.0)
+        handler.server = SimpleNamespace(store=store, claim_ttl_sec=60.0)
         handler._check_auth = lambda: True
         handler._read_json_body = lambda: {}
         handler._send_json = lambda code, data: responses.append((int(code), data))
         handler.do_PUT()
 
+    monkeypatch.setattr(payment_inbox, "_gopay_inbox_claim_ttl_sec", lambda: 3600.0)
     invoke_claim()
+    store.patch(
+        job["id"],
+        {
+            "claimed_at": (
+                datetime.now(timezone.utc) - timedelta(seconds=61)
+            ).isoformat()
+        },
+    )
     invoke_claim()
 
     assert responses[0][0] == 200
@@ -198,6 +208,111 @@ def test_web_claim_loss_does_not_cancel_shared_inbox_job(monkeypatch):
             (phone, job_id),
             {
                 "message": "支付租约已丢失且尚未扣款，预占已释放，可由其他 worker 接管",
+            },
+        )
+    ]
+
+
+def test_web_claim_loss_after_charge_keeps_non_retryable_binding(monkeypatch):
+    payment_inbox = _payment_inbox_module()
+    from opai.core import captcha_provider
+
+    job_id = "claim-loss-after-charge"
+    phone = "+628123456789"
+    snap = "123e4567-e89b-12d3-a456-426614174000"
+
+    class FakeStore:
+        def __init__(self):
+            self.statuses = []
+
+        def set_status_if_pending(self, requested_id, status):
+            self.statuses.append((requested_id, status))
+            return {"id": requested_id, "status": status}
+
+    class ClaimLostAfterChargePayment:
+        def __init__(self, **_kwargs):
+            pass
+
+        def pay(self, **kwargs):
+            kwargs["progress"]("Step 9: charge")
+            raise payment_inbox.PaymentClaimLostError("claim lost after charge")
+
+    fake_protocol = ModuleType("opai.core.gopay_payment_protocol")
+    fake_protocol.GoPayFraudDenyError = type("GoPayFraudDenyError", (Exception,), {})
+    fake_protocol.GoPayPayment = ClaimLostAfterChargePayment
+    monkeypatch.setitem(sys.modules, "opai.core.gopay_payment_protocol", fake_protocol)
+    monkeypatch.setattr(
+        payment_inbox,
+        "_find_gopay_account",
+        lambda _phone: ({"phone": phone, "sms_provider": "smsbower"}, 0),
+    )
+    monkeypatch.setattr(
+        payment_inbox,
+        "_preflight_gopay_proxy",
+        lambda _proxy: {"ok": True, "ip": "127.0.0.1"},
+    )
+    monkeypatch.setattr(
+        payment_inbox,
+        "_release_gopay_midtrans_binding",
+        lambda *_args, **_kwargs: pytest.fail(
+            "claim loss after charge must keep the non-retryable account binding"
+        ),
+    )
+    binding_updates = []
+    monkeypatch.setattr(
+        payment_inbox,
+        "_update_gopay_midtrans_binding_status",
+        lambda *args, **kwargs: binding_updates.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        captcha_provider,
+        "build_captcha_token_provider",
+        lambda **_kwargs: None,
+    )
+
+    manager = object.__new__(payment_inbox._WebPaymentManager)
+    manager._store = FakeStore()
+    manager._lock = threading.RLock()
+    manager._jobs = {
+        job_id: {
+            "id": job_id,
+            "phone": phone,
+            "status": "running",
+            "prompt": None,
+            "logs": [],
+            "snap_token": snap,
+        }
+    }
+    manager._snap_states = {}
+    manager._save_state_locked = lambda: None
+    snap_updates = []
+    manager._update_snap_state = lambda _snap, status, **_kwargs: snap_updates.append(status)
+    manager._start_inbox_claim_heartbeat = lambda *_args: (
+        threading.Event(), threading.Event(), None
+    )
+
+    manager._run(
+        job_id=job_id,
+        phone=phone,
+        local="8123456789",
+        pin="123456",
+        midtrans_url=f"https://app.midtrans.com/snap/v4/redirection/{snap}",
+        inbox_job_id="inbox-job",
+        inbox_claimed_at="2026-08-31T00:00:00+00:00",
+        proxy="",
+        payment_fingerprint={"profile_id": "test-profile"},
+        midtrans_client_key="client-key",
+    )
+
+    assert manager._jobs[job_id]["status"] == "interrupted_unknown"
+    assert manager._store.statuses == []
+    assert snap_updates[-1] == "interrupted_unknown"
+    assert binding_updates == [
+        (
+            (phone, "interrupted_unknown"),
+            {
+                "message": "支付租约已丢失，扣款阶段状态需人工核对；已禁止重试",
+                "job_id": job_id,
             },
         )
     ]
