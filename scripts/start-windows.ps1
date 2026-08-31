@@ -55,8 +55,12 @@ if (-not (Test-Path -LiteralPath $frontendStamp) -or
     (Get-NewestWriteTime $frontendSources) -gt (Get-Item -LiteralPath $frontendStamp).LastWriteTimeUtc) {
   Push-Location (Join-Path $Root "frontend")
   try {
-    npm run build
-    if ($LASTEXITCODE -ne 0) { throw "frontend build failed" }
+    # Capture stderr (vite warnings) so PS 5.1 + ErrorActionPreference=Stop
+    # does not treat native stderr as a terminating NativeCommandError.
+    $buildOutput = & npm run build 2>&1
+    $buildExit = $LASTEXITCODE
+    $buildOutput | Out-Host
+    if ($buildExit -ne 0) { throw "frontend build failed (exit $buildExit)" }
   } finally {
     Pop-Location
   }
@@ -69,8 +73,10 @@ $backendSources = @(
 if ((Get-NewestWriteTime $backendSources) -gt (Get-Item -LiteralPath $BackendExe).LastWriteTimeUtc) {
   Push-Location (Join-Path $Root "backend")
   try {
-    go build -trimpath -ldflags="-s -w" -o $BackendExe .
-    if ($LASTEXITCODE -ne 0) { throw "Go build failed" }
+    $goOutput = & go build -trimpath -ldflags="-s -w" -o $BackendExe . 2>&1
+    $goExit = $LASTEXITCODE
+    $goOutput | Out-Host
+    if ($goExit -ne 0) { throw "Go build failed (exit $goExit)" }
   } finally {
     Pop-Location
   }
