@@ -50,3 +50,14 @@ def _is_ascii_path(path: Path) -> bool:
         return True
     except UnicodeEncodeError:
         return False
+
+
+# Export the resolved ASCII CA bundle into the environment at import time.
+# curl_cffi (native libcurl) prefers SSL_CERT_FILE / CURL_CA_BUNDLE over the
+# Python-side certifi path, so setting these once covers every curl_cffi
+# request in the process -- including engines such as tools/pay153_checkout
+# that build their own Sessions with default verify and would otherwise fail
+# with CURLE_SSL_CACERT_BADFILE (curl 77) on Chinese-named paths.
+_CA_BUNDLE = ca_bundle_path()
+os.environ.setdefault("SSL_CERT_FILE", _CA_BUNDLE)
+os.environ.setdefault("CURL_CA_BUNDLE", _CA_BUNDLE)

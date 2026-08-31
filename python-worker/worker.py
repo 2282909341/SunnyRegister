@@ -17,6 +17,15 @@ from pydantic import BaseModel
 
 os.environ.setdefault("PYTHONUTF8", "1")
 
+# 顶层加载 CA bundle 修复：把 certifi 镜像到 ASCII 路径并导出
+# SSL_CERT_FILE / CURL_CA_BUNDLE 环境变量，使进程内所有 curl_cffi
+# Session（含上游合并的 pay153_checkout 引擎自带 Session）都使用
+# 可被 Windows libcurl 正确打开的 CA 文件，避免 curl 77。
+try:
+    import sunny_core.ca_bundle  # noqa: F401
+except Exception:  # pragma: no cover - 启动容错
+    traceback.print_exc()
+
 def _secret_value(env_key: str, file_key: str) -> str:
     file_name = os.getenv(file_key, "").strip()
     if file_name:
