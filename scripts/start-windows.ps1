@@ -21,6 +21,31 @@ foreach ($line in [System.IO.File]::ReadAllLines($EnvFile)) {
   }
 }
 
+$env:PORT = if ($env:SUNNYREGISTER_PORT) { $env:SUNNYREGISTER_PORT } else { "8000" }
+
+function Test-RunningPid([string]$File) {
+  if (-not (Test-Path -LiteralPath $File)) { return $false }
+  $value = [System.IO.File]::ReadAllText($File).Trim()
+  if ($value -notmatch '^\d+$') { return $false }
+  return $null -ne (Get-Process -Id ([int]$value) -ErrorAction SilentlyContinue)
+}
+
+$workerPidFile = Join-Path $RuntimeDir "python-worker.pid"
+$backendPidFile = Join-Path $RuntimeDir "backend.pid"
+if (Test-RunningPid $workerPidFile -or Test-RunningPid $backendPidFile) {
+  $readyUrl = "http://127.0.0.1:$($env:PORT)/api/ready"
+  $healthy = $false
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $readyUrl -TimeoutSec 3
+    $healthy = $response.StatusCode -eq 200
+  } catch { $healthy = $false }
+  if ($healthy) {
+    Write-Host "SunnyRegister is already running and healthy: http://127.0.0.1:$($env:PORT)" -ForegroundColor Green
+    exit 0
+  }
+  throw "SunnyRegister appears to be running but is not healthy. Run scripts\stop-windows.ps1 first, then retry."
+}
+
 if (-not (Test-Path -LiteralPath $BackendExe) -or -not (Test-Path -LiteralPath $WorkerPython)) {
   & (Join-Path $PSScriptRoot "setup-windows.ps1")
 }
@@ -53,6 +78,7 @@ $frontendSources = @(
 )
 if (-not (Test-Path -LiteralPath $frontendStamp) -or
     (Get-NewestWriteTime $frontendSources) -gt (Get-Item -LiteralPath $frontendStamp).LastWriteTimeUtc) {
+  Write-Host "Building frontend (npm run build, first start can take a few minutes) ..." -ForegroundColor Cyan
   Push-Location (Join-Path $Root "frontend")
   try {
     # Capture stderr (vite warnings) so PS 5.1 + ErrorActionPreference=Stop
@@ -71,6 +97,7 @@ $backendSources = @(
   (Join-Path $Root "go.work")
 )
 if ((Get-NewestWriteTime $backendSources) -gt (Get-Item -LiteralPath $BackendExe).LastWriteTimeUtc) {
+  Write-Host "Building backend (go build) ..." -ForegroundColor Cyan
   Push-Location (Join-Path $Root "backend")
   try {
     $goOutput = & go build -trimpath -ldflags="-s -w" -o $BackendExe . 2>&1
@@ -90,19 +117,6 @@ try {
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir, $LogDir, $DataDir | Out-Null
 
-function Test-RunningPid([string]$File) {
-  if (-not (Test-Path -LiteralPath $File)) { return $false }
-  $value = [System.IO.File]::ReadAllText($File).Trim()
-  if ($value -notmatch '^\d+$') { return $false }
-  return $null -ne (Get-Process -Id ([int]$value) -ErrorAction SilentlyContinue)
-}
-
-$workerPidFile = Join-Path $RuntimeDir "python-worker.pid"
-$backendPidFile = Join-Path $RuntimeDir "backend.pid"
-if (Test-RunningPid $workerPidFile -or Test-RunningPid $backendPidFile) {
-  throw "SunnyRegister already appears to be running. Run scripts\stop-windows.ps1 first."
-}
-
 $env:PYTHONUTF8 = "1"
 if (-not $env:DATABASE_URL) {
   throw "DATABASE_URL is required. Configure PostgreSQL in .env before starting SunnyRegister."
@@ -114,8 +128,8 @@ $env:SUNNY_TIMEZONE = $env:TZ
 $env:SUNNY_HEALTHCHECK_ENABLED = if ($env:SUNNY_HEALTHCHECK_ENABLED) { $env:SUNNY_HEALTHCHECK_ENABLED } else { "true" }
 $env:SUNNY_HEALTHCHECK_TIME = if ($env:SUNNY_HEALTHCHECK_TIME) { $env:SUNNY_HEALTHCHECK_TIME } else { "06:00" }
 $env:SUNNY_HEALTHCHECK_CONCURRENCY = if ($env:SUNNY_HEALTHCHECK_CONCURRENCY) { $env:SUNNY_HEALTHCHECK_CONCURRENCY } else { "2" }
-$env:PORT = if ($env:SUNNYREGISTER_PORT) { $env:SUNNYREGISTER_PORT } else { "8000" }
 
+Write-Host "Starting python worker (127.0.0.1:8765) ..." -ForegroundColor Cyan
 $worker = Start-Process -FilePath $WorkerPython `
   -ArgumentList @("-m", "uvicorn", "worker:app", "--host", "127.0.0.1", "--port", "8765") `
   -WorkingDirectory (Join-Path $Root "python-worker") `
@@ -137,6 +151,7 @@ if (-not $workerReady) {
   throw "Python Worker failed to become ready. Check logs\python-worker.err.log."
 }
 
+Write-Host "Starting backend (http://127.0.0.1:$($env:PORT)) ..." -ForegroundColor Cyan
 $backend = Start-Process -FilePath $BackendExe `
   -WorkingDirectory $Root `
   -RedirectStandardOutput (Join-Path $LogDir "backend.out.log") `
