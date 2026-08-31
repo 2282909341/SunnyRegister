@@ -330,7 +330,14 @@ def test_protocol_registration_completes_without_browser() -> None:
     assert traffic_meter.snapshot()["requests"] == 17
     assert traffic_meter.snapshot()["total_bytes"] > 0
     assert set(traffic_meter.snapshot()["by_kind"]) == {"protocol_http"}
-    assert checkpoints == ["protocol_started", "email_submitted", "email_verified", "auth_completed", "registered"]
+    assert checkpoints == [
+        "protocol_started",
+        "email_submitted",
+        "password_created",
+        "email_verified",
+        "auth_completed",
+        "registered",
+    ]
     assert session.closed is True
     assert not session.responses
     urls = [url for _method, url, _kwargs in session.requests]

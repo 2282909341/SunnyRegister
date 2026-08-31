@@ -808,6 +808,10 @@ class ProtocolRegistrationFlow:
         if response.status_code != 200:
             raise _response_error(response, "Submit account password")
         self.auth_action = "register"
+        self._emit(
+            "password_created",
+            {"generated_chatgpt_password": self.generated_password},
+        )
         return _json_response(response, "Submit account password")
 
     def _auth_json_post(self, path: str, payload: dict[str, Any], *, step: str, referer: str = "") -> dict[str, Any]:

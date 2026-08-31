@@ -1143,6 +1143,15 @@ class OpenAIEmailRegisterFlow:
                 password_step_attempts += 1
                 password_step_submitted = True
                 password_step_submitted_at = time.time()
+                if self.generated_password:
+                    # The generated value must be durable as soon as it is
+                    # submitted. If the browser/task disappears during the
+                    # following route transition, this is the only password
+                    # that can match a remotely accepted registration.
+                    self._emit_progress(
+                        "password_submitted",
+                        {"generated_chatgpt_password": self.generated_password},
+                    )
                 email_code_submitted = False
                 about_you_submitted = False
                 continue

@@ -189,16 +189,19 @@ class LoginSecretSetupFlow:
         self.force_access_token_refresh = bool(force_access_token_refresh)
         self.on_credential_saved = on_credential_saved or (lambda _kind, _value: None)
         self.on_session_saved = on_session_saved or (lambda _session: None)
+        self._persisted_credentials: set[tuple[str, str]] = set()
         self.last_access_token_probe_error = ""
         self.traffic_optimizer = BrowserTrafficOptimizer(traffic_meter) if traffic_meter is not None else None
         self.reader: Any | None = None
 
     def _persist_credential(self, kind: str, value: str) -> None:
         value = str(value or "").strip()
-        if value:
+        checkpoint = (str(kind or "").strip(), value)
+        if value and checkpoint not in self._persisted_credentials:
             # Persist each completed security step before the next step starts.
             # A later 2FA/AT failure must not roll back a password already set.
-            self.on_credential_saved(kind, value)
+            self.on_credential_saved(*checkpoint)
+            self._persisted_credentials.add(checkpoint)
 
     def _check_cancelled(self) -> None:
         if self.should_cancel():
@@ -894,6 +897,8 @@ class LoginSecretSetupFlow:
         except Exception as exc:
             protocol_result = {"ok": False, "status": 0, "reason": f"{type(exc).__name__}: {exc}"}
         if protocol_result.get("ok"):
+            self.account.chatgpt_password = password
+            self._persist_credential("password", password)
             self.log("[登录密钥] 已通过 OpenAI 协议接口添加 ChatGPT 密码（内容不写日志）")
             return password
         if _password_already_set(protocol_result):
@@ -941,6 +946,11 @@ class LoginSecretSetupFlow:
                 continue
             if state.get("passwordInputs") and self._submit_password(page, password):
                 submitted = True
+                # Preserve the exact generated value before any cancellable
+                # wait or browser transition. A successful remote submission
+                # followed by a disconnected browser must remain recoverable.
+                self.account.chatgpt_password = password
+                self._persist_credential("password", password)
                 self.log("[登录密钥] 已提交新 ChatGPT 密码（内容不写日志）")
                 self._sleep(2)
                 continue
@@ -948,6 +958,8 @@ class LoginSecretSetupFlow:
                 if not disappeared_at:
                     disappeared_at = time.time()
                 elif time.time() - disappeared_at >= 3:
+                    self.account.chatgpt_password = password
+                    self._persist_credential("password", password)
                     return password
             self._sleep(0.75)
         raise TimeoutError(f"添加 ChatGPT 密码超时: {self._page_state(page)}")
@@ -1267,6 +1279,7 @@ class LoginSecretSetupFlow:
         if not confirmed:
             raise RuntimeError("2FA activate 返回成功，但 mfa_info 未确认 TOTP 已启用")
         self.account.totp_secret = secret
+        self._persist_credential("totp_secret", secret)
         return secret, self._session_json(page)
 
     def _setup_2fa(self, page, password: str) -> tuple[str, dict[str, Any]]:
@@ -1471,13 +1484,16 @@ class ProtocolLoginSecretSetupFlow:
         self.recent_email_code_attempted = False
         self.on_credential_saved = on_credential_saved or (lambda _kind, _value: None)
         self.on_session_saved = on_session_saved or (lambda _session: None)
+        self._persisted_credentials: set[tuple[str, str]] = set()
         self.last_access_token_probe_error = ""
         self.reader: Any | None = None
 
     def _persist_credential(self, kind: str, value: str) -> None:
         value = str(value or "").strip()
-        if value:
-            self.on_credential_saved(kind, value)
+        checkpoint = (str(kind or "").strip(), value)
+        if value and checkpoint not in self._persisted_credentials:
+            self.on_credential_saved(*checkpoint)
+            self._persisted_credentials.add(checkpoint)
 
     def _check_cancelled(self) -> None:
         if self.should_cancel():
@@ -1822,6 +1838,8 @@ class ProtocolLoginSecretSetupFlow:
                 raise RuntimeError("远端 ChatGPT 已存在密码，但本地没有密码凭证，无法恢复原密码；请在账户管理中手动录入或重置后重试")
             if 200 <= status < 300:
                 self.log("[登录密钥] 已通过同一协议登录态添加 ChatGPT 密码（内容不写日志）")
+                self.account.chatgpt_password = password
+                self._persist_credential("password", password)
                 return self._session_json()
             invalid_step = _invalid_auth_step(result, text)
             invalid_state = _invalid_auth_state(result, text)
@@ -1918,6 +1936,8 @@ class ProtocolLoginSecretSetupFlow:
             confirmed_ok = confirmed_ok and any(str(item.get("id") or "") == factor_id for item in confirmed_factors)
         if not confirmed_ok:
             raise RuntimeError("2FA activate 返回成功，但 mfa_info 未确认 TOTP 已启用")
+        self.account.totp_secret = secret
+        self._persist_credential("totp_secret", secret)
         return secret, self._session_json()
 
     def run(self) -> dict[str, Any]:

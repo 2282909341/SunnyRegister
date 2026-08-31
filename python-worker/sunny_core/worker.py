@@ -1767,6 +1767,21 @@ def _run_one_impl(
 
     def save_progress(checkpoint: str, snapshot: dict[str, Any]) -> None:
         _emit_registration_progress(db, str(email), stage, checkpoint, setup_login_secret=setup_login_secret_enabled)
+        if checkpoint in {"password_submitted", "password_created"}:
+            generated_password = str(snapshot.get("generated_chatgpt_password") or "").strip()
+            if generated_password:
+                account.chatgpt_password = generated_password
+                db.save_chatgpt_password(mailbox_id, generated_password)
+                db.event(
+                    f"[{email}] [登录密钥] 注册密码步骤完成后已立即保存 ChatGPT 密码",
+                    detail={
+                        "email": email,
+                        "scope": "selected",
+                        "credential": "chatgpt_password",
+                        "checkpoint": checkpoint,
+                        "checkpoint_persisted": True,
+                    },
+                )
         if checkpoint in {"registered", "phone_bound"}:
             _persist_registration_checkpoint(
                 db,
