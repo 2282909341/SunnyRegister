@@ -15,6 +15,26 @@ from typing import Any, Callable
 import stripe_checkout as sc
 from billing_address_resolver import resolve_public_address
 
+try:
+    from checkout_identity import (
+        CheckoutSessionIdentity,
+        CheckoutSessionIdentityConflictError,
+        CheckoutSessionIdentityError,
+        classify_checkout_session_identity,
+    )
+except ImportError:  # pragma: no cover - package-style imports
+    from .checkout_identity import (
+        CheckoutSessionIdentity,
+        CheckoutSessionIdentityConflictError,
+        CheckoutSessionIdentityError,
+        classify_checkout_session_identity,
+    )
+
+try:
+    from payment_proof_contracts import PaymentFlowError
+except ImportError:  # pragma: no cover - package-style imports
+    from .payment_proof_contracts import PaymentFlowError
+
 
 PROVIDER_DEFAULTS = {
     "paypal": {"country": "US", "currency": "USD"},
@@ -55,6 +75,16 @@ _SAVED_METHOD_PARENT_KEYS = frozenset({
     "legacy_customer",
     "customer_info",
     "customer_session",
+})
+_STALE_METHOD_SNAPSHOT_PARENT_KEYS = frozenset({
+    "archive",
+    "archived",
+    "history",
+    "histories",
+    "old",
+    "previous",
+    "prior",
+    "stale",
 })
 
 
@@ -133,49 +163,51 @@ _UNAVAILABLE_METHOD_MARKERS = {
     "unsupported",
 }
 
+_METHOD_POSITIVE_AVAILABILITY_KEYS = frozenset({
+    "active",
+    "available",
+    "eligible",
+    "enabled",
+    "is_active",
+    "is_available",
+    "is_eligible",
+    "is_enabled",
+    "is_supported",
+    "is_visible",
+    "supported",
+    "visible",
+})
+_METHOD_NEGATIVE_AVAILABILITY_KEYS = frozenset({
+    "blocked",
+    "deprecated",
+    "disabled",
+    "hidden",
+    "inactive",
+    "ineligible",
+    "is_blocked",
+    "is_deprecated",
+    "is_disabled",
+    "is_hidden",
+    "is_inactive",
+    "is_ineligible",
+    "is_removed",
+    "is_unavailable",
+    "is_unsupported",
+    "removed",
+    "unsupported",
+})
+_METHOD_TRUE_MARKERS = frozenset({"1", "true", "yes", "on"})
+_METHOD_FALSE_MARKERS = frozenset({
+    "0", "false", "no", "off", "disabled", "unavailable", "inactive",
+})
+
 
 def _normalized_method_marker(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return _canonical_method_key(value)
 
 
-def _method_entry_is_available(entry: dict[str, Any]) -> bool:
-    """Honor common availability flags before reading a method label/type."""
-
-    false_values = {"0", "false", "no", "off", "disabled", "unavailable", "inactive"}
-    disabled_values = {"1", "true", "yes", "on"}
-    for raw_key, value in entry.items():
-        key = _canonical_method_key(raw_key)
-        normalized = _normalized_method_marker(value)
-        if key in {
-            "enabled", "available", "active", "eligible", "supported", "visible",
-            "is_enabled", "is_available", "is_active", "is_eligible", "is_supported",
-            "is_visible",
-        }:
-            if value is False or value == 0:
-                return False
-            if normalized in false_values:
-                return False
-        elif key in {"disabled", "is_disabled"}:
-            if value is True or value == 1:
-                return False
-            if isinstance(value, str) and normalized in disabled_values:
-                return False
-        elif key in {"status", "availability", "eligibility", "state"}:
-            if value is False or value == 0 or normalized in false_values:
-                return False
-        else:
-            continue
-        if normalized in _UNAVAILABLE_METHOD_MARKERS or any(
-            normalized.startswith(f"{marker}_") or normalized.endswith(f"_{marker}")
-            for marker in _UNAVAILABLE_METHOD_MARKERS
-        ):
-            return False
-    return True
-
-
-def _method_label_is_available(value: Any) -> bool:
-    normalized = _normalized_method_marker(value)
-    return not any(
+def _marker_denotes_unavailable(normalized: str) -> bool:
+    return any(
         normalized == marker
         or normalized.startswith(f"{marker}_")
         or normalized.endswith(f"_{marker}")
@@ -184,10 +216,113 @@ def _method_label_is_available(value: Any) -> bool:
     )
 
 
-def _published_payment_method_snapshot(payload: Any) -> tuple[list[str], bool]:
-    """Return normalized methods plus whether the response explicitly listed them."""
+def _availability_scalar(value: Any) -> bool | None:
+    """Return a decision for a scalar availability/eligibility marker."""
+    if value is False or value == 0:
+        return False
+    if value is True or value == 1:
+        return True
+    if not isinstance(value, str):
+        return None
+    normalized = _normalized_method_marker(value)
+    if normalized in _METHOD_TRUE_MARKERS or normalized in {
+        "active", "available", "eligible", "enabled", "supported", "visible",
+    }:
+        return True
+    if normalized in _METHOD_FALSE_MARKERS or _marker_denotes_unavailable(normalized):
+        return False
+    return None
+
+
+def _method_entry_is_available(entry: dict[str, Any]) -> bool:
+    """Honor common availability flags before reading a method label/type."""
+    for raw_key, value in entry.items():
+        key = _canonical_method_key(raw_key)
+        normalized = _normalized_method_marker(value)
+        if key in _METHOD_POSITIVE_AVAILABILITY_KEYS:
+            decision = _availability_scalar(value)
+            if decision is False:
+                return False
+        elif key in _METHOD_NEGATIVE_AVAILABILITY_KEYS:
+            decision = _availability_scalar(value)
+            if decision is True:
+                return False
+        elif key in {"status", "availability", "eligibility", "state"}:
+            decision = _availability_scalar(value)
+            if decision is False:
+                return False
+            if isinstance(value, dict) and _method_mapping_availability(value) is False:
+                return False
+        elif isinstance(value, dict) and key in {
+            "capabilities", "config", "details", "metadata", "provider",
+        }:
+            if _method_mapping_availability(value) is False:
+                return False
+        else:
+            continue
+        if _marker_denotes_unavailable(normalized):
+            return False
+    return True
+
+
+def _method_mapping_availability(value: Any) -> bool | None:
+    """Read availability from a method map without treating arbitrary metadata as a type."""
+    if isinstance(value, dict):
+        recognized = False
+        for raw_key, nested in value.items():
+            key = _canonical_method_key(raw_key)
+            if key in _METHOD_POSITIVE_AVAILABILITY_KEYS:
+                recognized = True
+                if _availability_scalar(nested) is False:
+                    return False
+            elif key in _METHOD_NEGATIVE_AVAILABILITY_KEYS:
+                recognized = True
+                if _availability_scalar(nested) is True:
+                    return False
+            elif key in {"status", "availability", "eligibility", "state"}:
+                recognized = True
+                if _availability_scalar(nested) is False:
+                    return False
+                if isinstance(nested, dict) and _method_mapping_availability(nested) is False:
+                    return False
+        return True if recognized else None
+    return _availability_scalar(value)
+
+
+def _method_label_is_available(value: Any) -> bool:
+    normalized = _normalized_method_marker(value)
+    return not _marker_denotes_unavailable(normalized)
+
+
+def _published_payment_method_snapshot(
+    payload: Any,
+    *,
+    include_custom_methods: bool = True,
+) -> tuple[list[str], bool]:
+    """Return normalized methods plus whether the response explicitly listed them.
+
+    Custom methods are included by default for compatibility with Checkout
+    snapshots that publish local methods exclusively through that container.
+    Native OAICS callers can disable them so a generic custom ``wallet`` entry
+    is not mistaken for a native payment method.
+    """
     found: list[str] = []
     explicit = False
+
+    def includes_container(key: str) -> bool:
+        return include_custom_methods or key != "custom_payment_methods"
+
+    def is_stale_snapshot_parent(key: str) -> bool:
+        if key in _STALE_METHOD_SNAPSHOT_PARENT_KEYS:
+            return True
+        return key.startswith((
+            "archived_",
+            "historical_",
+            "old_",
+            "previous_",
+            "prior_",
+            "stale_",
+        )) or key.endswith(("_history", "_histories"))
 
     def add(value: Any) -> None:
         if not _method_label_is_available(value):
@@ -232,46 +367,119 @@ def _published_payment_method_snapshot(payload: Any) -> tuple[list[str], bool]:
                 # {"gopay": {"available": false}, "card": {"available": true}}.
                 for raw_key, nested in value.items():
                     key = _canonical_method_key(raw_key)
-                    if key in _METHOD_TYPE_KEYS or key in _METHOD_CONTAINER_KEYS or not isinstance(nested, dict):
+                    if key in _METHOD_TYPE_KEYS or key in _METHOD_CONTAINER_KEYS:
                         continue
-                    if _method_entry_is_available(nested):
+                    decision = _method_mapping_availability(nested)
+                    if decision is True:
                         add(raw_key)
             for raw_key, nested in value.items():
-                if _canonical_method_key(raw_key) in _METHOD_CONTAINER_KEYS:
-                    collect(nested, depth + 1)
-
-    def walk(value: Any, depth: int = 0) -> None:
-        nonlocal explicit
-        if depth > 6:
-            return
-        if isinstance(value, dict):
-            for raw_key, nested in value.items():
                 key = _canonical_method_key(raw_key)
-                if key in _SAVED_METHOD_PARENT_KEYS:
-                    # Saved customer PaymentMethods do not describe the
-                    # channels currently published by this Checkout.
-                    continue
-                if key in _METHOD_CONTAINER_KEYS:
-                    # Empty lists are valid explicit snapshots.  A malformed
-                    # null/scalar field is treated as absent so a delayed
-                    # response may still use the prior snapshot.
-                    if not isinstance(nested, (list, tuple, set, dict)):
-                        continue
-                    explicit = True
+                if key in _METHOD_CONTAINER_KEYS and includes_container(key):
                     collect(nested, depth + 1)
-                elif isinstance(nested, (dict, list, tuple)):
-                    walk(nested, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for nested in value:
-                walk(nested, depth + 1)
 
-    walk(payload)
+    def collect_level(nodes: list[Any], depth: int) -> bool:
+        """Collect one explicit snapshot level without reading child history."""
+        level_explicit = False
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            for raw_key, nested in node.items():
+                key = _canonical_method_key(raw_key)
+                if key not in _METHOD_CONTAINER_KEYS or not includes_container(key):
+                    continue
+                # Empty containers explicitly withdraw previously published
+                # methods. Null/scalar values are malformed/missing and may
+                # therefore permit a controlled fallback.
+                if not isinstance(nested, (list, tuple, set, dict)):
+                    continue
+                level_explicit = True
+                collect(nested, depth + 1)
+        return level_explicit
+
+    def child_nodes(value: Any) -> list[Any]:
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return [item for item in value if isinstance(item, (dict, list, tuple))]
+        return []
+
+    # Search the current response breadth-first. A method container at the
+    # nearest current level is authoritative, including an empty container.
+    # Stale/history branches are held aside and considered only when the
+    # complete current response contains no explicit method fields.
+    frontier = child_nodes(payload)
+    stale_roots: list[Any] = []
+    depth = 0
+    while frontier and depth <= 6:
+        if collect_level(frontier, depth):
+            explicit = True
+            return found, explicit
+
+        next_frontier: list[Any] = []
+        for node in frontier:
+            if isinstance(node, dict):
+                for raw_key, nested in node.items():
+                    key = _canonical_method_key(raw_key)
+                    if key in _SAVED_METHOD_PARENT_KEYS or key in _METHOD_CONTAINER_KEYS:
+                        continue
+                    if not isinstance(nested, (dict, list, tuple)):
+                        continue
+                    if is_stale_snapshot_parent(key):
+                        stale_roots.extend(child_nodes(nested))
+                    else:
+                        next_frontier.extend(child_nodes(nested))
+            elif isinstance(node, (list, tuple)):
+                next_frontier.extend(child_nodes(node))
+        frontier = next_frontier
+        depth += 1
+
+    # Controlled legacy fallback: use only the nearest explicit stale
+    # snapshot, and never merge several generations together.
+    frontier = stale_roots
+    depth = 0
+    while frontier and depth <= 6:
+        if collect_level(frontier, depth):
+            explicit = True
+            return found, explicit
+        next_frontier = []
+        for node in frontier:
+            if isinstance(node, dict):
+                for raw_key, nested in node.items():
+                    key = _canonical_method_key(raw_key)
+                    if key in _SAVED_METHOD_PARENT_KEYS or key in _METHOD_CONTAINER_KEYS:
+                        continue
+                    if isinstance(nested, (dict, list, tuple)):
+                        next_frontier.extend(child_nodes(nested))
+            elif isinstance(node, (list, tuple)):
+                next_frontier.extend(child_nodes(node))
+        frontier = next_frontier
+        depth += 1
+
     return found, explicit
 
 
-def _published_payment_method_types(payload: Any) -> list[str]:
+def _published_payment_method_types(
+    payload: Any,
+    *,
+    include_custom_methods: bool = True,
+) -> list[str]:
     """Collect enabled method types from explicit Checkout method containers."""
-    return _published_payment_method_snapshot(payload)[0]
+    return _published_payment_method_snapshot(
+        payload,
+        include_custom_methods=include_custom_methods,
+    )[0]
+
+
+def published_payment_method_snapshot(
+    payload: Any,
+    *,
+    include_custom_methods: bool = True,
+) -> tuple[list[str], bool]:
+    """Public OAICS/CS Live contract for the latest explicit method snapshot."""
+    return _published_payment_method_snapshot(
+        payload,
+        include_custom_methods=include_custom_methods,
+    )
 
 
 def _prepare_gopay_payment_methods(
@@ -316,15 +524,25 @@ def _prepare_gopay_payment_methods(
         payload_elements_methods if elements_explicit else ctx_elements_methods
     )
 
-    if initial_phase:
+    if initial_phase and elements_explicit and not elements_methods:
+        # An explicit empty Elements snapshot withdraws the method even on the
+        # first read; do not resurrect the stale Stage1 publication.
+        merged = []
+        source = "elements_explicit_empty"
+    elif initial_phase:
         merged = _merge_payment_method_types(stage1_methods, init_methods, elements_methods)
+        source = "merged_initial"
     elif elements_explicit:
         merged = elements_methods
+        source = "elements_explicit"
     elif init_explicit:
         merged = init_methods
+        source = "stripe_init_explicit"
     else:
         merged = _merge_payment_method_types(elements_methods, init_methods, stage1_methods)
+        source = "legacy_fallback"
     ctx["payment_method_types"] = merged
+    ctx["payment_method_source"] = source
     log(
         f"[gopay] 支付方式来源（{phase}）："
         f"checkout={stage1_methods or []}，stripe_init={init_methods or []}，"
@@ -1566,9 +1784,13 @@ def stripe_to_provider(
         methods = ctx.get("payment_method_types") or []
     if not _has_provider_method(methods, provider):
         if provider == "gopay":
-            raise RuntimeError(
-                "GOPAY_METHOD_UNAVAILABLE: CS Live 的 Checkout 创建响应、Stripe init 与 "
-                f"Elements 均未发布 GoPay；merged={methods or []}"
+            raise PaymentFlowError(
+                "GOPAY_METHOD_UNAVAILABLE",
+                "CS Live 的 Checkout 创建响应、Stripe init 与 "
+                f"Elements 均未发布 GoPay；merged={methods or []}",
+                phase="checkout",
+                retryable=True,
+                rebuild_checkout=True,
             )
         raise RuntimeError(f"当前 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
     if provider != "gopay":
@@ -1608,9 +1830,13 @@ def stripe_to_provider(
                 methods = ctx.get("payment_method_types") or []
             if not _has_provider_method(methods, provider):
                 if provider == "gopay":
-                    raise RuntimeError(
-                        "GOPAY_PROMO_METHOD_INCOMPATIBLE: 应用优惠后 Stripe init 与 Elements "
-                        f"均未发布 GoPay；merged={methods or []}"
+                    raise PaymentFlowError(
+                        "GOPAY_PROMO_METHOD_INCOMPATIBLE",
+                        "应用优惠后 Stripe init 与 Elements "
+                        f"均未发布 GoPay；merged={methods or []}",
+                        phase="promotion",
+                        retryable=True,
+                        rebuild_checkout=True,
                     )
                 raise RuntimeError(f"应用优惠后 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
             if provider != "gopay":
@@ -1638,9 +1864,13 @@ def stripe_to_provider(
             phase="post_taxes", init_payload=init_data,
         )
         if not _has_provider_method(methods, "gopay"):
-            raise RuntimeError(
-                "GOPAY_METHOD_UNAVAILABLE_AFTER_TAXES: ID/IDR taxes 后 Stripe init 与 Elements "
-                f"均未发布 GoPay；merged={methods or []}"
+            raise PaymentFlowError(
+                "GOPAY_METHOD_UNAVAILABLE_AFTER_TAXES",
+                "ID/IDR taxes 后 Stripe init 与 Elements "
+                f"均未发布 GoPay；merged={methods or []}",
+                phase="taxes",
+                retryable=True,
+                rebuild_checkout=True,
             )
     if provider == "blik":
         original_checkout_amount = ctx.get("original_checkout_amount")
@@ -1694,14 +1924,18 @@ def stripe_to_provider(
                         ctx.get("original_checkout_amount") not in (None, "")
                         and str(checkout_amount) == str(ctx.get("original_checkout_amount"))
                     )
-                    raise RuntimeError(
-                        "GOPAY_PROMO_AMOUNT_REQUIRED: GoPay 优惠金额必须小于 50 IDR："
+                    raise PaymentFlowError(
+                        "GOPAY_PROMO_AMOUNT_REQUIRED",
+                        "GoPay 优惠金额必须小于 50 IDR："
                         f"amount={checkout_amount} currency={str(ctx.get('currency') or '').upper() or '?'}"
                         + (
                             "；GOPAY_PROMO_ACCEPTED_WITHOUT_DISCOUNT: checkout/update 已接受，"
                             "但 Stripe 金额未变化，下一轮将改为创建 Checkout 时携带优惠券"
                             if unchanged else ""
-                        )
+                        ),
+                        phase="promotion",
+                        retryable=True,
+                        rebuild_checkout=True,
                     )
                 if provider == "momo":
                     raise RuntimeError(
@@ -1896,6 +2130,8 @@ def stripe_to_provider(
         "promo_requested": require_zero_due,
         "promo_applied": promo_applied,
     })
+    if provider == "gopay":
+        out["payment_method_source"] = str(ctx.get("payment_method_source") or "unknown")
     if provider == "ideal" and out.get("provider_redirect_url"):
         out.update(enrich_ideal_redirect(http, str(out.get("provider_redirect_url") or ""), log))
     if provider == "ideal" and not is_valid_ideal_payment_url(out.get("provider_redirect_url") or ""):

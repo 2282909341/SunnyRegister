@@ -26,8 +26,14 @@ class FakeHttp:
 
 
 class FakeCookies:
-    def set(self, *_args, **_kwargs) -> None:
-        pass
+    def __init__(self) -> None:
+        self.values = {"oai-did": "device"}
+
+    def set(self, name: str, value: str, **_kwargs) -> None:
+        self.values[name] = value
+
+    def get_dict(self) -> dict[str, str]:
+        return dict(self.values)
 
 
 class FakeResponse:
@@ -50,6 +56,21 @@ class ScriptedHttp(FakeHttp):
     def post(self, *_args, **_kwargs) -> FakeResponse:
         self.post_calls += 1
         return self.response
+
+
+def bound_gopay_context(
+    http: object,
+    proxy: str = "http://fake-proxy",
+) -> checkout_app.CheckoutClientContext:
+    return checkout_app.CheckoutClientContext(
+        payment_provider="gopay",
+        device_id="device",
+        did="device",
+        user_agent="Mozilla/5.0 test-agent",
+        proxy_route=proxy,
+        session_owner=f"checkout-http:{id(http)}",
+        cookies={"oai-did": "device"},
+    )
 
 
 @pytest.mark.parametrize(
@@ -130,6 +151,53 @@ def test_http_session_registry_deduplicates_releases_and_closes_idempotently() -
 
     assert retained_http.close_calls == 1
     assert released_http.close_calls == 0
+
+
+def test_gopay_creation_identity_failure_closes_http_session_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http = FakeHttp()
+    context = bound_gopay_context(object())
+    monkeypatch.setattr(checkout_app.sc, "build_http", lambda _proxy: http)
+
+    with pytest.raises(
+        checkout_app.PaymentFlowError,
+        match="CLIENT_CONTEXT_MISMATCH",
+    ):
+        checkout_app.create_checkout(
+            "fake-token",
+            {"checkout_ui_mode": "redirect"},
+            "http://fake-proxy",
+            "device",
+            "device",
+            lambda _message: None,
+            diagnostic_label="GoPay",
+            client_context=context,
+            proof_policy=checkout_app.ProofPolicy.strict_gopay(),
+        )
+
+    assert http.close_calls == 1
+
+
+def test_gopay_creation_fails_closed_when_cookie_binding_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http = FakeHttp()
+    monkeypatch.setattr(checkout_app.sc, "build_http", lambda _proxy: http)
+
+    with pytest.raises(checkout_app.PaymentFlowError) as caught:
+        checkout_app.create_checkout(
+            "fake-token",
+            {"checkout_ui_mode": "redirect"},
+            "http://fake-proxy",
+            "device",
+            "device",
+            lambda _message: None,
+            diagnostic_label="GoPay",
+        )
+
+    assert caught.value.code == "CLIENT_COOKIE_BINDING_FAILED"
+    assert http.close_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -346,6 +414,11 @@ def test_account_shared_budget_exhaustion_stops_before_next_outer_attempt(
         state.update(
             status="error",
             error="GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED: result=blocked",
+            payment_error={
+                "code": "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED",
+                "retryable": True,
+                "rebuild_checkout": True,
+            },
         )
 
     store._run_single = run_single
@@ -405,20 +478,21 @@ def test_default_account_budget_covers_oaics_rebuilds_for_ten_cs_live_candidates
     ("status_code", "payload", "expected_error"),
     [
         (200, {"result": "blocked"}, "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED"),
-        (200, {"result": "invalid_promotion"}, "MANUAL_APPROVAL_INVALID_PROMOTION"),
-        (200, {"result": "failed"}, "MANUAL_APPROVAL_FAILED"),
-        (200, {}, "MANUAL_APPROVAL_MISSING"),
-        (200, {"result": "future_upstream_state"}, "MANUAL_APPROVAL_UNKNOWN"),
-        (403, {"result": "blocked"}, "Checkout approve HTTP 403"),
+        (200, {"result": "invalid_promotion"}, "GOPAY_APPROVAL_INVALID_PROMOTION"),
+        (200, {"result": "failed"}, "GOPAY_APPROVAL_FAILED"),
+        (200, {}, "GOPAY_APPROVAL_MISSING_RESULT"),
+        (200, {"result": "future_upstream_state"}, "GOPAY_APPROVAL_UNKNOWN_RESULT"),
+        (403, {"result": "blocked"}, "GOPAY_APPROVAL_HTTP_ERROR"),
     ],
 )
-def test_gopay_approval_rebuilds_only_typed_blocked_result_and_closes_owned_http(
+def test_gopay_approval_rebuilds_only_typed_blocked_result_and_keeps_caller_http(
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
     payload: dict,
     expected_error: str,
 ) -> None:
     http = ScriptedHttp(FakeResponse(status_code, payload))
+    context = bound_gopay_context(http)
     monkeypatch.setattr(checkout_app.sc, "build_http", lambda _proxy: http)
     monkeypatch.setattr(
         checkout_app,
@@ -434,18 +508,21 @@ def test_gopay_approval_rebuilds_only_typed_blocked_result_and_closes_owned_http
             "http://fake-proxy",
             "device",
             "device",
+            http=http,
+            client_context=context,
         )
 
     assert http.post_calls == 1
-    assert http.close_calls == 1
+    assert http.close_calls == 0
     if payload.get("result") != "blocked" or status_code != 200:
         assert "GOPAY_APPROVAL_BLOCKED_REBUILD_REQUIRED" not in str(caught.value)
 
 
-def test_gopay_approved_result_returns_and_closes_owned_http(
+def test_gopay_approved_result_returns_and_keeps_caller_http(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     http = ScriptedHttp(FakeResponse(200, {"result": "approved"}))
+    context = bound_gopay_context(http)
     monkeypatch.setattr(checkout_app.sc, "build_http", lambda _proxy: http)
     monkeypatch.setattr(
         checkout_app,
@@ -460,11 +537,35 @@ def test_gopay_approved_result_returns_and_closes_owned_http(
         "http://fake-proxy",
         "device",
         "device",
+        http=http,
+        client_context=context,
     )
 
     assert result == {"result": "approved"}
     assert http.post_calls == 1
-    assert http.close_calls == 1
+    assert http.close_calls == 0
+
+
+def test_gopay_approval_fails_closed_when_session_cookie_is_missing() -> None:
+    http = ScriptedHttp(FakeResponse(200, {"result": "approved"}))
+    context = bound_gopay_context(http)
+    http.cookies.values.clear()
+
+    with pytest.raises(checkout_app.PaymentFlowError) as caught:
+        checkout_app.approve_gopay_checkout_or_rebuild(
+            "fake-token",
+            "cs_live_test",
+            "openai_llc",
+            "http://fake-proxy",
+            "device",
+            "device",
+            http=http,
+            client_context=context,
+        )
+
+    assert caught.value.code == "CLIENT_CONTEXT_MISMATCH"
+    assert http.post_calls == 0
+    assert http.close_calls == 0
 
 
 def test_shared_approval_keeps_legacy_missing_result_compatibility(

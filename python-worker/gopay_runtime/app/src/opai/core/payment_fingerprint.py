@@ -2,26 +2,19 @@
 from __future__ import annotations
 
 import hashlib
-import random
 from copy import deepcopy
 from typing import Any
 
 
-_DEFAULT_LOCALE = "id-ID"
-_DEFAULT_TIMEZONE = "Asia/Jakarta"
-
-_DESKTOP_VIEWPORTS = [
-    {"width": 1366, "height": 768, "device_scale_factor": 1},
-    {"width": 1440, "height": 900, "device_scale_factor": 1},
-    {"width": 1536, "height": 864, "device_scale_factor": 1},
-    {"width": 1600, "height": 900, "device_scale_factor": 1},
-    {"width": 1920, "height": 1080, "device_scale_factor": 1},
-]
-
-_WINDOWS_PLATFORMS = [
-    ("Windows NT 10.0; Win64; x64", '"Windows"'),
-    ("Windows NT 10.0; WOW64", '"Windows"'),
-]
+_FINGERPRINT_VERSION = 2
+_DEFAULT_LOCALE = "zh-CN"
+_DEFAULT_TIMEZONE = "Asia/Shanghai"
+_CAPTURED_VIEWPORT = {"width": 787, "height": 586, "device_scale_factor": 1}
+_CAPTURED_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
+)
+_CAPTURED_SEC_CH_UA = '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"'
 
 
 def _seed_from_parts(*parts: str) -> str:
@@ -33,28 +26,27 @@ def _profile_id(seed: str) -> str:
     return hashlib.sha256(seed.encode()).hexdigest()[:16]
 
 
+def _saved_profile_id(value: Any) -> str:
+    profile_id = str(value or "").strip().lower()
+    if len(profile_id) == 16 and all(char in "0123456789abcdef" for char in profile_id):
+        return profile_id
+    return ""
+
+
 def build_payment_fingerprint(*, seed: str = "", phone: str = "", local: str = "", account_id: str = "") -> dict[str, Any]:
-    """Build one deterministic payment fingerprint from stable account data."""
+    """Build a deterministic profile matching the successful 2026-08-26 HAR."""
     seed_value = _seed_from_parts(seed, account_id, phone, local)
-    rng = random.Random(seed_value)
-    chrome_major = rng.choice([120, 121, 122, 123, 124])
-    platform_token, sec_ch_platform = rng.choice(_WINDOWS_PLATFORMS)
-    viewport = deepcopy(rng.choice(_DESKTOP_VIEWPORTS))
-    sec_ch_ua = f'"Not_A Brand";v="8", "Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}"'
 
     return {
-        "version": 1,
+        "version": _FINGERPRINT_VERSION,
         "profile_id": _profile_id(seed_value),
-        "user_agent": (
-            f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
-        ),
+        "user_agent": _CAPTURED_USER_AGENT,
         "locale": _DEFAULT_LOCALE,
         "timezone": _DEFAULT_TIMEZONE,
-        "viewport": viewport,
-        "sec_ch_ua": sec_ch_ua,
-        "sec_ch_ua_mobile": "?0",
-        "sec_ch_ua_platform": sec_ch_platform,
+        "viewport": deepcopy(_CAPTURED_VIEWPORT),
+        "sec_ch_ua": _CAPTURED_SEC_CH_UA,
+        "sec_ch_ua_mobile": "?1",
+        "sec_ch_ua_platform": '"Android"',
     }
 
 
@@ -62,6 +54,14 @@ def normalize_payment_fingerprint(profile: dict[str, Any] | None, **seed_parts: 
     """Return a complete profile, preserving valid saved values when present."""
     fallback = build_payment_fingerprint(**seed_parts)
     if not isinstance(profile, dict):
+        return fallback
+    try:
+        saved_version = int(profile.get("version") or 0)
+    except (TypeError, ValueError):
+        saved_version = 0
+    if saved_version != _FINGERPRINT_VERSION:
+        if saved_version == 1:
+            fallback["profile_id"] = _saved_profile_id(profile.get("profile_id")) or fallback["profile_id"]
         return fallback
 
     normalized = deepcopy(fallback)
@@ -109,27 +109,19 @@ def ensure_account_payment_fingerprint(account: dict[str, Any]) -> dict[str, Any
 def payment_fingerprint_headers(profile: dict[str, Any] | None) -> dict[str, str]:
     """Map a payment fingerprint to reusable browser request headers."""
     fp = normalize_payment_fingerprint(profile)
-    viewport = fp.get("viewport") or {}
-    width = str(viewport.get("width") or "")
-    dpr = str(viewport.get("device_scale_factor") or "")
     locale = str(fp.get("locale") or _DEFAULT_LOCALE)
-    timezone = str(fp.get("timezone") or _DEFAULT_TIMEZONE)
+    accept_language = (
+        "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,ru;q=0.6"
+        if locale.lower() == "zh-cn"
+        else f"{locale},{locale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7"
+    )
 
-    headers = {
+    return {
         "User-Agent": str(fp.get("user_agent") or ""),
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Accept-Language": f"{locale},{locale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": accept_language,
         "Sec-CH-UA": str(fp.get("sec_ch_ua") or ""),
         "Sec-CH-UA-Mobile": str(fp.get("sec_ch_ua_mobile") or "?0"),
         "Sec-CH-UA-Platform": str(fp.get("sec_ch_ua_platform") or '"Windows"'),
-        "X-Timezone": timezone,
-        "X-User-Locale": locale.replace("-", "_"),
     }
-    if width:
-        headers["Viewport-Width"] = width
-        headers["Sec-CH-Viewport-Width"] = width
-    if dpr:
-        headers["DPR"] = dpr
-        headers["Sec-CH-DPR"] = dpr
-    return headers

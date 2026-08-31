@@ -33,6 +33,10 @@ from opai.core.payment_inbox import (  # noqa: E402
     _write_sms_config,
     _write_gopay_accounts_raw,
 )
+from opai.core.captcha_provider import (  # noqa: E402
+    captcha_config_status,
+    write_captcha_config,
+)
 
 POOL = Path(os.environ.get("OPAI_GOPAY_PHONE_POOL_FILE", str(ROOT / "config" / "gopay_phone_pool.json"))).expanduser()
 
@@ -264,6 +268,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sms-status":
             self.send(200, _sms_api_status(include_balance=False))
             return
+        if path == "/api/captcha-status":
+            self.send(200, captcha_config_status())
+            return
         if path == "/api/paypal-config":
             self.send(200, _paypal_manager().public_config())
             return
@@ -368,6 +375,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/sms-config":
                 self.send(200, _write_sms_config(data))
+                return
+            if path == "/api/captcha-config":
+                self.send(200, write_captcha_config(data))
                 return
             if path == "/api/paypal-config":
                 self.send(200, _paypal_manager().update_config(data))
