@@ -1589,21 +1589,30 @@ def _gopay_payment_sms_active(account: dict[str, Any]) -> bool:
         return False
 
 
-def _set_gopay_sms_status(phone: str, status: str) -> None:
+def _set_gopay_sms_status(
+    phone: str,
+    status: str,
+    *,
+    activation_id: str = "",
+) -> bool:
     target = _digits(phone)
     if not target:
-        return
+        return False
+    expected_activation_id = str(activation_id or "").strip()
     with _gopay_accounts_write_guard():
         accounts = _load_gopay_accounts_raw()
-        changed = False
         for item in accounts:
             if target in {_digits(item.get("phone", "")), _digits(item.get("local", ""))}:
+                current_activation_id = str(
+                    item.get("activation_id") or item.get("aid") or ""
+                ).strip()
+                if expected_activation_id and current_activation_id != expected_activation_id:
+                    return False
                 item["sms_activation_status"] = status
                 item["sms_activation_updated_at"] = _now_iso()
-                changed = True
-                break
-        if changed:
-            _write_gopay_accounts_raw(accounts)
+                _write_gopay_accounts_raw(accounts)
+                return True
+    return False
 
 
 def _mark_gopay_sms_done(account: dict[str, Any]) -> bool:
@@ -1621,18 +1630,22 @@ def _mark_gopay_sms_done(account: dict[str, Any]) -> bool:
                 smspool_cancel,
             )
             if smspool_cancel(aid):
-                _set_gopay_sms_status(phone, "completed")
+                _set_gopay_sms_status(phone, "completed", activation_id=aid)
                 return True
             schedule_smspool_cancel_retry(
                 aid,
-                on_success=lambda: _set_gopay_sms_status(phone, "completed"),
+                on_success=lambda: _set_gopay_sms_status(
+                    phone,
+                    "completed",
+                    activation_id=aid,
+                ),
             )
             return False
         from opai.core.sms_helpers import get_sms_api_key, sms_done
 
         api_key = get_sms_api_key("")
         if api_key and sms_done(api_key, aid):
-            _set_gopay_sms_status(phone, "completed")
+            _set_gopay_sms_status(phone, "completed", activation_id=aid)
             return True
     except Exception:
         log.debug("payment sms_done failed", exc_info=True)
@@ -2249,8 +2262,15 @@ async function claim(id){
     const r = await fetch(`/api/jobs/${id}/claim`, {
       method:'PUT', headers: authHeaders(), credentials: 'same-origin',
     });
-    if (!r.ok) console.warn('[inbox] claim failed', id, r.status);
-  } catch(e){ console.warn('[inbox] claim exception', id, e); }
+    if (!r.ok) {
+      console.warn('[inbox] claim failed', id, r.status);
+      return false;
+    }
+    return true;
+  } catch(e){
+    console.warn('[inbox] claim exception', id, e);
+    return false;
+  }
 }
 function _consumeJob(id){
   // 单点：黑名单 + DOM 删行 + 从 _lastJobs 缓存移除。任何"已经被处理过"的 job 都该这样调一次，
@@ -2261,22 +2281,36 @@ function _consumeJob(id){
   const tr = document.querySelector(`tr[data-id="${id}"]`);
   if (tr) tr.remove();
 }
-function onLinkClick(ev, id, kind){
-  // 不阻止默认 → 链接照常在新 tab 打开；同步并发触发 claim 并 consume
-  claim(id);
-  _consumeJob(id);
+async function onLinkClick(ev, id, kind){
+  ev.preventDefault();
+  const popup = _reserveBlankTab();
+  if (!popup) {
+    alert('浏览器拦截了新窗口，请允许本站弹窗后重试');
+    return;
+  }
+  await _claimAndNavigate(id, ev.currentTarget.href, popup, true);
 }
-function _tryOpenInNewTab(url){
-  // 仅 window.open：返 null 即明确未开，给 fallback 面板。**不再叠加 <a>.click()** —
-  // 部分浏览器 (Chrome 某些 build / Edge) 即使 window.open 已成功打开 tab，<a>.click() 也会
-  // 再开一次，导致同一链接打开两次（用户实际反馈的 bug）。fallback 面板里的 <a> 是用户
-  // 真鼠标点击，浏览器一定放行，不需要 anchor 兜底。
+function _reserveBlankTab(){
+  // 必须在用户手势同步调用栈里预留空 tab；真正 URL 仅在服务端 claim 成功后写入。
   try {
-    const w = window.open(url, '_blank', 'noopener,noreferrer');
-    return !!w;
+    const popup = window.open('about:blank', '_blank');
+    if (popup) popup.opener = null;
+    return popup;
   } catch(e) {
+    return null;
+  }
+}
+async function _claimAndNavigate(id, url, popup, notifyFailure){
+  const claimed = await claim(id);
+  if (!claimed) {
+    try { popup.close(); } catch(e) {}
+    if (notifyFailure) alert('任务已被其他 worker 领取，未打开支付链接');
+    loadJobs();
     return false;
   }
+  _consumeJob(id);
+  try { popup.location.replace(url); } catch(e) { popup.location.href = url; }
+  return true;
 }
 function _showFallbackPanel(targets, field){
   // 浏览器拦了多窗口 → 渲染一个面板，每个链接是真 <a target=_blank>，
@@ -2312,11 +2346,17 @@ function _showFallbackPanel(targets, field){
     a.rel = 'noopener noreferrer';
     a.textContent = `${j.account_email || j.account_name} (${j.plan_kind})`;
     a.style.cssText = 'color:#0a58ca;text-decoration:none;display:block;';
-    a.addEventListener('click', () => {
-      claim(j.id);
-      _consumeJob(j.id);
-      row.style.opacity = '0.4';
-      row.style.textDecoration = 'line-through';
+    a.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      const popup = _reserveBlankTab();
+      if (!popup) {
+        alert('浏览器拦截了新窗口，请允许本站弹窗后重试');
+        return;
+      }
+      if (await _claimAndNavigate(j.id, a.href, popup, true)) {
+        row.style.opacity = '0.4';
+        row.style.textDecoration = 'line-through';
+      }
     });
     row.appendChild(a);
     list.appendChild(row);
@@ -2352,15 +2392,13 @@ function bulkOpen(field){
     return;
   }
   // 不用 confirm（确保 gesture 能直接走到 window.open 第一个）
-  let opened = 0;
+  const reservations = [];
   const blocked = [];
   for (let i = 0; i < target.length; i++) {
     const j = target[i];
-    const ok = _tryOpenInNewTab(_jobActionUrl(j, field));
-    if (ok) {
-      opened++;
-      claim(j.id);
-      _consumeJob(j.id);
+    const popup = _reserveBlankTab();
+    if (popup) {
+      reservations.push({j, popup});
     } else {
       blocked.push(j);
     }
@@ -2369,10 +2407,17 @@ function bulkOpen(field){
     // 把被拦的渲染到 fallback 面板，让用户真实点击逐个开
     _showFallbackPanel(blocked, field);
   }
-  if (opened === 0) {
+  if (reservations.length === 0) {
     console.warn('[inbox] 浏览器拦截了所有弹窗，已渲染 fallback 面板');
+  } else {
+    Promise.all(reservations.map(({j, popup}) =>
+      _claimAndNavigate(j.id, _jobActionUrl(j, field), popup, false)
+    )).then(results => {
+      const failed = results.filter(ok => !ok).length;
+      if (failed) alert(`${failed} 个任务已被其他 worker 领取，相关支付链接未打开`);
+      loadJobs();
+    });
   }
-  setTimeout(loadJobs, 800);
 }
 async function _doStateChange(id, path, label){
   try {
@@ -2702,7 +2747,10 @@ let activeGptTaskId = '';
 let generatedInboxJobId = '';
 let cachedAccounts = [];
 let cachedPlusPool = [];
+let cachedInboxJobs = [];
 function authHeaders(){return {'Content-Type':'application/json'};}
+function reserveInboxPopup(){try{const popup=window.open('about:blank','_blank');if(popup)popup.opener=null;return popup}catch(e){return null}}
+async function openClaimedInboxJob(event,id){event.preventDefault();const job=cachedInboxJobs.find(x=>x.id===id);const url=(job&&(job.provider_url||job.paypal_url))||'';if(!url)return;const popup=reserveInboxPopup();if(!popup){alert('浏览器拦截了新窗口，请允许本站弹窗后重试');return}try{const r=await fetch('/api/jobs/'+encodeURIComponent(id)+'/claim',{method:'PUT',headers:authHeaders()});if(!r.ok){popup.close();alert('任务已被其他 worker 领取，未打开支付链接');loadJobs();return}popup.location.replace(url);loadJobs()}catch(e){try{popup.close()}catch(_){}alert('任务领取失败，未打开支付链接');loadJobs()}}
 const gopayRegisterNav=document.querySelector('button[data-view="register"]');if(gopayRegisterNav)gopayRegisterNav.textContent='GoPay注册/登录';
 async function startRegister(){const body={source:document.getElementById('regSource')?.value||'pool',phone:document.getElementById('regPhone')?.value.trim()||'',pin:document.getElementById('regPin')?.value.trim()||'147258',country_code:'+62',force_live:false,login_existing:document.getElementById('regTaskType')?.value==='login',relogin_after_register:false,claim_envelope_after_register:false,proxy:document.getElementById('regProxy')?.value.trim()||''};const r=await fetch('/api/manual-register',{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});const d=await r.json();if(!r.ok){alert(d.error||'创建失败');return}activeManualId=d.id;loadManualJobs()}
 function showView(name){document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));['tasks','register','email_orders','oauth_tokens','oauth_tasks','accounts','payment','otp','plus_pool'].forEach(v=>{const el=document.getElementById('view-'+v);if(el)el.style.display=v===name?'block':'none'}); if(name==='accounts'){loadAccounts();loadEnvelopes();} if(name==='payment'){loadAccounts();loadPaymentJobs();} if(name==='register')loadGptRegisterTasks(); if(name==='email_orders')loadGptEmails(); if(name==='oauth_tokens')loadGptAccounts(); if(name==='oauth_tasks')loadGptRegisterTasks(); if(name==='otp')loadOtp(); if(name==='plus_pool')loadPlusPool();}
@@ -2741,7 +2789,7 @@ async function startAutoFlow(email){if(!email)return;const body={email,pin:(auto
 async function startGptRegister(){if(gptRegAutoFlow&&gptRegAutoFlow.checked){await fetch('/api/auto-flow/config',{method:'POST',headers:authHeaders(),body:JSON.stringify({enabled:true,pin:(autoFlowPin&&autoFlowPin.value.trim())||'147258',proxy:(autoFlowProxy&&autoFlowProxy.value.trim())||'',new_only:true})})}const body={count:Number(gptRegCount.value||1),workers:Number(gptRegWorkers.value||1),delay:Number(gptRegDelay.value||0),continue_on_fail:gptRegContinue.checked,proxy:gptRegUseProxy.checked?gptRegProxy.value.trim():''};const r=await fetch('/api/gpt/register-tasks',{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});const d=await r.json();if(!r.ok){alert(d.error||'创建失败');return}activeGptTaskId=d.id;renderGptTaskDetail(d);loadGptRegisterTasks();refreshTopStats()}
 async function loadGptRegisterTasks(){const r=await fetch('/api/gpt/register-tasks?limit=100');const d=await r.json();const tasks=d.tasks||[];const running=tasks.filter(x=>x.status==='running').length;setTop('regRunningTasks',running);if(tasks[0]){const es=tasks[0].email_summary||tasks[0].email_summary_start||{};setTop('regEmailReady',es.available??0);setTop('regSuccessTotal',tasks[0].success_pool_total??0);setTop('regRouteLabel',tasks[0].route_label||'代理池')}gptRegisterRows.innerHTML=tasks.map(j=>`<tr onclick="activeGptTaskId='${j.id}';renderGptTaskDetail(${JSON.stringify(j).replace(/"/g,'&quot;')})"><td>${esc(j.id)}</td><td>${esc(j.count)} / ${esc(j.workers)}</td><td>${esc(j.route_label||'代理池')}</td><td>${badge(j.status)}</td><td>${esc(j.message)}</td><td>${esc(j.success_pool_total??'-')}</td><td>${fmt(j.created_at)}</td></tr>`).join('')||'<tr><td colspan="7">暂无注册任务</td></tr>';gptOauthTaskRows.innerHTML=(d.gpt_jobs||[]).map(j=>`<tr><td>${esc(j.id)}</td><td>${esc(j.email_source||'')}</td><td>${esc(j.email||'')}</td><td>${badge(j.status)}</td><td>${esc(j.error_message||'')}</td><td>${fmt(j.completed_at)}</td></tr>`).join('')||'<tr><td colspan="6">暂无 OAuth 授权任务</td></tr>';if(activeGptTaskId){const j=tasks.find(x=>x.id===activeGptTaskId);if(j)renderGptTaskDetail(j)}else if(tasks[0]){activeGptTaskId=tasks[0].id;renderGptTaskDetail(tasks[0])}refreshTopStats()}
 function renderGptTaskDetail(j){gptRegMeta.innerHTML=`<div><span class="muted">当前任务</span><b>${esc(j.id||'-')} ｜ ${esc(j.status||'-')}</b></div><div><span class="muted">日志文件</span><b class="mono">${esc(j.log_file||'-')}</b></div><div><span class="muted">运行摘要</span><b>${esc(taskSummary(j))}</b></div>`;gptRegLog.textContent=j.log_tail||j.message||'运行中'}
-async function loadJobs(){const p=new URLSearchParams({limit:50,include_claimed:'1'});const st=document.getElementById('statusFilter').value;if(st)p.set('status',st);const e=document.getElementById('emailFilter').value.trim();if(e)p.set('email',e);const r=await fetch('/api/jobs?'+p);const d=await r.json();const jobs=d.jobs||[];document.getElementById('m-total').textContent=d.total||jobs.length;document.getElementById('m-running').textContent=jobs.filter(j=>j.status==='pending').length;document.getElementById('m-paid').textContent=jobs.filter(j=>j.status==='paid').length;document.getElementById('m-failed').textContent=jobs.filter(j=>['cancelled','expired'].includes(j.status)).length;document.getElementById('jobRows').innerHTML=jobs.map(j=>`<tr><td>${esc(j.id)}</td><td>OpenAI Plus - ${esc((j.provider||'GoPay').toUpperCase())}</td><td>${esc(j.account_email||j.account_name||'-')}</td><td>${esc(j.provider_url||j.paypal_url||'-')}</td><td>${badge(j.status)}</td><td>${esc(j.notes||j.oauth_status||'')}</td><td><div class="row-actions">${j.provider_url?`<button class="iconbtn play" onclick="window.open('${esc(j.provider_url)}','_blank')">▶</button>`:''}<button class="iconbtn stop" onclick="cancelJob('${j.id}')">■</button></div></td></tr>`).join('')||'<tr><td colspan="7">暂无任务</td></tr>';refreshTopStats()}
+async function loadJobs(){const p=new URLSearchParams({limit:50,include_claimed:'1'});const st=document.getElementById('statusFilter').value;if(st)p.set('status',st);const e=document.getElementById('emailFilter').value.trim();if(e)p.set('email',e);const r=await fetch('/api/jobs?'+p);const d=await r.json();const jobs=d.jobs||[];cachedInboxJobs=jobs;document.getElementById('m-total').textContent=d.total||jobs.length;document.getElementById('m-running').textContent=jobs.filter(j=>j.status==='pending').length;document.getElementById('m-paid').textContent=jobs.filter(j=>j.status==='paid').length;document.getElementById('m-failed').textContent=jobs.filter(j=>['cancelled','expired'].includes(j.status)).length;document.getElementById('jobRows').innerHTML=jobs.map(j=>`<tr><td>${esc(j.id)}</td><td>OpenAI Plus - ${esc((j.provider||'GoPay').toUpperCase())}</td><td>${esc(j.account_email||j.account_name||'-')}</td><td>${esc(j.provider_url||j.paypal_url||'-')}</td><td>${badge(j.status)}</td><td>${esc(j.notes||j.oauth_status||'')}</td><td><div class="row-actions">${j.provider_url?`<button class="iconbtn play" onclick="openClaimedInboxJob(event,'${j.id}')">▶</button>`:''}<button class="iconbtn stop" onclick="cancelJob('${j.id}')">■</button></div></td></tr>`).join('')||'<tr><td colspan="7">暂无任务</td></tr>';refreshTopStats()}
 async function cancelJob(id){await fetch('/api/jobs/'+id+'/cancel',{method:'PUT'});loadJobs()}
 async function bulkCancel(){if(!confirm('取消当前筛选下的运行中任务？'))return;const rows=[...document.querySelectorAll('#jobRows tr')];for(const tr of rows){const id=tr.children[0]?.textContent;if(id)await fetch('/api/jobs/'+id+'/cancel',{method:'PUT'})}loadJobs()}
 async function startRegister(){const body={phone:regPhone.value.trim(),pin:regPin.value.trim(),country_code:regCountry.value.trim(),force_live:regForce.value==='1',login_existing:regTaskType.value==='login',relogin_after_register:false,claim_envelope_after_register:regTaskType.value==='register'&&regClaimEnvelope.checked,proxy:regUseProxy.checked?regProxy.value.trim():''};const r=await fetch('/api/manual-register',{method:'POST',headers:authHeaders(),body:JSON.stringify(body)});const d=await r.json();if(!r.ok){alert(d.error||'创建失败');return}activeManualId=d.id;renderManualDetail(d);loadManualJobs();refreshTopStats()}
@@ -3389,7 +3437,11 @@ class _ManualRegisterManager:
                     result.get("keep_sms")
                     or (not result.get("failed") and not result.get("already_registered"))
                 ):
-                    _set_gopay_sms_status(phone, "active")
+                    _set_gopay_sms_status(
+                        phone,
+                        "active",
+                        activation_id=sms_activation_id,
+                    )
                     _set_gopay_sms_provider(phone, sms_provider or source)
                 else:
                     _cancel_gopay_sms(sms_provider or source, sms_api_key, sms_activation_id)
@@ -4042,14 +4094,21 @@ class _WebPaymentManager:
         inbox_job_id: str,
         claimed_at: str,
     ) -> str:
-        """Verify the inbox lease after preflight and before starting payment."""
+        """Acquire or renew the inbox lease immediately before payment starts."""
         token = str(claimed_at or "").strip()
-        if not inbox_job_id or not token:
-            return token
-        renewed_at = self._store.renew_claim(
-            inbox_job_id,
-            claimed_at=token,
-        )
+        if not inbox_job_id:
+            return ""
+        if token:
+            renewed_at = self._store.renew_claim(
+                inbox_job_id,
+                claimed_at=token,
+            )
+        else:
+            claimed = self._store.claim_pending(
+                inbox_job_id,
+                ttl_sec=_gopay_inbox_claim_ttl_sec(),
+            )
+            renewed_at = str((claimed or {}).get("claimed_at") or "").strip()
         if not renewed_at:
             raise PaymentClaimLostError(
                 "GoPay inbox claim ownership was lost during payment preflight"
@@ -4870,15 +4929,14 @@ class _WebPaymentManager:
                         exc_info=True,
                     )
                 try:
-                    _update_gopay_midtrans_binding_status(
+                    _release_gopay_midtrans_binding(
                         phone_for_job,
-                        "failed",
-                        message="支付租约已丢失，等待其他 worker 接管",
-                        job_id=job_id,
+                        job_id,
+                        message="支付租约已丢失且尚未扣款，预占已释放，可由其他 worker 接管",
                     )
                 except Exception:
                     log.warning(
-                        "Could not update stale account binding after claim loss for %s",
+                        "Could not release stale account binding after claim loss for %s",
                         job_id,
                         exc_info=True,
                     )
@@ -5596,13 +5654,20 @@ class _AutoFlowManager:
                             except Exception:
                                 log.exception("auto flow could not persist unknown payment state: %s", job_id)
                             return
+                        result = latest.get("result") if isinstance(latest.get("result"), dict) else {}
+                        failure_label = str(result.get("failure_label") or "")
+                        failure_message = str(latest.get("message") or "")
+                        if failure_label == "支付租约已丢失" or "租约已丢失" in failure_message:
+                            raise PaymentClaimLostError(
+                                failure_message or "GoPay inbox claim ownership was lost"
+                            )
                         _update_gopay_midtrans_binding_status(
                             phone,
                             "failed",
-                            message=str(latest.get("message") or "支付失败"),
+                            message=failure_message or "支付失败",
                             job_id=payment_id,
                         )
-                        raise RuntimeError(str(latest.get("message") or "支付失败"))
+                        raise RuntimeError(failure_message or "支付失败")
                 time.sleep(2)
             if payment_id:
                 try:
@@ -5620,6 +5685,7 @@ class _AutoFlowManager:
         except Exception as exc:
             log.exception("auto flow failed: %s", job_id)
             reason = str(exc)
+            claim_lost = isinstance(exc, PaymentClaimLostError) or "租约已丢失" in reason
             if payment_id and last_payment_status not in {
                 "success",
                 "success_unreconciled",
@@ -5643,7 +5709,7 @@ class _AutoFlowManager:
                 email_key = str(failed_job.get("email") or "").strip().lower()
                 reserved_phone = str(failed_job.get("phone") or "").strip()
                 retry_count = int(failed_job.get("retry_count") or 0)
-                if email_key:
+                if email_key and not claim_lost:
                     self._processed.discard(email_key)
                 try:
                     self._save_state_locked()
@@ -5659,7 +5725,7 @@ class _AutoFlowManager:
             except Exception:
                 log.exception("auto flow could not release account reservation: %s", job_id)
             try:
-                if inbox_job_id and self._server.store is not None:
+                if inbox_job_id and not claim_lost and self._server.store is not None:
                     self._server.store.set_status_if_pending(inbox_job_id, "cancelled")
             except Exception:
                 log.debug("auto flow cancel inbox job failed", exc_info=True)
@@ -7268,6 +7334,7 @@ class _InboxHandler(BaseHTTPRequestHandler):
                     pin=str(data.get("pin") or "").strip(),
                     midtrans_url=str(data.get("midtrans_url") or "").strip(),
                     inbox_job_id=str(data.get("inbox_job_id") or "").strip(),
+                    inbox_claimed_at=str(data.get("inbox_claimed_at") or "").strip(),
                     proxy=str(data.get("proxy") or "").strip(),
                 )
                 self._send_json(HTTPStatus.CREATED, job)
@@ -7507,14 +7574,10 @@ class _InboxHandler(BaseHTTPRequestHandler):
                     else:
                         self._send_json(HTTPStatus.CONFLICT, {"error": "claim_lost"})
                     return
-                self._send_json(
-                    HTTPStatus.OK,
-                    {
-                        "id": jid,
-                        "claimed_at": renewed_at,
-                        "ttl_sec": self.server.claim_ttl_sec,
-                    },
-                )
+                renewed = store.get(jid) or {"id": jid}
+                renewed["claimed_at"] = renewed_at
+                renewed["ttl_sec"] = self.server.claim_ttl_sec
+                self._send_json(HTTPStatus.OK, renewed)
                 return
             j = store.claim_pending(jid, ttl_sec=self.server.claim_ttl_sec)
             if j is None:
@@ -7524,8 +7587,9 @@ class _InboxHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json(HTTPStatus.CONFLICT, {"error": "claim_unavailable"})
                 return
-            self._send_json(HTTPStatus.OK, {"id": j["id"], "claimed_at": j.get("claimed_at"),
-                                            "ttl_sec": self.server.claim_ttl_sec})
+            response = dict(j)
+            response["ttl_sec"] = self.server.claim_ttl_sec
+            self._send_json(HTTPStatus.OK, response)
             return
         # /api/jobs/<id>/paid 或 /cancel —— 用 set_status_if_pending 走幂等 SQL
         if path.startswith("/api/jobs/") and (path.endswith("/paid") or path.endswith("/cancel")):

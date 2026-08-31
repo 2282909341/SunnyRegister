@@ -148,6 +148,54 @@ def test_web_payment_preflight_renews_current_claim_token() -> None:
     assert calls == [("inbox-job", "original-token")]
 
 
+def test_web_payment_preflight_atomically_claims_job_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opai.core import payment_inbox
+
+    calls: list[tuple[str, float]] = []
+
+    class FakeStore:
+        def claim_pending(self, job_id: str, *, ttl_sec: float):
+            calls.append((job_id, ttl_sec))
+            return {"id": job_id, "claimed_at": "new-token"}
+
+    monkeypatch.setattr(payment_inbox, "_gopay_inbox_claim_ttl_sec", lambda: 5400.0)
+    manager = object.__new__(payment_inbox._WebPaymentManager)
+    manager._store = FakeStore()
+
+    assert manager._renew_inbox_claim_before_payment("inbox-job", "") == "new-token"
+    assert calls == [("inbox-job", 5400.0)]
+
+
+def test_web_payment_preflight_stops_when_unclaimed_job_is_unavailable() -> None:
+    from opai.core import payment_inbox
+
+    class FakeStore:
+        def claim_pending(self, _job_id: str, *, ttl_sec: float):
+            assert ttl_sec >= 300
+            return None
+
+    manager = object.__new__(payment_inbox._WebPaymentManager)
+    manager._store = FakeStore()
+
+    with pytest.raises(payment_inbox.PaymentClaimLostError):
+        manager._renew_inbox_claim_before_payment("inbox-job", "")
+
+
+def test_admin_payment_link_waits_for_claim_before_navigation() -> None:
+    from opai.core import payment_inbox
+
+    html = payment_inbox._ADMIN_HTML_PAGE
+    claim_call = "await fetch('/api/jobs/'+encodeURIComponent(id)+'/claim'"
+    navigate_call = "popup.location.replace(url)"
+
+    assert claim_call in html
+    assert navigate_call in html
+    assert html.index(claim_call) < html.index(navigate_call)
+    assert "window.open('${esc(j.provider_url)}','_blank')" not in html
+
+
 def test_web_payment_preflight_stops_when_claim_was_replaced() -> None:
     from opai.core import payment_inbox
 
@@ -191,3 +239,84 @@ def test_smspool_background_cancel_retry_runs_success_callback(
     assert thread.is_alive() is False
     assert attempts == ["order-id", "order-id"]
     assert completed == [True]
+
+
+def test_smspool_old_cancel_retry_does_not_complete_reactivated_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opai.core import payment_inbox, smspool_helpers
+
+    accounts_path = tmp_path / "accounts.json"
+    accounts_path.write_text(
+        json.dumps([{
+            "phone": "+628123456789",
+            "local": "8123456789",
+            "activation_id": "old-order",
+            "sms_provider": "smspool",
+            "sms_activation_status": "active",
+        }]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPAI_GOPAY_ACCOUNTS_FILE", str(accounts_path))
+    callbacks = []
+    monkeypatch.setattr(smspool_helpers, "smspool_cancel", lambda _order_id: False)
+    monkeypatch.setattr(
+        smspool_helpers,
+        "schedule_smspool_cancel_retry",
+        lambda _order_id, **kwargs: callbacks.append(kwargs["on_success"]),
+    )
+
+    account = json.loads(accounts_path.read_text(encoding="utf-8"))[0]
+    assert payment_inbox._mark_gopay_sms_done(account) is False
+    assert len(callbacks) == 1
+
+    account["activation_id"] = "new-order"
+    account["sms_activation_status"] = "active"
+    accounts_path.write_text(json.dumps([account]), encoding="utf-8")
+    callbacks[0]()
+
+    current = json.loads(accounts_path.read_text(encoding="utf-8"))[0]
+    assert current["activation_id"] == "new-order"
+    assert current["sms_activation_status"] == "active"
+
+
+def test_claim_loss_binding_release_allows_owner_safe_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opai.core import payment_inbox
+
+    phone = "+628123456789"
+    accounts_path = tmp_path / "accounts.json"
+    accounts_path.write_text(
+        json.dumps([{
+            "phone": phone,
+            "midtrans_binding_status": "reserved",
+            "midtrans_binding_job_id": "stale-job",
+            "midtrans_binding_order_id": "order-1",
+        }]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPAI_GOPAY_ACCOUNTS_FILE", str(accounts_path))
+
+    assert payment_inbox._release_gopay_midtrans_binding(
+        phone,
+        "stale-job",
+        message="claim lost",
+    ) is True
+    released = json.loads(accounts_path.read_text(encoding="utf-8"))[0]
+    assert payment_inbox._gopay_binding_block_reason(released) == ""
+
+    assert payment_inbox._reserve_gopay_midtrans_binding(
+        phone,
+        job_id="replacement-job",
+        order_id="order-1",
+    ) is True
+    assert payment_inbox._release_gopay_midtrans_binding(
+        phone,
+        "stale-job",
+    ) is False
+    replacement = json.loads(accounts_path.read_text(encoding="utf-8"))[0]
+    assert replacement["midtrans_binding_job_id"] == "replacement-job"
+    assert replacement["midtrans_binding_status"] == "reserved"

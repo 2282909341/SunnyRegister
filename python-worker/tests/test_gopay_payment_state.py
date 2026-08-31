@@ -100,6 +100,9 @@ def test_browser_claim_endpoint_returns_conflict_for_live_claim(tmp_path):
     invoke_claim()
 
     assert responses[0][0] == 200
+    assert responses[0][1]["id"] == job["id"]
+    assert responses[0][1]["provider_url"] == job["provider_url"]
+    assert responses[0][1]["ttl_sec"] == 3600.0
     assert responses[1] == (409, {"error": "claim_unavailable"})
 
 
@@ -136,10 +139,18 @@ def test_web_claim_loss_does_not_cancel_shared_inbox_job(monkeypatch):
         "_preflight_gopay_proxy",
         lambda _proxy: {"ok": True, "ip": "127.0.0.1"},
     )
+    release_calls = []
     monkeypatch.setattr(
         payment_inbox,
         "_update_gopay_midtrans_binding_status",
-        lambda *_args, **_kwargs: True,
+        lambda *_args, **_kwargs: pytest.fail(
+            "claim loss before charge must not leave a failed account binding"
+        ),
+    )
+    monkeypatch.setattr(
+        payment_inbox,
+        "_release_gopay_midtrans_binding",
+        lambda *args, **kwargs: release_calls.append((args, kwargs)) or True,
     )
 
     claim_lost = threading.Event()
@@ -182,6 +193,14 @@ def test_web_claim_loss_does_not_cancel_shared_inbox_job(monkeypatch):
     assert "租约" in manager._jobs[job_id]["message"]
     assert manager._store.statuses == []
     assert snap_updates == ["failed"]
+    assert release_calls == [
+        (
+            (phone, job_id),
+            {
+                "message": "支付租约已丢失且尚未扣款，预占已释放，可由其他 worker 接管",
+            },
+        )
+    ]
 
 
 def test_payment_task_state_path_uses_persistent_override(monkeypatch, tmp_path):
@@ -777,6 +796,65 @@ def test_auto_flow_start_failure_releases_outer_account_reservation(monkeypatch)
     assert "midtrans_binding_job_id" not in accounts[0]
     assert "midtrans_binding_status" not in accounts[0]
     assert accounts[0]["midtrans_binding_message"] == "自动支付未启动，账号预占已释放，可重新使用"
+
+
+def test_auto_flow_claim_loss_does_not_cancel_shared_inbox_job(monkeypatch):
+    payment_inbox = _payment_inbox_module()
+    outer_id = "auto-flow-claim-lost"
+    phone = "+628123456789"
+    url = "https://app.midtrans.com/snap/v4/redirection/123e4567-e89b-12d3-a456-426614174000"
+
+    class FakeStore:
+        def __init__(self):
+            self.statuses = []
+
+        def set_status_if_pending(self, job_id, status):
+            self.statuses.append((job_id, status))
+            return {"id": job_id, "status": status}
+
+    class FakeServer:
+        store = FakeStore()
+
+    class ClaimLostWebPayment:
+        def start(self, **_kwargs):
+            raise payment_inbox.PaymentClaimLostError("支付租约已丢失")
+
+    manager = object.__new__(payment_inbox._AutoFlowManager)
+    manager._server = FakeServer()
+    manager._web_payment = ClaimLostWebPayment()
+    manager._lock = threading.RLock()
+    manager._processed = {"test@example.com"}
+    manager._jobs = {
+        outer_id: {
+            "id": outer_id,
+            "email": "test@example.com",
+            "status": "running",
+            "stage": "gopay_account",
+            "midtrans_url": url,
+            "inbox_job_id": "inbox-job",
+            "order_id": "order-1",
+            "logs": [],
+        }
+    }
+    manager._save_state_locked = lambda: None
+    manager._ensure_gopay_account = lambda *_args, **_kwargs: {"phone": phone}
+    monkeypatch.setattr(
+        payment_inbox,
+        "_release_gopay_midtrans_binding",
+        lambda *_args, **_kwargs: True,
+    )
+
+    manager._run(
+        job_id=outer_id,
+        record={"email": "test@example.com", "access_token": "token"},
+        pin="123456",
+        proxy="",
+    )
+
+    assert manager._jobs[outer_id]["status"] == "failed"
+    assert "租约已丢失" in manager._jobs[outer_id]["message"]
+    assert manager._server.store.statuses == []
+    assert "test@example.com" in manager._processed
 
 
 @pytest.mark.parametrize(
