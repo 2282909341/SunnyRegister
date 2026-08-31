@@ -32,6 +32,7 @@ from .sms_helpers import (
     sms_api, sms_get_number, sms_wait_code, sms_request_another,
     sms_cancel, sms_done, api_call_with_retry, get_error_code,
     get_sms_api_key, load_selected_env_file, sms_api_base_url, is_waf_block, is_rate_limited,
+    sms_code_sha256,
 )
 from .gojek_client import (
     GojekClient,
@@ -1813,6 +1814,10 @@ def _get_envelope_did() -> str:
 # Payment
 # ---------------------------------------------------------------------------
 
+
+class PaymentClaimLostError(RuntimeError):
+    """Raised when a worker no longer owns the inbox payment lease."""
+
 def _cli_payment_state(midtrans_url: str) -> tuple[str, dict]:
     from .payment_inbox import _extract_midtrans_snap_token, _load_snap_states
 
@@ -1826,20 +1831,64 @@ def _persist_cli_payment_state(snap: str, status: str, *, job_id: str, reason: s
     return _update_persisted_snap_state(snap, status, job_id=job_id, reason=reason)
 
 
-def _start_claim_heartbeat(inbox_client, job_id: str) -> tuple[threading.Event, threading.Thread]:
+def _start_claim_heartbeat(
+    inbox_client,
+    job_id: str,
+    claimed_at: str = "",
+) -> tuple[threading.Event, threading.Event, threading.Thread | None]:
+    """Renew a CLI inbox claim with compare-and-swap semantics.
+
+    The server returns a new timestamp on every successful renewal. A 409 (or
+    any response without a replacement token) means another worker owns the
+    job, so the caller must stop before issuing any irreversible request.
+    """
     raw_interval = str(os.environ.get("OPAI_GOPAY_CLAIM_HEARTBEAT_SEC") or "60").strip()
     try:
         interval = max(5.0, float(raw_interval))
     except ValueError:
         interval = 60.0
     stop = threading.Event()
+    lost = threading.Event()
+    token = str(claimed_at or "").strip()
+    if not token:
+        # Older inbox servers did not return a claim token. Do not send an
+        # unguarded heartbeat that could overwrite a newer worker's claim.
+        return stop, lost, None
 
     def renew() -> None:
         while not stop.wait(interval):
             try:
-                inbox_client._req("PUT", f"/api/jobs/{job_id}/claim")
+                response = inbox_client._req(
+                    "PUT",
+                    f"/api/jobs/{job_id}/claim",
+                    data={"claimed_at": nonlocal_token[0]},
+                )
+                renewed = str((response or {}).get("claimed_at") or "").strip()
+                if not renewed:
+                    lost.set()
+                    log.error("[job:%s] Claim heartbeat returned no replacement token", job_id[:8])
+                    return
+                # Python closure assignment is intentionally local to the
+                # thread; use a mutable cell so each renewal carries forward
+                # the server-issued CAS token.
+                nonlocal_token[0] = renewed
             except Exception as exc:
-                log.warning("[job:%s] Claim heartbeat failed: %s", job_id[:8], exc)
+                if "HTTP 409" in str(exc) or "claim_lost" in str(exc):
+                    lost.set()
+                    log.error("[job:%s] Claim heartbeat lost ownership", job_id[:8])
+                    return
+                # Fail closed: once renewal cannot be confirmed, this worker
+                # must not continue toward an irreversible charge while a
+                # replacement worker may acquire the expired lease.
+                lost.set()
+                log.error(
+                    "[job:%s] Claim heartbeat could not verify ownership: %s",
+                    job_id[:8],
+                    exc,
+                )
+                return
+
+    nonlocal_token = [token]
 
     thread = threading.Thread(
         target=renew,
@@ -1847,24 +1896,73 @@ def _start_claim_heartbeat(inbox_client, job_id: str) -> tuple[threading.Event, 
         name=f"gopay-claim-heartbeat-{job_id[:8]}",
     )
     thread.start()
-    return stop, thread
+    return stop, lost, thread
+
+
+def _renew_claim_before_payment(inbox_client, job_id: str, claimed_at: str) -> str:
+    """Synchronously verify and renew a claim before doing remote work.
+
+    A worker may spend several minutes in proxy, metadata, or CAPTCHA setup
+    before the periodic heartbeat gets its first turn.  The initial CAS
+    renewal closes that window.  Any failure is treated as an ownership loss
+    so a stale worker never proceeds toward charge.
+    """
+    token = str(claimed_at or "").strip()
+    if not token:
+        # Keep compatibility with inbox servers predating claim tokens.  Such
+        # servers cannot provide CAS protection, so _start_claim_heartbeat
+        # will intentionally remain disabled for this job.
+        return ""
+    try:
+        response = inbox_client._req(
+            "PUT",
+            f"/api/jobs/{job_id}/claim",
+            data={"claimed_at": token},
+        )
+    except Exception as exc:
+        if "HTTP 409" in str(exc) or "claim_lost" in str(exc):
+            raise PaymentClaimLostError(
+                "GoPay inbox claim ownership was lost before payment"
+            ) from None
+        raise PaymentClaimLostError(
+            "GoPay inbox claim ownership could not be verified before payment"
+        ) from None
+    renewed = str((response or {}).get("claimed_at") or "").strip()
+    if not renewed:
+        raise PaymentClaimLostError(
+            "GoPay inbox claim renewal returned no ownership token"
+        )
+    return renewed
 
 
 def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, proxy: str = "") -> tuple[bool, str]:
     job_id = job["id"]
     midtrans_url = job.get("provider_url") or job.get("paypal_url") or ""
     phone = account["local"]
+    claimed_at = str(job.get("claimed_at") or "").strip()
     snap = ""
     charge_started = False
+    heartbeat_stop = threading.Event()
+    heartbeat_lost = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
     log.info("[job:%s] Paying with %s (protocol)", job_id[:8], account["phone"])
 
     try:
+        claimed_at = _renew_claim_before_payment(inbox_client, job_id, claimed_at) or claimed_at
+        heartbeat_stop, heartbeat_lost, heartbeat_thread = _start_claim_heartbeat(
+            inbox_client,
+            job_id,
+            claimed_at,
+        )
+
         from .payment_inbox import (
+            _account_consumed_sms_code_hashes,
             _find_gopay_account,
             _load_gopay_accounts,
             _midtrans_transaction_meta,
             _preflight_gopay_proxy,
             _proxy_preflight_error,
+            _record_gopay_consumed_sms_code_hashes,
             _validate_payment_midtrans_meta,
         )
 
@@ -1939,16 +2037,79 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
         except Exception:
             log.debug("[job:%s] CAPTCHA provider setup failed", job_id[:8], exc_info=True)
 
+        # The active worker may have reactivated the rental after the account
+        # snapshot was loaded.  Prefer its in-memory lease so payment OTP never
+        # polls a superseded provider order.
+        activation_id = str(
+            account.get("activation_id")
+            or account.get("aid")
+            or profile_account.get("activation_id")
+            or profile_account.get("aid")
+            or ""
+        ).strip()
+        sms_provider = str(
+            account.get("sms_provider")
+            or profile_account.get("sms_provider")
+            or "smsbower"
+        ).strip().lower()
+        ignored_sms_hashes = _account_consumed_sms_code_hashes(profile_account, activation_id)
+
+        def ensure_claim_owned() -> None:
+            if heartbeat_lost.is_set():
+                raise PaymentClaimLostError(
+                    "GoPay inbox claim ownership was lost; payment stopped"
+                )
+
         def wait_otp(ph: str, timeout: int = 120) -> Optional[str]:
+            ensure_claim_owned()
+            del ph
+            if not activation_id:
+                return None
             try:
-                sms_api(api_key, "setStatus", {"id": account["aid"], "status": "3"})
+                if sms_provider == "smspool":
+                    from .smspool_helpers import smspool_resend
+
+                    smspool_resend(activation_id)
+                else:
+                    sms_request_another(api_key, activation_id)
             except Exception:
                 pass
             time.sleep(2)
-            return sms_wait_code(api_key, account["aid"], timeout=timeout)
+            if sms_provider == "smspool":
+                from .smspool_helpers import smspool_wait_code
+
+                code = smspool_wait_code(
+                    activation_id,
+                    timeout=max(timeout, 180),
+                    ignore_code_hashes=ignored_sms_hashes,
+                )
+            else:
+                code = sms_wait_code(
+                    api_key,
+                    activation_id,
+                    timeout=timeout,
+                    ignore_code_hashes=ignored_sms_hashes,
+                )
+            digest = sms_code_sha256(code or "")
+            if digest:
+                ignored_sms_hashes.add(digest)
+                try:
+                    _record_gopay_consumed_sms_code_hashes(
+                        str(profile_account.get("phone") or account.get("phone") or ""),
+                        activation_id,
+                        [digest],
+                    )
+                except Exception:
+                    log.exception(
+                        "[job:%s] Could not persist consumed SMS code hash for %s",
+                        job_id[:8],
+                        activation_id,
+                    )
+            return code
 
         def payment_progress(message: str) -> None:
             nonlocal charge_started
+            ensure_claim_owned()
             text = str(message or "")
             if "Step 9: charge" in text:
                 charge_started = True
@@ -1957,21 +2118,17 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
                 charge_started = True
                 _persist_cli_payment_state(snap, "charged", job_id=job_id)
 
-        heartbeat_stop, heartbeat_thread = _start_claim_heartbeat(inbox_client, job_id)
-        try:
-            result = payment.pay(
-                midtrans_url=midtrans_url,
-                phone=phone,
-                country_code="62",
-                pin=pin,
-                wait_otp=wait_otp,
-                progress=payment_progress,
-                midtrans_client_key=midtrans_client_key,
-                captcha_token_provider=captcha_provider,
-            )
-        finally:
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1)
+        result = payment.pay(
+            midtrans_url=midtrans_url,
+            phone=phone,
+            country_code="62",
+            pin=pin,
+            wait_otp=wait_otp,
+            progress=payment_progress,
+            midtrans_client_key=midtrans_client_key,
+            captcha_token_provider=captcha_provider,
+            before_charge=ensure_claim_owned,
+        )
 
         detail = result.get("detail", "")
         if result.get("success"):
@@ -2010,6 +2167,22 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
                 pass
             return False, detail
 
+    except PaymentClaimLostError as e:
+        # The inbox job remains pending for the worker that owns the newer
+        # lease. Do not cancel it or mark it paid from a stale worker.
+        if snap:
+            try:
+                _persist_cli_payment_state(
+                    snap,
+                    "interrupted_unknown" if charge_started else "failed",
+                    job_id=job_id,
+                    reason="inbox claim ownership lost",
+                )
+            except Exception:
+                log.exception("[job:%s] Could not persist claim-loss journal", job_id[:8])
+        log.warning("[job:%s] %s", job_id[:8], e)
+        return False, str(e)
+
     except GoPayFraudDenyError as e:
         if snap:
             try:
@@ -2037,6 +2210,11 @@ def _pay_job(job: dict, account: dict, inbox_client, api_key: str, pin: str, pro
         except Exception:
             pass
         return False, str(e)
+
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1)
 
 
 def _claim_job(inbox, min_remaining: float = MIN_REMAINING_SEC) -> Optional[dict]:
@@ -2101,6 +2279,90 @@ def _sms_reactivate(api_key: str, activation_id: str) -> Optional[str]:
         return None
 
 
+def _reactivate_sms(provider: str, api_key: str, activation_id: str) -> Optional[str]:
+    if str(provider or "smsbower").strip().lower() == "smspool":
+        from .smspool_helpers import smspool_reactivate
+
+        return smspool_reactivate(activation_id)
+    return _sms_reactivate(api_key, activation_id)
+
+
+def _release_sms(
+    provider: str,
+    api_key: str,
+    activation_id: str,
+    *,
+    attempts: int = 3,
+) -> bool:
+    if str(provider or "smsbower").strip().lower() == "smspool":
+        from .smspool_helpers import smspool_cancel
+
+        for attempt in range(1, max(1, attempts) + 1):
+            if smspool_cancel(activation_id):
+                return True
+            if attempt < max(1, attempts):
+                time.sleep(float(attempt))
+        log.warning(
+            "[release] SMSPool order %s could not be cancelled after %d attempts",
+            activation_id,
+            max(1, attempts),
+        )
+        return False
+    return bool(sms_done(api_key, activation_id))
+
+
+def _persist_account_sms_activation(
+    phone: str,
+    provider: str,
+    activation_id: str,
+    *,
+    status: str = "active",
+) -> bool:
+    """Persist the current provider lease without replacing account tokens."""
+    target = str(phone or "").strip().lstrip("+")
+    new_activation_id = str(activation_id or "").strip()
+    if not target or not new_activation_id:
+        return False
+    with _accounts_lock:
+        try:
+            accounts = json.loads(Path(ACCOUNTS_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        if not isinstance(accounts, list):
+            return False
+        changed = False
+        for item in accounts:
+            if not isinstance(item, dict):
+                continue
+            account_phone = str(item.get("phone") or "").strip().lstrip("+")
+            account_local = str(item.get("local") or "").strip()
+            if target not in {account_phone, account_local} and not (
+                account_local and target.endswith(account_local)
+            ):
+                continue
+            previous_activation_id = str(
+                item.get("activation_id") or item.get("aid") or ""
+            ).strip()
+            item["activation_id"] = new_activation_id
+            item["sms_provider"] = str(provider or "smsbower").strip().lower()
+            item["sms_activation_status"] = str(status or "active").strip().lower()
+            item["sms_activation_updated_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            if previous_activation_id != new_activation_id:
+                item["sms_consumed_code_activation_id"] = new_activation_id
+                item["sms_consumed_code_hashes"] = []
+            changed = True
+            break
+        if not changed:
+            return False
+        Path(ACCOUNTS_FILE).write_text(
+            json.dumps(accounts, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    return True
+
+
 def _resume_account(phone: str, proxy: str = "") -> Optional[dict]:
     digits = phone.strip().lstrip("+")
     # Keep the complete read/modify/write transaction under the same lock used
@@ -2156,6 +2418,9 @@ def _resume_account(phone: str, proxy: str = "") -> Optional[dict]:
         "phone": entry["phone"],
         "client": client,
         "aid": entry.get("activation_id", ""),
+        "sms_provider": str(entry.get("sms_provider") or "smsbower").strip().lower(),
+        "sms_consumed_code_activation_id": entry.get("sms_consumed_code_activation_id", ""),
+        "sms_consumed_code_hashes": list(entry.get("sms_consumed_code_hashes") or []),
         "pin": entry.get("pin", DEFAULT_PIN),
         "local": entry.get("local", ""),
         "payment_fingerprint": payment_profile,
@@ -2183,6 +2448,9 @@ def _worker_loop(
             account = _resume_account(resume_phone, proxy)
             resume_phone = ""
         else:
+            if not api_key:
+                log.info("%s SMSPool resume work completed; no SMSBower key, worker exiting", tag)
+                return
             new_did = _get_envelope_did()
             if new_did:
                 envelope_did = new_did
@@ -2198,6 +2466,7 @@ def _worker_loop(
         phone = account["phone"]
         client = account["client"]
         aid = account["aid"]
+        sms_provider = str(account.get("sms_provider") or "smsbower").strip().lower()
         is_resumed = account.get("resumed", False)
         register_time = 0 if is_resumed else time.time()
         log.info("%s Account ready: %s%s", tag, phone, " (resumed)" if is_resumed else "")
@@ -2219,10 +2488,21 @@ def _worker_loop(
                 if reactivate_count < max_reactivates:
                     log.info("%s Phone expiring during balance wait, reactivating (%d/%d)...",
                              tag, reactivate_count + 1, max_reactivates)
-                    new_aid = _sms_reactivate(api_key, aid)
+                    new_aid = _reactivate_sms(sms_provider, api_key, aid)
                     if new_aid:
                         aid = new_aid
                         account["aid"] = new_aid
+                        account["activation_id"] = new_aid
+                        if not _persist_account_sms_activation(
+                            phone,
+                            sms_provider,
+                            new_aid,
+                        ):
+                            log.error(
+                                "%s Could not persist reactivated SMS order %s",
+                                tag,
+                                new_aid,
+                            )
                         phone_activated_at = time.time()
                         reactivate_count += 1
                     else:
@@ -2260,10 +2540,21 @@ def _worker_loop(
                     log.info("%s Max reactivates (%d) reached, retiring phone", tag, max_reactivates)
                     break
                 log.info("%s Phone expiring, reactivating (%d/%d)...", tag, reactivate_count + 1, max_reactivates)
-                new_aid = _sms_reactivate(api_key, aid)
+                new_aid = _reactivate_sms(sms_provider, api_key, aid)
                 if new_aid:
                     aid = new_aid
                     account["aid"] = new_aid
+                    account["activation_id"] = new_aid
+                    if not _persist_account_sms_activation(
+                        phone,
+                        sms_provider,
+                        new_aid,
+                    ):
+                        log.error(
+                            "%s Could not persist reactivated SMS order %s",
+                            tag,
+                            new_aid,
+                        )
                     phone_activated_at = time.time()
                     reactivate_count += 1
                     log.info("%s Reactivated, new aid=%s", tag, new_aid)
@@ -2298,14 +2589,50 @@ def _worker_loop(
 
         # === Release phone ===
         try:
-            sms_done(api_key, aid)
+            released = _release_sms(sms_provider, api_key, aid)
+            if released:
+                _persist_account_sms_activation(
+                    phone,
+                    sms_provider,
+                    aid,
+                    status="completed",
+                )
+            else:
+                log.warning(
+                    "%s Could not release %s activation %s; account remains active for manual release",
+                    tag,
+                    sms_provider,
+                    aid,
+                )
         except Exception:
-            pass
+            log.exception("%s SMS activation release failed", tag)
 
 
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
+
+def _stored_resume_sms_source(phone: str) -> tuple[str, str]:
+    """Return the persisted provider and activation for one resume target."""
+    digits = str(phone or "").strip().lstrip("+")
+    with _accounts_lock:
+        try:
+            accounts = json.loads(Path(ACCOUNTS_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return "", ""
+    for account in accounts if isinstance(accounts, list) else []:
+        if not isinstance(account, dict):
+            continue
+        account_digits = str(account.get("phone") or "").strip().lstrip("+")
+        local = str(account.get("local") or "").strip()
+        if digits not in {account_digits, local} and not (local and digits.endswith(local)):
+            continue
+        return (
+            str(account.get("sms_provider") or "smsbower").strip().lower(),
+            str(account.get("activation_id") or account.get("aid") or "").strip(),
+        )
+    return "", ""
+
 
 def run_worker(
     max_workers: int = 3,
@@ -2317,15 +2644,25 @@ def run_worker(
     from .payment_inbox import PaymentInboxClient
 
     api_key = get_sms_api_key(api_key)
+    resume_phones = list(resume_phones or [])
     if not api_key:
-        log.error("No SMS API key. Set OPAI_SMSBOWER_API_KEY, OPAI_SMSBOWER_API_KEY_FILE, or OPAI_GOPAY_SMS_ENV_FILE")
-        return
+        resume_sources = {phone: _stored_resume_sms_source(phone) for phone in resume_phones}
+        invalid_resumes = [
+            phone
+            for phone in resume_phones
+            if resume_sources[phone][0] != "smspool" or not resume_sources[phone][1]
+        ]
+        if not resume_phones or invalid_resumes:
+            log.error(
+                "No SMSBower API key; only persisted SMSPool accounts can be resumed%s",
+                f": {', '.join(invalid_resumes)}" if invalid_resumes else "",
+            )
+            return
 
     inbox = PaymentInboxClient(base_url=INBOX_URL, basic_auth=(INBOX_USER, INBOX_PASS))
     stop = threading.Event()
 
-    resume_phones = resume_phones or []
-    actual_workers = max(max_workers, len(resume_phones))
+    actual_workers = len(resume_phones) if not api_key else max(max_workers, len(resume_phones))
     log.info("Worker started: workers=%d poll=%.0fs resume=%s ttl=%ds",
              actual_workers, poll_interval, resume_phones or "(none)", GOPAY_ACCOUNT_TTL)
     _inbox_ttl_cleanup()

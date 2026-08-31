@@ -75,6 +75,10 @@ class ProxyPreflightError(ValueError):
     """代理在发生任何购号或 GoPay 请求前未通过预检。"""
 
 
+class PaymentClaimLostError(RuntimeError):
+    """当前支付线程不再拥有对应 inbox job 的租约。"""
+
+
 def _normalize_proxy_url(raw: str) -> str:
     value = (raw or "").strip()
     if not value:
@@ -782,7 +786,7 @@ class InboxStore:
 
         order_sql = "ASC" if prefer_oldest else "DESC"
         pp_filter = "AND (paypal_url != '' OR provider_url != '')" if prefer_paypal_url else ""
-        provider_filter = f"AND provider = '{provider}'" if provider else ""
+        provider_filter = "AND provider = ?" if provider else ""
 
         sql = f"""
             UPDATE jobs SET claimed_at = ?
@@ -795,7 +799,40 @@ class InboxStore:
             )
             RETURNING *
         """
-        row = c.execute(sql, (now_iso, cutoff_iso)).fetchone()
+        params: list[Any] = [now_iso]
+        if provider:
+            params.append(provider)
+        params.append(cutoff_iso)
+        row = c.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    def claim_pending(
+        self,
+        job_id: str,
+        *,
+        ttl_sec: float = 60.0,
+    ) -> "PaymentInboxJob | None":
+        """Atomically claim one pending job when its claim is empty/expired.
+
+        This is the browser's single-job equivalent of ``claim_next_pending``.
+        Returning ``None`` means either the job is missing, no longer pending,
+        or another worker still owns a live claim; callers can inspect the
+        current row to distinguish those cases and return a conflict.
+        """
+        c = self._conn()
+        now_iso = _now_iso()
+        cutoff_iso = (
+            datetime.now(timezone.utc) - timedelta(seconds=ttl_sec)
+        ).isoformat()
+        row = c.execute(
+            """
+            UPDATE jobs SET claimed_at=?
+            WHERE id=? AND status='pending'
+              AND (claimed_at='' OR claimed_at < ?)
+            RETURNING *
+            """,
+            (now_iso, job_id, cutoff_iso),
+        ).fetchone()
         return dict(row) if row else None
 
     def set_status_if_pending(
@@ -841,6 +878,22 @@ class InboxStore:
             return dict(row)
         # rowcount=0:status 已不再 pending(被别人改过)→ 返回当前 job
         return self.get(job_id)
+
+    def renew_claim(self, job_id: str, *, claimed_at: str) -> str | None:
+        """Renew a pending claim only when this caller still owns its lease."""
+        token = str(claimed_at or "").strip()
+        if not token:
+            return None
+        renewed_at = _now_iso()
+        row = self._conn().execute(
+            """
+            UPDATE jobs SET claimed_at=?
+            WHERE id=? AND status='pending' AND claimed_at=?
+            RETURNING claimed_at
+            """,
+            (renewed_at, job_id, token),
+        ).fetchone()
+        return str(row["claimed_at"]) if row else None
 
     def release_claim(
         self,
@@ -1037,28 +1090,134 @@ def _snap_state_path() -> Path:
     return _gopay_accounts_path().parent / "midtrans_snap_state.json"
 
 
-def _load_snap_states() -> dict[str, dict[str, Any]]:
-    with _SNAP_STATE_LOCK:
-        path = _snap_state_path()
-        if not path.exists():
-            return {}
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            log.debug("payment_inbox: read snap states failed", exc_info=True)
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
-
-
-def _write_snap_states(states: dict[str, dict[str, Any]]) -> None:
+@contextmanager
+def _snap_state_file_guard():
+    """Serialize Snap journal updates across threads and worker processes."""
     with _SNAP_STATE_LOCK:
         path = _snap_state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(states, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a+b") as lock_file:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                deadline = time.monotonic() + 30
+                while True:
+                    lock_file.seek(0)
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"timed out locking Snap journal: {lock_path}")
+                        time.sleep(0.05)
+                try:
+                    yield path
+                finally:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield path
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_snap_states_unlocked(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.debug("payment_inbox: read snap states failed", exc_info=True)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _write_snap_states_unlocked(path: Path, states: dict[str, dict[str, Any]]) -> None:
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(states, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            log.debug("payment_inbox: remove Snap journal temp failed", exc_info=True)
+
+
+def _load_snap_states() -> dict[str, dict[str, Any]]:
+    with _snap_state_file_guard() as path:
+        return _read_snap_states_unlocked(path)
+
+
+def _reserve_persisted_snap_state(
+    snap: str,
+    *,
+    job_id: str,
+    phone: str,
+    midtrans_url: str,
+) -> dict[str, Any] | None:
+    """Atomically reserve one Snap token and return its previous state."""
+    allow_retry = (os.environ.get("OPAI_PAYMENT_ALLOW_SNAP_RETRY") or "").strip() == "1"
+    with _snap_state_file_guard() as path:
+        states = _read_snap_states_unlocked(path)
+        previous = dict(states[snap]) if snap in states else None
+        existing_status = str((previous or {}).get("status") or "").strip()
+        retryable_status = existing_status in {"failed", "fraud_denied"}
+        if existing_status and not retryable_status and not allow_retry:
+            raise ValueError(
+                "这条 Midtrans 链接已经跑过或正在运行，不能重复支付；"
+                f"当前状态={existing_status}，请重新用 AT 生成新链接"
+            )
+        now = _now_iso()
+        states[snap] = {
+            "snap": snap,
+            "job_id": job_id,
+            "phone": phone,
+            "midtrans_url": midtrans_url,
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+        }
+        _write_snap_states_unlocked(path, states)
+        return previous
+
+
+def _restore_persisted_snap_state(
+    snap: str,
+    *,
+    job_id: str,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Roll back only the reservation still owned by ``job_id``."""
+    with _snap_state_file_guard() as path:
+        states = _read_snap_states_unlocked(path)
+        current = states.get(snap)
+        if not current or str(current.get("job_id") or "") != job_id:
+            return dict(current) if current else None
+        if previous is None:
+            states.pop(snap, None)
+            restored = None
+        else:
+            restored = dict(previous)
+            states[snap] = restored
+        _write_snap_states_unlocked(path, states)
+        return dict(restored) if restored else None
 
 
 def _update_persisted_snap_state(
@@ -1068,19 +1227,30 @@ def _update_persisted_snap_state(
     job_id: str = "",
     reason: str = "",
 ) -> dict[str, Any]:
-    """Atomically journal a CLI payment phase before an irreversible request."""
+    """Atomically merge one payment phase without overwriting other Snap jobs."""
     if not snap:
         raise ValueError("missing Midtrans snap token")
-    with _SNAP_STATE_LOCK:
-        states = _load_snap_states()
+    with _snap_state_file_guard() as path:
+        states = _read_snap_states_unlocked(path)
         state = states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
+        current_owner = str(state.get("job_id") or "").strip()
+        current_status = str(state.get("status") or "").strip()
+        owner_changed = bool(job_id and current_owner and current_owner != job_id)
+        retry_takeover = status == "linking" and current_status in {"failed", "fraud_denied"}
+        if owner_changed and not retry_takeover:
+            raise ValueError(
+                f"Midtrans snap is owned by another payment job (state={current_status or 'unknown'})"
+            )
+        if retry_takeover:
+            state = {"snap": snap, "created_at": _now_iso()}
+            states[snap] = state
         if job_id:
             state["job_id"] = job_id
         state["status"] = status
         if reason:
             state["reason"] = reason
         state["updated_at"] = _now_iso()
-        _write_snap_states(states)
+        _write_snap_states_unlocked(path, states)
         return dict(state)
 
 
@@ -1446,10 +1616,17 @@ def _mark_gopay_sms_done(account: dict[str, Any]) -> bool:
         return True
     try:
         if provider == "smspool":
-            from opai.core.smspool_helpers import smspool_cancel
+            from opai.core.smspool_helpers import (
+                schedule_smspool_cancel_retry,
+                smspool_cancel,
+            )
             if smspool_cancel(aid):
                 _set_gopay_sms_status(phone, "completed")
                 return True
+            schedule_smspool_cancel_retry(
+                aid,
+                on_success=lambda: _set_gopay_sms_status(phone, "completed"),
+            )
             return False
         from opai.core.sms_helpers import get_sms_api_key, sms_done
 
@@ -1497,8 +1674,12 @@ def _cancel_gopay_sms(provider: str, api_key: str, activation_id: str) -> None:
     if not activation_id:
         return
     if str(provider or "smsbower").strip().lower() == "smspool":
-        from opai.core.smspool_helpers import smspool_cancel
-        smspool_cancel(activation_id)
+        from opai.core.smspool_helpers import (
+            schedule_smspool_cancel_retry,
+            smspool_cancel,
+        )
+        if not smspool_cancel(activation_id):
+            schedule_smspool_cancel_retry(activation_id)
     else:
         _cancel_sms_activation_with_retry(api_key, activation_id)
 
@@ -3252,7 +3433,19 @@ class _WebPaymentManager:
             changed = bool(self._jobs) or changed
         if changed and self._jobs:
             self._save_state_locked()
-            self._save_snap_state_locked()
+            for job_id, job in self._jobs.items():
+                if not job.get("interrupted_from_status"):
+                    continue
+                snap = str(job.get("snap_token") or "")
+                try:
+                    self._update_snap_state(
+                        snap,
+                        "interrupted_unknown",
+                        reason="服务重启，交易状态待核对",
+                        job_id=job_id,
+                    )
+                except ValueError:
+                    log.warning("Skipped stale interrupted Snap state for %s", snap)
         self._start_interrupted_recovery()
 
     def _read_state(self) -> dict[str, Any]:
@@ -3541,7 +3734,7 @@ class _WebPaymentManager:
                         "交易仍为 pending，但账号没有可用 PIN，需人工核对；已禁止重新扣款",
                     )
                     return
-                self._append_log(job_id, f"检测到待完成交易，从支付 challenge 继续: {challenge_ref}")
+                self._append_log(job_id, "检测到待完成交易，从支付 challenge 继续（引用已隐藏）")
                 result = payment.resume_payment_challenge(
                     str(job.get("midtrans_url") or ""),
                     challenge_ref,
@@ -3626,6 +3819,9 @@ class _WebPaymentManager:
             str(job.get("proxy") or ""),
             str(job.get("pin") or ""),
             str(job.get("challenge_ref") or ""),
+            # Older tasks only persisted the charge reference in their logs.
+            # Include the recovered value before rendering any public text.
+            str(self._challenge_ref_from_job(job) or ""),
             str(meta.get("snap_token") or ""),
             str(meta.get("midtrans_client_key") or ""),
         ]
@@ -3778,29 +3974,22 @@ class _WebPaymentManager:
             job = self._jobs.get(job_id)
             return self._public(job) if job else None
 
-    def _save_snap_state_locked(self) -> None:
-        _write_snap_states(self._snap_states)
-
-    def _reserve_snap_locked(self, snap: str, *, job_id: str, phone: str, midtrans_url: str) -> None:
-        existing = self._snap_states.get(snap) or {}
-        existing_status = str(existing.get("status") or "").strip()
-        allow_retry = (os.environ.get("OPAI_PAYMENT_ALLOW_SNAP_RETRY") or "").strip() == "1"
-        retryable_status = existing_status in {"failed", "fraud_denied"}
-        if existing_status and not retryable_status and not allow_retry:
-            raise ValueError(
-                "这条 Midtrans 链接已经跑过或正在运行，不能重复支付；"
-                f"当前状态={existing_status}，请重新用 AT 生成新链接"
-            )
-        self._snap_states[snap] = {
-            "snap": snap,
-            "job_id": job_id,
-            "phone": phone,
-            "midtrans_url": midtrans_url,
-            "status": "running",
-            "created_at": _now_iso(),
-            "updated_at": _now_iso(),
-        }
-        self._save_snap_state_locked()
+    def _reserve_snap_locked(
+        self,
+        snap: str,
+        *,
+        job_id: str,
+        phone: str,
+        midtrans_url: str,
+    ) -> dict[str, Any] | None:
+        previous = _reserve_persisted_snap_state(
+            snap,
+            job_id=job_id,
+            phone=phone,
+            midtrans_url=midtrans_url,
+        )
+        self._snap_states = _load_snap_states()
+        return previous
 
     def _rollback_start_locked(
         self,
@@ -3814,12 +4003,16 @@ class _WebPaymentManager:
         """Undo a reservation when a task did not reach a running thread."""
         self._jobs.pop(job_id, None)
         self._conds.pop(job_id, None)
-        if previous_snap_state is None:
-            self._snap_states.pop(snap, None)
-        else:
-            self._snap_states[snap] = dict(previous_snap_state)
         try:
-            self._save_snap_state_locked()
+            restored = _restore_persisted_snap_state(
+                snap,
+                job_id=job_id,
+                previous=previous_snap_state,
+            )
+            if restored is None:
+                self._snap_states.pop(snap, None)
+            else:
+                self._snap_states[snap] = restored
         except Exception:
             log.exception("Could not roll back Midtrans snap reservation %s", snap)
         if binding_reserved:
@@ -3836,14 +4029,32 @@ class _WebPaymentManager:
         if not snap:
             return
         with self._lock:
-            state = self._snap_states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
-            if job_id:
-                state["job_id"] = job_id
-            state["status"] = status
-            if reason:
-                state["reason"] = reason
-            state["updated_at"] = _now_iso()
-            self._save_snap_state_locked()
+            owner = job_id or str((self._snap_states.get(snap) or {}).get("job_id") or "")
+            self._snap_states[snap] = _update_persisted_snap_state(
+                snap,
+                status,
+                job_id=owner,
+                reason=reason,
+            )
+
+    def _renew_inbox_claim_before_payment(
+        self,
+        inbox_job_id: str,
+        claimed_at: str,
+    ) -> str:
+        """Verify the inbox lease after preflight and before starting payment."""
+        token = str(claimed_at or "").strip()
+        if not inbox_job_id or not token:
+            return token
+        renewed_at = self._store.renew_claim(
+            inbox_job_id,
+            claimed_at=token,
+        )
+        if not renewed_at:
+            raise PaymentClaimLostError(
+                "GoPay inbox claim ownership was lost during payment preflight"
+            )
+        return renewed_at
 
     def start(
         self,
@@ -3852,6 +4063,7 @@ class _WebPaymentManager:
         pin: str,
         midtrans_url: str,
         inbox_job_id: str = "",
+        inbox_claimed_at: str = "",
         proxy: str = "",
         expected_previous_job_id: str = "",
     ) -> dict[str, Any]:
@@ -3893,6 +4105,10 @@ class _WebPaymentManager:
         )
         if block_reason:
             raise ValueError(block_reason)
+        current_inbox_claimed_at = self._renew_inbox_claim_before_payment(
+            inbox_job_id,
+            inbox_claimed_at,
+        )
         job_id = uuid.uuid4().hex[:12]
         now = _now_iso()
         cond = threading.Condition(self._lock)
@@ -3900,10 +4116,13 @@ class _WebPaymentManager:
         previous_snap_state: dict[str, Any] | None = None
         binding_reserved = False
         with self._lock:
-            existing_snap = self._snap_states.get(snap)
-            previous_snap_state = dict(existing_snap) if existing_snap is not None else None
             try:
-                self._reserve_snap_locked(snap, job_id=job_id, phone=account_phone, midtrans_url=url)
+                previous_snap_state = self._reserve_snap_locked(
+                    snap,
+                    job_id=job_id,
+                    phone=account_phone,
+                    midtrans_url=url,
+                )
                 binding_reserved = _reserve_gopay_midtrans_binding(
                     account_phone,
                     job_id=job_id,
@@ -3927,6 +4146,7 @@ class _WebPaymentManager:
                     "payment_fingerprint": payment_profile,
                     "proxy": use_proxy,
                     "inbox_job_id": inbox_job_id,
+                    "inbox_claimed_at": current_inbox_claimed_at,
                     "status": "running",
                     "message": f"预检通过: {meta.get('order_id')} {meta.get('gross_amount')} {meta.get('currency')}，余额 {balance} Rp",
                     "created_at": now,
@@ -3948,6 +4168,16 @@ class _WebPaymentManager:
                     previous_snap_state=previous_snap_state,
                     binding_reserved=binding_reserved,
                 )
+                if inbox_job_id and current_inbox_claimed_at:
+                    try:
+                        self._store.release_claim(
+                            inbox_job_id,
+                            claimed_at=current_inbox_claimed_at,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Could not release renewed inbox claim after payment start failure"
+                        )
                 raise
         t = threading.Thread(
             target=self._run,
@@ -3958,6 +4188,7 @@ class _WebPaymentManager:
                 "pin": effective_pin,
                 "midtrans_url": url,
                 "inbox_job_id": inbox_job_id,
+                "inbox_claimed_at": current_inbox_claimed_at,
                 "proxy": use_proxy,
                 "payment_fingerprint": payment_profile,
                 "midtrans_client_key": str(meta.get("midtrans_client_key") or ""),
@@ -3976,6 +4207,16 @@ class _WebPaymentManager:
                     previous_snap_state=previous_snap_state,
                     binding_reserved=binding_reserved,
                 )
+            if inbox_job_id and current_inbox_claimed_at:
+                try:
+                    self._store.release_claim(
+                        inbox_job_id,
+                        claimed_at=current_inbox_claimed_at,
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not release renewed inbox claim after thread start failure"
+                    )
             raise
         return self.get(job_id) or {}
 
@@ -3992,10 +4233,63 @@ class _WebPaymentManager:
         if not url:
             raise ValueError("领取到的任务没有 Midtrans 链接")
         try:
-            return self.start(phone=phone, pin=pin, midtrans_url=url, inbox_job_id=job["id"], proxy=proxy)
+            return self.start(
+                phone=phone,
+                pin=pin,
+                midtrans_url=url,
+                inbox_job_id=job["id"],
+                inbox_claimed_at=str(job.get("claimed_at") or ""),
+                proxy=proxy,
+            )
         except Exception:
             self._store.release_claim(job["id"], claimed_at=str(job.get("claimed_at") or ""))
             raise
+
+    def _start_inbox_claim_heartbeat(
+        self,
+        inbox_job_id: str,
+        claimed_at: str,
+    ) -> tuple[threading.Event, threading.Event, threading.Thread | None]:
+        stop = threading.Event()
+        lost = threading.Event()
+        if not inbox_job_id or not claimed_at:
+            return stop, lost, None
+        raw_interval = str(os.environ.get("OPAI_GOPAY_CLAIM_HEARTBEAT_SEC") or "60").strip()
+        try:
+            configured_interval = max(5.0, float(raw_interval))
+        except ValueError:
+            configured_interval = 60.0
+        interval = min(configured_interval, max(5.0, _gopay_inbox_claim_ttl_sec() / 3))
+        claim_token = [claimed_at]
+
+        def renew() -> None:
+            while not stop.wait(interval):
+                try:
+                    renewed_at = self._store.renew_claim(
+                        inbox_job_id,
+                        claimed_at=claim_token[0],
+                    )
+                except Exception:
+                    log.warning(
+                        "Web payment claim heartbeat failed for %s",
+                        inbox_job_id,
+                        exc_info=True,
+                    )
+                    lost.set()
+                    return
+                if not renewed_at:
+                    lost.set()
+                    log.error("Web payment lost inbox claim ownership for %s", inbox_job_id)
+                    return
+                claim_token[0] = renewed_at
+
+        thread = threading.Thread(
+            target=renew,
+            daemon=True,
+            name=f"web-payment-claim-{inbox_job_id[:8]}",
+        )
+        thread.start()
+        return stop, lost, thread
 
     def submit_otp(self, job_id: str, code: str) -> dict[str, Any] | None:
         code = (code or "").strip()
@@ -4045,10 +4339,11 @@ class _WebPaymentManager:
             job["updated_at"] = _now_iso()
             snap = str(job.get("snap_token") or "")
             if snap:
-                state = self._snap_states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
-                state["status"] = status if status == "awaiting_captcha" else "linking"
-                state["updated_at"] = _now_iso()
-                self._save_snap_state_locked()
+                self._update_snap_state(
+                    snap,
+                    status if status == "awaiting_captcha" else "linking",
+                    job_id=job_id,
+                )
             self._save_state_locked()
 
     def _append_log(self, job_id: str, message: str) -> None:
@@ -4056,19 +4351,25 @@ class _WebPaymentManager:
             job = self._jobs.get(job_id)
             if not job:
                 return
+            raw_message = str(message or "")
             challenge_match = re.search(
                 r"charge challenge_ref=([A-Za-z0-9_-]+)",
-                str(message or ""),
+                raw_message,
             )
             if challenge_match:
                 job["challenge_ref"] = challenge_match.group(1)
                 job["payment_phase"] = "charged"
                 job["charge_started_at"] = job.get("charge_started_at") or _now_iso()
-            elif "Step 9: charge" in str(message or ""):
+            elif "Step 9: charge" in raw_message:
                 job["payment_phase"] = "charge_started"
                 job["charge_started_at"] = job.get("charge_started_at") or _now_iso()
-            job.setdefault("logs", []).append({"at": _now_iso(), "message": message})
-            job["message"] = message
+            safe_message = re.sub(
+                r"(?i)\b(linking reference|(?:linking|payment) challenge_id|charge challenge_ref)=([A-Za-z0-9_-]+)",
+                r"\1=[已隐藏]",
+                raw_message,
+            )
+            job.setdefault("logs", []).append({"at": _now_iso(), "message": safe_message})
+            job["message"] = safe_message
             job["updated_at"] = _now_iso()
             self._save_state_locked()
 
@@ -4083,10 +4384,7 @@ class _WebPaymentManager:
             job["_otp"] = []
             snap = str(job.get("snap_token") or "")
             if snap:
-                state = self._snap_states.setdefault(snap, {"snap": snap, "created_at": _now_iso()})
-                state["status"] = "waiting_otp"
-                state["updated_at"] = _now_iso()
-                self._save_snap_state_locked()
+                self._update_snap_state(snap, "waiting_otp", job_id=job_id)
             job["prompt"] = {
                 "label": "支付 OTP",
                 "phone": phone,
@@ -4365,8 +4663,20 @@ class _WebPaymentManager:
         proxy: str,
         payment_fingerprint: dict[str, Any] | None = None,
         midtrans_client_key: str = "",
+        inbox_claimed_at: str = "",
     ) -> None:
         snap = _extract_midtrans_snap_token(midtrans_url)
+        claim_stop, claim_lost, claim_thread = self._start_inbox_claim_heartbeat(
+            inbox_job_id,
+            inbox_claimed_at,
+        )
+
+        def ensure_claim_owned() -> None:
+            if claim_lost.is_set():
+                raise PaymentClaimLostError(
+                    "GoPay inbox claim ownership was lost; payment stopped"
+                )
+
         try:
             from opai.core.gopay_payment_protocol import GoPayFraudDenyError, GoPayPayment
 
@@ -4406,6 +4716,7 @@ class _WebPaymentManager:
                     log.debug("payment sms preparation failed", exc_info=True)
                     self._append_log(job_id, f"{('SMSPool' if sms_provider == 'smspool' else 'SMSBower')} 下一条验证码准备异常，仍可在网页手动输入")
             self._append_log(job_id, f"开始支付: {phone} -> {midtrans_url}")
+            ensure_claim_owned()
             self._update_snap_state(snap, "linking", job_id=job_id)
             payment = GoPayPayment(proxy=proxy, payment_fingerprint=payment_fingerprint)
 
@@ -4427,6 +4738,7 @@ class _WebPaymentManager:
                 self._append_log(job_id, f"CAPTCHA provider 配置读取失败，将在需要验证时提示: {exc}")
 
             def solve_captcha(challenge: dict[str, Any]) -> Any:
+                ensure_claim_owned()
                 self._set_captcha_state(job_id, "awaiting_captcha", challenge)
                 if captcha_provider is None:
                     self._set_captcha_state(job_id, "running")
@@ -4436,15 +4748,25 @@ class _WebPaymentManager:
                 finally:
                     self._set_captcha_state(job_id, "running")
 
+            def wait_payment_otp(otp_phone: str, timeout: int) -> str | None:
+                ensure_claim_owned()
+                return self._wait_otp(job_id, otp_phone, timeout)
+
+            def payment_progress(message: str) -> None:
+                ensure_claim_owned()
+                self._append_log(job_id, message)
+
+            ensure_claim_owned()
             result = payment.pay(
                 midtrans_url=midtrans_url,
                 phone=local_phone,
                 country_code="62",
                 pin=pin,
-                wait_otp=lambda otp_phone, timeout: self._wait_otp(job_id, otp_phone, timeout),
-                progress=lambda message: self._append_log(job_id, message),
+                wait_otp=wait_payment_otp,
+                progress=payment_progress,
                 midtrans_client_key=midtrans_client_key,
                 captcha_token_provider=solve_captcha,
+                before_charge=ensure_claim_owned,
             )
             if result.get("success"):
                 try:
@@ -4508,6 +4830,76 @@ class _WebPaymentManager:
                 job["prompt"] = None
                 job["updated_at"] = _now_iso()
                 self._save_state_locked()
+        except PaymentClaimLostError as exc:
+            # A newer worker may already own the inbox job.  Mark only this
+            # local payment attempt and never cancel or otherwise mutate the
+            # shared inbox row on behalf of a stale claimant.
+            with self._lock:
+                job = self._jobs.get(job_id)
+                charge_may_have_started = bool(
+                    job and self._job_charge_may_have_started(job)
+                )
+                snap_for_job = str((job or {}).get("snap_token") or snap)
+                phone_for_job = str((job or {}).get("phone") or phone)
+                if job:
+                    job["result"] = {
+                        "success": False,
+                        "detail": str(exc),
+                        "failure_label": "支付租约已丢失",
+                    }
+            if charge_may_have_started:
+                self._mark_recovery_unknown(
+                    job_id,
+                    "支付租约已丢失，扣款阶段状态需人工核对；已禁止重试",
+                )
+            else:
+                try:
+                    self._update_snap_state(
+                        snap_for_job,
+                        "failed",
+                        reason="inbox claim ownership lost before charge",
+                        job_id=job_id,
+                    )
+                except Exception:
+                    # The replacement worker may have taken over the Snap
+                    # journal too; ownership checks deliberately reject stale
+                    # updates in that case.
+                    log.warning(
+                        "Could not update stale Snap state after claim loss for %s",
+                        job_id,
+                        exc_info=True,
+                    )
+                try:
+                    _update_gopay_midtrans_binding_status(
+                        phone_for_job,
+                        "failed",
+                        message="支付租约已丢失，等待其他 worker 接管",
+                        job_id=job_id,
+                    )
+                except Exception:
+                    log.warning(
+                        "Could not update stale account binding after claim loss for %s",
+                        job_id,
+                        exc_info=True,
+                    )
+                with self._lock:
+                    job = self._jobs.get(job_id)
+                    if job:
+                        job["status"] = "failed"
+                        job["message"] = "支付租约已丢失，等待其他 worker 接管"
+                        job["prompt"] = None
+                        job["updated_at"] = _now_iso()
+                        job.setdefault("logs", []).append({
+                            "at": _now_iso(),
+                            "message": "支付租约已丢失，未取消 inbox 任务",
+                        })
+                        try:
+                            self._save_state_locked()
+                        except Exception:
+                            log.exception(
+                                "Could not persist claim-loss payment task %s",
+                                job_id,
+                            )
         except GoPayFraudDenyError as exc:
             label = _payment_failure_label(str(exc))
             log.exception("web payment fraud denied: %s", job_id)
@@ -4555,6 +4947,10 @@ class _WebPaymentManager:
                     job["prompt"] = None
                     job["updated_at"] = _now_iso()
                     self._save_state_locked()
+        finally:
+            claim_stop.set()
+            if claim_thread is not None:
+                claim_thread.join(timeout=1)
 
 
 class _AutoFlowManager:
@@ -5799,7 +6195,7 @@ def _midtrans_transaction_meta(
     except Exception:
         data = {"raw": getattr(resp, "text", "")}
     if resp.status_code != 200:
-        raise RuntimeError(f"Midtrans 链接信息读取失败: {resp.status_code} {str(data)[:300]}")
+        raise RuntimeError(f"Midtrans 链接信息读取失败: HTTP {resp.status_code}")
     details = data.get("transaction_details") if isinstance(data.get("transaction_details"), dict) else {}
     merchant = data.get("merchant") if isinstance(data.get("merchant"), dict) else {}
     accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else {}
@@ -7095,13 +7491,38 @@ class _InboxHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, j)
             return
-        # /api/jobs/<id>/claim — 网页用户点开支付链接前调用，TTL 内列表会隐藏此 job，
-        # 避免多人浏览面板同时点同一条 job。返回新写入的 ``claimed_at`` 时间。
+        # /api/jobs/<id>/claim — 网页用户点开支付链接前调用，或由 CLI
+        # worker 带上旧 token 做 CAS 心跳续租。首次 claim 也必须走带 TTL
+        # 条件的原子更新，不能覆盖其他 worker 的活动租约。
         if path.startswith("/api/jobs/") and path.endswith("/claim"):
             jid = path.split("/")[3]
-            j = store.patch(jid, {"claimed_at": _now_iso()})
+            data = self._read_json_body()
+            claimed_at = str(data.get("claimed_at") or "").strip()
+            if claimed_at:
+                renewed_at = store.renew_claim(jid, claimed_at=claimed_at)
+                if renewed_at is None:
+                    current = store.get(jid)
+                    if current is None:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                    else:
+                        self._send_json(HTTPStatus.CONFLICT, {"error": "claim_lost"})
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "id": jid,
+                        "claimed_at": renewed_at,
+                        "ttl_sec": self.server.claim_ttl_sec,
+                    },
+                )
+                return
+            j = store.claim_pending(jid, ttl_sec=self.server.claim_ttl_sec)
             if j is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                current = store.get(jid)
+                if current is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                else:
+                    self._send_json(HTTPStatus.CONFLICT, {"error": "claim_unavailable"})
                 return
             self._send_json(HTTPStatus.OK, {"id": j["id"], "claimed_at": j.get("claimed_at"),
                                             "ttl_sec": self.server.claim_ttl_sec})
@@ -7288,7 +7709,7 @@ class PaymentInboxClient:
         except Exception:
             data_out = {"raw": txt}
         if code >= 400:
-            raise RuntimeError(f"{method} {url} → HTTP {code}: {txt[:200]}")
+            raise RuntimeError(f"{method} {url} → HTTP {code}")
         return data_out
 
     def push_job(
@@ -7363,8 +7784,16 @@ class PaymentInboxClient:
     def mark_paid(self, job_id: str) -> dict[str, Any]:
         return self._req("PUT", f"/api/jobs/{job_id}/paid")
 
-    def claim_job(self, job_id: str) -> dict[str, Any]:
-        return self._req("PUT", f"/api/jobs/{job_id}/claim")
+    def claim_job(self, job_id: str, *, claimed_at: str = "") -> dict[str, Any]:
+        data = {"claimed_at": claimed_at} if claimed_at else None
+        return self._req("PUT", f"/api/jobs/{job_id}/claim", data=data)
+
+    def renew_claim(self, job_id: str, claimed_at: str) -> dict[str, Any]:
+        """Renew a job lease using the caller's current compare-and-swap token."""
+        token = str(claimed_at or "").strip()
+        if not token:
+            raise ValueError("claimed_at is required to renew a claim")
+        return self.claim_job(job_id, claimed_at=token)
 
     def _claim_next_one(self, *, prefer_paypal_url: bool, prefer_oldest: bool) -> dict[str, Any] | None:
         """一次原子 claim;无 pending 返 None,真错(网络/HTTP 5xx 等)log warning + 返 None。

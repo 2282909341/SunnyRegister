@@ -493,6 +493,42 @@ class CaptchaProviderError(RuntimeError):
     pass
 
 
+def _safe_provider_detail(value: Any) -> str:
+    """Keep provider diagnostics useful without exposing response payloads."""
+    candidate: Any = value
+    if isinstance(candidate, dict):
+        candidate = (
+            candidate.get("errorDescription")
+            or candidate.get("errorMessage")
+            or candidate.get("message")
+            or candidate.get("description")
+            or ""
+        )
+    text = str(candidate or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        text = str(
+            parsed.get("errorDescription")
+            or parsed.get("errorMessage")
+            or parsed.get("message")
+            or parsed.get("description")
+            or "provider response"
+        )
+    text = re.sub(r"(?i)\b(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[credentials-redacted]@", text)
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text)
+    text = re.sub(
+        r"(?i)([\"']?(?:api[\s_-]?key|client[\s_-]?key|access[\s_-]?token|token|secret|password|pin|otp|cookie|authorization|device[\s_-]?token|certify[\s_-]?id)[\"']?\s*[:=]\s*[\"']?)[^,}\s\"']+",
+        r"\1[redacted]",
+        text,
+    )
+    return text[:240]
+
+
 def _env_path() -> Path:
     configured = str(os.environ.get("OPAI_MIDTRANS_CAPTCHA_ENV_FILE") or "").strip()
     return Path(configured).expanduser() if configured else PROJECT_ROOT / "config" / "captcha.env"
@@ -649,14 +685,16 @@ def _post_json(url: str, payload: dict[str, Any], timeout: float = 30.0) -> dict
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        raise CaptchaProviderError(f"2Captcha HTTP {exc.code}: {raw[:300]}") from None
+        exc.read()
+        raise CaptchaProviderError(f"CAPTCHA provider HTTP {exc.code}") from None
     except urllib.error.URLError as exc:
-        raise CaptchaProviderError(f"2Captcha network error: {exc.reason}") from None
+        raise CaptchaProviderError(
+            f"CAPTCHA provider network error: {_safe_provider_detail(exc.reason)}"
+        ) from None
     try:
         result = json.loads(raw)
     except ValueError:
-        raise CaptchaProviderError(f"2Captcha returned non-JSON data: {raw[:300]}") from None
+        raise CaptchaProviderError("CAPTCHA provider returned non-JSON data") from None
     if not isinstance(result, dict):
         raise CaptchaProviderError("2Captcha returned an invalid response object")
     return result
@@ -698,23 +736,33 @@ def _legacy_request(
             if exc.code in retryable_http and network_attempt < 3:
                 time.sleep(float(network_attempt))
                 continue
-            raise CaptchaProviderError(f"2Captcha HTTP {exc.code}: {raw[:300]}") from None
+            raise CaptchaProviderError(f"2Captcha HTTP {exc.code}") from None
         except urllib.error.URLError as exc:
             if network_attempt < 3:
                 time.sleep(float(network_attempt))
                 continue
-            raise CaptchaProviderError(f"2Captcha network error: {exc.reason}") from None
+            raise CaptchaProviderError(
+                f"2Captcha network error: {_safe_provider_detail(exc.reason)}"
+            ) from None
     try:
         result = json.loads(raw)
     except ValueError:
-        raise CaptchaProviderError(f"2Captcha returned non-JSON data: {raw[:300]}") from None
+        raise CaptchaProviderError("2Captcha returned non-JSON data") from None
     if not isinstance(result, dict):
         raise CaptchaProviderError("2Captcha returned an invalid response object")
     return result
 
 
 def _legacy_error(response: dict[str, Any], stage: str) -> CaptchaProviderError:
-    code = str(response.get("request") or "unknown")
+    raw_code = str(response.get("request") or "").strip().upper()
+    # Legacy 2Captcha puts both short error codes and arbitrary provider text
+    # in ``request``.  Keep recognizable codes for retry decisions while
+    # collapsing payloads that could contain API keys or response secrets.
+    code = (
+        raw_code
+        if re.fullmatch(r"ERROR_[A-Z0-9_]{1,80}", raw_code)
+        else "PROVIDER_ERROR"
+    )
     if code.strip().upper() in UNSOLVABLE_PROVIDER_ERRORS:
         return CaptchaProviderError(
             "2Captcha "
@@ -726,7 +774,8 @@ def _legacy_error(response: dict[str, Any], stage: str) -> CaptchaProviderError:
 
 
 def _legacy_error_code(response: dict[str, Any]) -> str:
-    return str(response.get("request") or "").strip().upper()
+    raw_code = str(response.get("request") or "").strip().upper()
+    return raw_code if re.fullmatch(r"ERROR_[A-Z0-9_]{1,80}", raw_code) else "PROVIDER_ERROR"
 
 
 def _legacy_base_url(configured: str) -> str:
@@ -761,10 +810,16 @@ def _dynamic_js_url(value: Any) -> str:
     return f"https://g.alicdn.com/captcha-frontend/dynamicJS/{raw}.js"
 
 
-def _provider_error(response: dict[str, Any], stage: str) -> CaptchaProviderError:
+def _provider_error(
+    response: dict[str, Any],
+    stage: str,
+    *,
+    provider: str = "2Captcha",
+) -> CaptchaProviderError:
     code = str(response.get("errorCode") or response.get("errorId") or "unknown")
-    description = str(response.get("errorDescription") or response.get("errorMessage") or "provider error")
-    return CaptchaProviderError(f"2Captcha {stage} failed [{code}]: {description}")
+    description = _safe_provider_detail(response)
+    suffix = f": {description}" if description else ""
+    return CaptchaProviderError(f"{provider} {stage} failed [{code}]{suffix}")
 
 
 def _provider_error_code(response: dict[str, Any]) -> str:
@@ -1133,9 +1188,7 @@ def solve_alibaba_captcha_solverify(
         {"clientKey": api_key, "task": task},
     )
     if int(create.get("errorId") or 0) != 0 or not create.get("taskId"):
-        code = str(create.get("errorCode") or "ERROR_CREATE_TASK")
-        detail = str(create.get("errorDescription") or create.get("message") or "")
-        raise CaptchaProviderError(f"Solverify createTask failed [{code}]: {detail}".rstrip())
+        raise _provider_error(create, "createTask", provider="Solverify")
 
     task_id = str(create["taskId"])
     if progress:
@@ -1151,9 +1204,7 @@ def solve_alibaba_captcha_solverify(
         )
         status = str(result.get("status") or "").lower()
         if int(result.get("errorId") or 0) != 0:
-            code = str(result.get("errorCode") or "ERROR_TASK_FAILED")
-            detail = str(result.get("errorDescription") or result.get("message") or "")
-            raise CaptchaProviderError(f"Solverify task failed [{code}]: {detail}".rstrip())
+            raise _provider_error(result, "task", provider="Solverify")
         if status in {"processing", "queued", "pending"}:
             continue
         if status not in {"completed", "ready"}:
@@ -1206,7 +1257,7 @@ def solve_alibaba_captcha_official(
         {"clientKey": cfg["api_key"], "task": task},
     )
     if int(create.get("errorId") or 0) != 0 or not create.get("taskId"):
-        raise CaptchaProviderError(f"2Captcha official createTask failed: {create}")
+        raise _provider_error(create, "official createTask")
     task_id = str(create["taskId"])
     if progress:
         progress(f"CAPTCHA official task {task_id} submitted with current dynamicJS")
@@ -1222,7 +1273,7 @@ def solve_alibaba_captcha_official(
         if str(result.get("status") or "") != "ready":
             if str(result.get("errorCode") or "").upper() == "ERROR_CAPTCHA_UNSOLVABLE":
                 raise CaptchaProviderError("2Captcha official task returned ERROR_CAPTCHA_UNSOLVABLE")
-            raise CaptchaProviderError(f"2Captcha official result failed: {result}")
+            raise _provider_error(result, "official result")
         solution = result.get("solution") or {}
         tokens = _normalize_solution_tokens(solution.get("data") if isinstance(solution, dict) else solution)
         if not tokens:

@@ -10,9 +10,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
-from typing import Any, Collection
+from typing import Any, Callable, Collection
 
 import tls_client
 
@@ -22,6 +23,8 @@ SMSPOOL_DEFAULT_BASE_URL = "https://api.smspool.net"
 SMSPOOL_DEFAULT_COUNTRY = "9"
 SMSPOOL_DEFAULT_SERVICE = "392"
 SMSPOOL_TIMEOUT = 180
+SMSPOOL_CANCEL_RETRY_ATTEMPTS = 3
+SMSPOOL_CANCEL_RETRY_DELAY_SECONDS = 30.0
 
 
 def _load_env() -> None:
@@ -184,6 +187,78 @@ def smspool_cancel(order_id: str) -> bool:
     except Exception:
         log.debug("SMSPool cancel failed for %s", order_id, exc_info=True)
         return False
+
+
+def schedule_smspool_cancel_retry(
+    order_id: str,
+    *,
+    retry_attempts: int | None = None,
+    delay_seconds: float | None = None,
+    on_success: Callable[[], None] | None = None,
+) -> threading.Thread | None:
+    """Retry a failed cancellation without changing the single-call API."""
+    normalized_order_id = str(order_id or "").strip()
+    if not normalized_order_id:
+        return None
+
+    if retry_attempts is None:
+        raw_attempts = os.environ.get(
+            "OPAI_SMSPOOL_CANCEL_RETRY_ATTEMPTS",
+            str(SMSPOOL_CANCEL_RETRY_ATTEMPTS),
+        )
+        try:
+            retry_attempts = int(raw_attempts)
+        except (TypeError, ValueError):
+            retry_attempts = SMSPOOL_CANCEL_RETRY_ATTEMPTS
+    retry_attempts = max(0, min(int(retry_attempts), 20))
+    if retry_attempts == 0:
+        return None
+
+    if delay_seconds is None:
+        raw_delay = os.environ.get(
+            "OPAI_SMSPOOL_CANCEL_RETRY_DELAY_SEC",
+            str(SMSPOOL_CANCEL_RETRY_DELAY_SECONDS),
+        )
+        try:
+            delay_seconds = float(raw_delay)
+        except (TypeError, ValueError):
+            delay_seconds = SMSPOOL_CANCEL_RETRY_DELAY_SECONDS
+    delay_seconds = max(0.0, min(float(delay_seconds), 3600.0))
+
+    def retry() -> None:
+        for attempt in range(1, retry_attempts + 1):
+            if delay_seconds:
+                time.sleep(delay_seconds)
+            if not smspool_cancel(normalized_order_id):
+                continue
+            log.info(
+                "SMSPool cancellation retry succeeded for %s on attempt %d",
+                normalized_order_id,
+                attempt,
+            )
+            if on_success is not None:
+                try:
+                    on_success()
+                except Exception:
+                    log.warning(
+                        "SMSPool cancellation success callback failed for %s",
+                        normalized_order_id,
+                        exc_info=True,
+                    )
+            return
+        log.warning(
+            "SMSPool cancellation retries exhausted for %s after %d attempts",
+            normalized_order_id,
+            retry_attempts,
+        )
+
+    thread = threading.Thread(
+        target=retry,
+        daemon=True,
+        name=f"smspool-cancel-{normalized_order_id[:24]}",
+    )
+    thread.start()
+    return thread
 
 
 def smspool_activate(order_id: str) -> bool:

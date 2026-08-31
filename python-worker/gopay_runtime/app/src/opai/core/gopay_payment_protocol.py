@@ -616,6 +616,7 @@ class GoPayPayment:
         midtrans_client_key: str = "",
         captcha_token: str = "",
         captcha_token_provider: Callable[[dict[str, Any]], Any] | None = None,
+        before_charge: Callable[[], None] | None = None,
     ) -> dict:
         """
         执行完整的 GoPay 支付流程。
@@ -908,6 +909,11 @@ class GoPayPayment:
 
         # Step 9: charge
         note("Step 9: charge")
+        # Callers that coordinate a remote payment job can use this hook to
+        # perform a final lease/ownership check immediately before the
+        # irreversible charge request.
+        if before_charge is not None:
+            before_charge()
         charge = self._midtrans_post(f"/snap/v2/transactions/{snap}/charge", {
             "payment_type": "gopay",
             "tokenization": "true",

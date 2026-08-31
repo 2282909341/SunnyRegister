@@ -27,6 +27,163 @@ def _stub_tls_client(monkeypatch):
     monkeypatch.setitem(sys.modules, "tls_client", fake_tls_client)
 
 
+def test_claim_next_provider_filter_treats_provider_as_a_value(tmp_path):
+    payment_inbox = _payment_inbox_module()
+    store = payment_inbox.InboxStore(tmp_path / "payment_inbox.db")
+    job = store.create(
+        account_name="test",
+        account_email="test@example.com",
+        plan_kind="plus",
+        checkout_url="https://example.test/checkout",
+        provider="paypal",
+        provider_url="https://paypal.example.test/ba",
+    )
+
+    # An input containing SQL syntax must not broaden the provider predicate.
+    assert store.claim_next_pending(
+        provider="gopay' OR 1=1 --",
+        ttl_sec=3600,
+    ) is None
+    current = store.get(job["id"])
+    assert current and current["claimed_at"] == ""
+
+
+def test_browser_claim_is_atomic_and_respects_claim_ttl(tmp_path):
+    payment_inbox = _payment_inbox_module()
+    store = payment_inbox.InboxStore(tmp_path / "payment_inbox.db")
+    job = store.create(
+        account_name="test",
+        account_email="test@example.com",
+        plan_kind="plus",
+        checkout_url="https://example.test/checkout",
+        provider="gopay",
+        provider_url="https://app.midtrans.com/snap/v4/redirection/123e4567-e89b-12d3-a456-426614174000",
+    )
+
+    first = store.claim_pending(job["id"], ttl_sec=3600)
+    assert first and first["claimed_at"]
+    first_claim = first["claimed_at"]
+
+    # A live claim belongs to the first browser/worker and cannot be replaced.
+    assert store.claim_pending(job["id"], ttl_sec=3600) is None
+    assert store.get(job["id"])["claimed_at"] == first_claim
+
+    # Once the lease is expired, a new claimant may take it atomically.
+    store.patch(job["id"], {"claimed_at": "2000-01-01T00:00:00+00:00"})
+    replacement = store.claim_pending(job["id"], ttl_sec=3600)
+    assert replacement and replacement["claimed_at"] != "2000-01-01T00:00:00+00:00"
+
+
+def test_browser_claim_endpoint_returns_conflict_for_live_claim(tmp_path):
+    payment_inbox = _payment_inbox_module()
+    store = payment_inbox.InboxStore(tmp_path / "payment_inbox.db")
+    job = store.create(
+        account_name="test",
+        account_email="test@example.com",
+        plan_kind="plus",
+        checkout_url="https://example.test/checkout",
+        provider="gopay",
+        provider_url="https://app.midtrans.com/snap/v4/redirection/123e4567-e89b-12d3-a456-426614174000",
+    )
+    responses = []
+
+    def invoke_claim() -> None:
+        handler = object.__new__(payment_inbox._InboxHandler)
+        handler.path = f"/api/jobs/{job['id']}/claim"
+        handler.server = SimpleNamespace(store=store, claim_ttl_sec=3600.0)
+        handler._check_auth = lambda: True
+        handler._read_json_body = lambda: {}
+        handler._send_json = lambda code, data: responses.append((int(code), data))
+        handler.do_PUT()
+
+    invoke_claim()
+    invoke_claim()
+
+    assert responses[0][0] == 200
+    assert responses[1] == (409, {"error": "claim_unavailable"})
+
+
+def test_web_claim_loss_does_not_cancel_shared_inbox_job(monkeypatch):
+    payment_inbox = _payment_inbox_module()
+    job_id = "claim-loss-payment"
+    phone = "+628123456789"
+    snap = "123e4567-e89b-12d3-a456-426614174000"
+    url = f"https://app.midtrans.com/snap/v4/redirection/{snap}"
+
+    class FakeStore:
+        def __init__(self):
+            self.statuses = []
+
+        def set_status_if_pending(self, requested_id, status):
+            self.statuses.append((requested_id, status))
+            return {"id": requested_id, "status": status}
+
+    class FakePayment:
+        def __init__(self, **_kwargs):
+            raise AssertionError("payment must stop after claim loss")
+
+    fake_protocol = ModuleType("opai.core.gopay_payment_protocol")
+    fake_protocol.GoPayFraudDenyError = type("GoPayFraudDenyError", (Exception,), {})
+    fake_protocol.GoPayPayment = FakePayment
+    monkeypatch.setitem(sys.modules, "opai.core.gopay_payment_protocol", fake_protocol)
+    monkeypatch.setattr(
+        payment_inbox,
+        "_find_gopay_account",
+        lambda _phone: ({"phone": phone, "sms_provider": "smsbower"}, 0),
+    )
+    monkeypatch.setattr(
+        payment_inbox,
+        "_preflight_gopay_proxy",
+        lambda _proxy: {"ok": True, "ip": "127.0.0.1"},
+    )
+    monkeypatch.setattr(
+        payment_inbox,
+        "_update_gopay_midtrans_binding_status",
+        lambda *_args, **_kwargs: True,
+    )
+
+    claim_lost = threading.Event()
+    claim_lost.set()
+    manager = object.__new__(payment_inbox._WebPaymentManager)
+    manager._store = FakeStore()
+    manager._lock = threading.RLock()
+    manager._jobs = {
+        job_id: {
+            "id": job_id,
+            "phone": phone,
+            "status": "running",
+            "prompt": None,
+            "logs": [],
+            "snap_token": snap,
+        }
+    }
+    manager._snap_states = {}
+    manager._save_state_locked = lambda: None
+    snap_updates = []
+    manager._update_snap_state = lambda _snap, status, **_kwargs: snap_updates.append(status)
+    manager._start_inbox_claim_heartbeat = lambda *_args: (
+        threading.Event(), claim_lost, None
+    )
+
+    manager._run(
+        job_id=job_id,
+        phone=phone,
+        local="8123456789",
+        pin="123456",
+        midtrans_url=url,
+        inbox_job_id="inbox-job",
+        inbox_claimed_at="2026-08-31T00:00:00+00:00",
+        proxy="",
+        payment_fingerprint={"profile_id": "test-profile"},
+        midtrans_client_key="client-key",
+    )
+
+    assert manager._jobs[job_id]["status"] == "failed"
+    assert "租约" in manager._jobs[job_id]["message"]
+    assert manager._store.statuses == []
+    assert snap_updates == ["failed"]
+
+
 def test_payment_task_state_path_uses_persistent_override(monkeypatch, tmp_path):
     payment_inbox = _payment_inbox_module()
     state_path = tmp_path / "gopay" / "payment_tasks.json"
@@ -103,6 +260,29 @@ def test_inbox_release_claim_is_compare_and_swap(tmp_path):
 
     released = store.release_claim(job["id"], claimed_at=newer_claim)
     assert released and released["claimed_at"] == ""
+
+
+def test_inbox_renew_claim_is_compare_and_swap(tmp_path):
+    payment_inbox = _payment_inbox_module()
+    store = payment_inbox.InboxStore(tmp_path / "payment_inbox.db")
+    job = store.create(
+        account_name="test",
+        account_email="test@example.com",
+        plan_kind="plus",
+        checkout_url="https://example.test/checkout",
+        provider="gopay",
+        provider_url="https://app.midtrans.com/snap/v4/redirection/123e4567-e89b-12d3-a456-426614174000",
+    )
+    claimed = store.claim_next_pending(provider="gopay", ttl_sec=3600)
+    assert claimed and claimed["id"] == job["id"]
+    original_claim = str(claimed["claimed_at"])
+
+    renewed = store.renew_claim(job["id"], claimed_at=original_claim)
+    assert renewed and renewed != original_claim
+    assert store.renew_claim(job["id"], claimed_at=original_claim) is None
+
+    store.patch(job["id"], {"claimed_at": "2099-01-01T00:00:00+00:00"})
+    assert store.renew_claim(job["id"], claimed_at=renewed) is None
 
 
 def test_claim_start_failure_releases_inbox_claim(monkeypatch):

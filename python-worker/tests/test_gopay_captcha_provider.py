@@ -464,6 +464,120 @@ def test_solverify_requests_use_fixed_official_endpoint(
     ]
 
 
+@pytest.mark.parametrize(
+    ("solver", "responses"),
+    [
+        (
+            "solverify",
+            [{
+                "errorId": 1,
+                "errorCode": "ERROR_BAD_REQUEST",
+                "errorDescription": "API key=solver-secret token=solver-token",
+                "request": {"clientKey": "solver-secret"},
+            }],
+        ),
+        (
+            "2captcha",
+            [{
+                "errorId": 1,
+                "errorCode": "ERROR_BAD_REQUEST",
+                "errorDescription": "Bearer provider-secret",
+                "request": {"clientKey": "two-secret"},
+            }],
+        ),
+    ],
+)
+def test_json_provider_create_errors_do_not_expose_response_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    solver: str,
+    responses: list[dict[str, Any]],
+) -> None:
+    monkeypatch.setattr(
+        captcha_provider,
+        "load_captcha_config",
+        lambda: _config(
+            solverify_api_key="solver-secret",
+            api_key="two-secret",
+        ),
+    )
+    monkeypatch.setattr(captcha_provider, "_post_json", lambda *_args, **_kwargs: responses.pop(0))
+
+    challenge = {
+        "website_url": "https://app.midtrans.com/snap/v4/redirection/token",
+        "scene_id": "scene",
+        "prefix": "prefix",
+        "region": "sgp",
+        "api_get_lib": "https://g.alicdn.com/captcha-frontend/dynamicJS/current.js",
+        "solver_proxy": {"server": "https://proxy.example:443"},
+    }
+    solve = (
+        captcha_provider.solve_alibaba_captcha_solverify
+        if solver == "solverify"
+        else captcha_provider.solve_alibaba_captcha_official
+    )
+
+    with pytest.raises(captcha_provider.CaptchaProviderError) as raised:
+        solve(challenge)
+
+    message = str(raised.value)
+    assert "ERROR_BAD_REQUEST" in message
+    assert "solver-secret" not in message
+    assert "solver-token" not in message
+    assert "provider-secret" not in message
+    assert "two-secret" not in message
+    assert "[redacted]" in message
+
+
+@pytest.mark.parametrize("solver", ["solverify", "2captcha"])
+def test_json_provider_poll_errors_do_not_expose_response_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    solver: str,
+) -> None:
+    responses = iter([
+        {"errorId": 0, "taskId": "task-id"},
+        {
+            "errorId": 1,
+            "errorCode": "ERROR_TASK_FAILED",
+            "message": "password=provider-password",
+            "solution": {"token": "completed-secret"},
+        },
+    ])
+    monkeypatch.setattr(
+        captcha_provider,
+        "load_captcha_config",
+        lambda: _config(
+            solverify_api_key="solver-secret",
+            api_key="two-secret",
+            poll_sec="1",
+            solverify_poll_sec="1",
+        ),
+    )
+    monkeypatch.setattr(captcha_provider.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(captcha_provider, "_post_json", lambda *_args, **_kwargs: next(responses))
+    challenge = {
+        "website_url": "https://app.midtrans.com/snap/v4/redirection/token",
+        "scene_id": "scene",
+        "prefix": "prefix",
+        "region": "sgp",
+        "api_get_lib": "https://g.alicdn.com/captcha-frontend/dynamicJS/current.js",
+        "solver_proxy": {"server": "https://proxy.example:443"},
+    }
+    solve = (
+        captcha_provider.solve_alibaba_captcha_solverify
+        if solver == "solverify"
+        else captcha_provider.solve_alibaba_captcha_official
+    )
+
+    with pytest.raises(captcha_provider.CaptchaProviderError) as raised:
+        solve(challenge)
+
+    message = str(raised.value)
+    assert "ERROR_TASK_FAILED" in message
+    assert "provider-password" not in message
+    assert "completed-secret" not in message
+    assert "[redacted]" in message
+
+
 def test_recursive_tokens_and_provider_specific_timeout_budget() -> None:
     assert captcha_provider._normalize_solution_tokens(
         {"result": {"solution": {"data": {"tokens": TOKENS}}}}
