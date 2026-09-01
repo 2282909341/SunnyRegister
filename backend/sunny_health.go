@@ -229,6 +229,19 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 			subjects, fetchErr = fetchXbovoMailSubjects(candidate.Email, candidate.AccessKey, 5, proxyURL)
 		} else if candidate.MailboxType == "apple" && candidate.Channel == "url_api" {
 			subjects, fetchErr = fetchURLAPIMailSubjects(candidate.Email, candidate.AccessKey, 5, proxyURL)
+		} else if candidate.MailboxType == "domain" {
+			var latest map[string]any
+			latest, fetchErr = s.domainMailLatestMail(candidate.AccessKey, candidate.Email, 5)
+			if fetchErr == nil {
+				subjects = []string{text(latest["subject"]), text(latest["body"])}
+				if rawItems, ok := latest["items"].([]map[string]any); ok && len(rawItems) > 0 {
+					subjects = append(subjects, text(rawItems[0]["subject"]), text(rawItems[0]["body"]), text(rawItems[0]["body_preview"]))
+				} else if rawItems, ok := latest["items"].([]any); ok && len(rawItems) > 0 {
+					if item, itemOK := rawItems[0].(map[string]any); itemOK {
+						subjects = append(subjects, text(item["subject"]), text(item["body"]), text(item["body_preview"]))
+					}
+				}
+			}
 		} else if strings.TrimSpace(proxyURL) != "" {
 			var token string
 			for _, endpoint := range hotmailGraphTokenEndpoints {
