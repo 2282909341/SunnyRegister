@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -313,6 +313,45 @@ def _emit_registration_progress(
     )
 
 
+_MOMO_METHOD_ALIASES = {
+    "credit_card": "card", "cards": "card", "paypal_express": "paypal",
+    "gcash_wallet": "gcash", "kakao": "kakao_pay", "kakaopay": "kakao_pay",
+    "nice_pay": "nicepay", "ideal_bank": "ideal", "momo_wallet": "momo",
+    "twint_wallet": "twint", "pix_qr": "pix", "upi_collect": "upi", "go_pay": "gopay",
+    "pay_now": "paynow", "grab_pay": "grabpay", "prompt_pay": "promptpay",
+    "pay_pay": "paypay", "przelewy24": "p24", "mbway": "mb_way",
+}
+_MOMO_METHOD_PRIORITY = {
+    "paypal": 0, "card": 1, "link": 2, "gcash": 3, "gopay": 4,
+    "kakao_pay": 5, "nicepay": 6, "ideal": 7, "momo": 8, "twint": 9,
+    "pix": 10, "upi": 11, "paynow": 12, "grabpay": 13, "fpx": 14,
+    "promptpay": 15, "paypay": 16, "konbini": 17, "boleto": 18,
+    "blik": 19, "p24": 20, "mb_way": 21,
+}
+
+
+def _normalize_payment_methods(values) -> list[str]:
+    """复刻 backend normalizeSunnyPaymentMethods，保持与手动探测一致的 methods 数组。"""
+    seen: set[str] = set()
+    methods: list[str] = []
+    for value in values or []:
+        method = str(value or "").strip().lower()
+        for prefix in ("cpmt_", "payment_method_"):
+            if method.startswith(prefix):
+                method = method[len(prefix):]
+        method = method.replace("-", "_").replace(" ", "_")
+        method = _MOMO_METHOD_ALIASES.get(method, method)
+        if len(method) > 64:
+            continue
+        if not re.fullmatch(r"[a-z0-9_]+", method):
+            continue
+        if method not in seen:
+            seen.add(method)
+            methods.append(method)
+    methods.sort(key=lambda m: (_MOMO_METHOD_PRIORITY.get(m, 99), m))
+    return methods
+
+
 def _probe_momo_promo_after_register(db: SunnyDB, email: str, access_token: str, proxy_url: str) -> None:
     """注册成功后自动探测 0 元 MoMo（越南 VN/VND 促销），结果写回 sunny_accounts。"""
     if not email or not access_token:
@@ -321,8 +360,8 @@ def _probe_momo_promo_after_register(db: SunnyDB, email: str, access_token: str,
 
     outcome = probe_momo_promo(access_token, proxy_url, "VN", "VND")
     checkout = outcome.get("checkout") or {}
-    methods = [str(m).lower() for m in (checkout.get("payment_methods") or [])]
-    has_momo = any("momo" in m for m in methods)
+    methods = _normalize_payment_methods(checkout.get("payment_methods"))
+    has_momo = "momo" in methods
     discounted = bool(checkout.get("momo_discounted"))
     if discounted and has_momo:
         status = "supported"
@@ -336,10 +375,26 @@ def _probe_momo_promo_after_register(db: SunnyDB, email: str, access_token: str,
     http_status = checkout.get("http")
     if error_text and http_status not in (None, 200):
         status = "unknown"
-    db.save_momo_promo_result(email, status, json.dumps(outcome, ensure_ascii=False), error_text)
+    # 与 backend 手动探测写库结构一致：顶层 flat detail（methods 为归一化数组），
+    # 供前端 MomoPromoBadge 悬停展示 amount/currency/methods。
+    detail: dict[str, Any] = {
+        "kind": str(checkout.get("kind") or ""),
+        "methods": methods,
+        "momo_discounted": discounted,
+        "status": status,
+        "http": http_status if http_status is not None else 0,
+        "error": error_text,
+    }
+    amount = checkout.get("amount")
+    if amount is not None:
+        detail["amount"] = amount
+    currency = str(checkout.get("currency") or "").upper()
+    if currency:
+        detail["currency"] = currency
+    db.save_momo_promo_result(email, status, json.dumps(detail, ensure_ascii=False), error_text)
     db.event(
         f"[{email}] [0元MoMo] 注册后自动探测完成：{status}" + (f"（{error_text}）" if error_text else ""),
-        detail={"email": email, "scope": "selected", "momo_promo_status": status, "checkout": checkout},
+        detail={"email": email, "scope": "selected", "momo_promo_status": status, "checkout": detail},
     )
 
 
