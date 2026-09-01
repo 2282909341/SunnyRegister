@@ -3145,7 +3145,7 @@ def require_gopay_midtrans_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 _MOMO_AUTHORIZE_PATH_RE = re.compile(
-    r"^/authorize/acct_[A-Za-z0-9]+/sa_nonce_[A-Za-z0-9]+/?$",
+    r"^/authorize/acct_[A-Za-z0-9]+/(?:pa|sa)_nonce_[A-Za-z0-9]+/?$",
     re.IGNORECASE,
 )
 

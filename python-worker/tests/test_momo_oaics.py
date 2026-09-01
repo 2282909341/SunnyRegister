@@ -70,12 +70,31 @@ def test_momo_authorization_url_accepts_expected_stripe_handoff() -> None:
     assert checkout_app.momo_authorization_url({"next_action": {"url": url}}) == url
 
 
+def test_momo_authorization_url_accepts_har_observed_payment_action_nonce() -> None:
+    url = (
+        "https://pm-redirects.stripe.com/authorize/"
+        "acct_1HOrSwC6h1nxGoI3/pa_nonce_VB99UramZf155SBdCjUYH0N18NB1KSw"
+    )
+    confirm_payload = {
+        "status": "success",
+        "setup_intent": {
+            "next_action": {"redirect_to_url": {"url": url}},
+        },
+    }
+
+    assert checkout_app.is_valid_momo_authorization_url(url)
+    assert checkout_app.momo_authorization_url(confirm_payload) == url
+
+
 def test_momo_authorization_url_rejects_checkout_and_other_provider_urls() -> None:
     assert not checkout_app.is_valid_momo_authorization_url(
         "https://chatgpt.com/checkout/openai_ie/oaics_example"
     )
     assert not checkout_app.is_valid_momo_authorization_url(
         "https://pm-redirects.stripe.com/authorize/acct_test/not_a_nonce"
+    )
+    assert not checkout_app.is_valid_momo_authorization_url(
+        "https://pm-redirects.stripe.com/authorize/acct_test/xa_nonce_unexpected"
     )
 
 
