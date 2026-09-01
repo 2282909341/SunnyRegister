@@ -5723,6 +5723,15 @@ func (s *Server) sunnyPrepareAddLSTask(accountIDs []uint) ([]uint, []map[string]
 }
 
 func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) == 2 && parts[0] == "register" && parts[1] == "countries" && r.Method == http.MethodGet {
+		groups, err := s.sunnyRegisterProxyGroups()
+		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"countries": sunnyRegisterProxyCountryList(groups)})
+		return
+	}
 	if len(parts) != 1 || r.Method != http.MethodPost {
 		writeError(w, 404, "not found")
 		return
@@ -5833,6 +5842,14 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 		total = intValue(body["count"], 1)
 	}
 	body = s.sunnyTaskProxySnapshot(body)
+	if typ == "sunny_register" {
+		nextBody, err := s.sunnyApplyCountriesToProxyPool(body, s.sunnyRegisterProxyPoolForCountries)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		body = nextBody
+	}
 	task := s.createTask(typ, "sunny", body, total)
 	writeJSON(w, 200, serializeTask(task))
 }
