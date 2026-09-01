@@ -288,6 +288,10 @@ class SunnyDB:
                 "rebind_mailbox_api": "text DEFAULT ''",
                 "last_health_checked_at": "datetime",
                 "status_changed_at": "datetime",
+                "momo_promo_status": "text DEFAULT 'unknown'",
+                "momo_promo_result_json": "text DEFAULT '{}'",
+                "momo_promo_error": "text DEFAULT ''",
+                "momo_promo_probed_at": "datetime",
                 "created_at": "datetime",
                 "updated_at": "datetime",
             },
@@ -1488,6 +1492,16 @@ class SunnyDB:
         self.conn.execute(
             "update sunny_mailboxes set totp_secret=?, updated_at=? where id=?",
             (secret, now_sql(), mailbox_id),
+        )
+        self.conn.commit()
+
+    def save_momo_promo_result(self, email: str, status: str, result_json: str, error: str = "") -> None:
+        email = str(email or "").strip()
+        if not email:
+            return
+        self.conn.execute(
+            "update sunny_accounts set momo_promo_status=?,momo_promo_result_json=?,momo_promo_error=?,momo_promo_probed_at=?,updated_at=? where lower(trim(email))=lower(trim(?))",
+            (str(status or "unknown"), str(result_json or "{}"), str(error or "")[:1000], now_sql(), now_sql(), email),
         )
         self.conn.commit()
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -310,6 +310,36 @@ def _emit_registration_progress(
             "state": state,
             "error": str(error or "")[:500],
         },
+    )
+
+
+def _probe_momo_promo_after_register(db: SunnyDB, email: str, access_token: str, proxy_url: str) -> None:
+    """注册成功后自动探测 0 元 MoMo（越南 VN/VND 促销），结果写回 sunny_accounts。"""
+    if not email or not access_token:
+        return
+    from .commerce_probe import probe_momo_promo
+
+    outcome = probe_momo_promo(access_token, proxy_url, "VN", "VND")
+    checkout = outcome.get("checkout") or {}
+    methods = [str(m).lower() for m in (checkout.get("payment_methods") or [])]
+    has_momo = any("momo" in m for m in methods)
+    discounted = bool(checkout.get("momo_discounted"))
+    if discounted and has_momo:
+        status = "supported"
+    elif discounted:
+        status = "promo_only"
+    elif has_momo:
+        status = "momo_only"
+    else:
+        status = "unsupported"
+    error_text = str(checkout.get("error") or "").strip()
+    http_status = checkout.get("http")
+    if error_text and http_status not in (None, 200):
+        status = "unknown"
+    db.save_momo_promo_result(email, status, json.dumps(outcome, ensure_ascii=False), error_text)
+    db.event(
+        f"[{email}] [0元MoMo] 注册后自动探测完成：{status}" + (f"（{error_text}）" if error_text else ""),
+        detail={"email": email, "scope": "selected", "momo_promo_status": status, "checkout": checkout},
     )
 
 
@@ -1628,6 +1658,8 @@ def _run_one_impl(
         return False, message
     stage = _stage(payload)
     setup_login_secret_enabled = payload.get("setup_login_secret") is True
+    probe_momo_after_register = payload.get("probe_momo_promo") is True
+    login_secret_retried = False
     explicit_rt_acquire = task_type == "sunny_acquire_rt"
     _emit_registration_progress(db, str(email), stage, "initializing", setup_login_secret=setup_login_secret_enabled)
     try:
@@ -2417,6 +2449,51 @@ def _run_one_impl(
             # base registration result, but mark the task progress partial when
             # either password or TOTP setup did not finish.
             base_stage_complete = bool(result.get("stage_complete"))
+            if (
+                setup_login_secret_enabled
+                and not login_secret_result.get("complete")
+                and not login_secret_retried
+            ):
+                # 严格模式：勾选"添加密码+2FA"后必须设置成功，未完成时自动重试一次
+                login_secret_retried = True
+                db.event(
+                    f"[{email}] [登录密钥] 密码与 2FA 未全部完成，严格模式自动重试一次",
+                    "warning",
+                    detail={"email": email, "scope": "selected", "login_secret_retry": True},
+                )
+                try:
+                    retried_result = setup_login_secret(
+                        account,
+                        session,
+                        proxies["register"],
+                        lambda m: db.event(m, detail={"email": email, "scope": "selected"}),
+                        should_cancel=db.cancel_requested,
+                        mailbox_proxy_url=mailbox_proxy_url,
+                        traffic_meter=traffic_meter,
+                        recent_email_code=recent_email_code,
+                        recent_email_code_at=recent_email_code_at,
+                        on_credential_saved=save_login_secret_credential,
+                        on_session_saved=save_login_secret_session,
+                        on_progress=lambda checkpoint: _emit_registration_progress(
+                            db, str(email), stage, checkpoint, setup_login_secret=True,
+                        ),
+                    )
+                    _raise_if_login_secret_account_deactivated(retried_result)
+                    if retried_result.get("password_added"):
+                        db.save_chatgpt_password(mailbox_id, str(retried_result.get("password") or ""))
+                    if retried_result.get("totp_added"):
+                        db.save_totp_secret(mailbox_id, str(retried_result.get("totp_secret") or ""))
+                    if isinstance(retried_result.get("session"), dict):
+                        session = retried_result["session"]
+                    login_secret_result = retried_result
+                except Exception as exc:
+                    if _is_cancel_exception(exc):
+                        raise
+                    if _is_account_deactivated(exc):
+                        raise
+                    retry_errors = list(login_secret_result.get("errors") or [])
+                    retry_errors.append(f"自动重试失败: {exc}")
+                    login_secret_result = {**login_secret_result, "complete": False, "errors": retry_errors}
             result["stage_complete"] = bool(result.get("stage_complete") and login_secret_result.get("complete"))
         elif setup_login_secret_enabled:
             result["stage_complete"] = False
@@ -2447,6 +2524,42 @@ def _run_one_impl(
             setup_login_secret=setup_login_secret_enabled,
         )
         result["proxy_traffic"] = finalize_traffic(True)
+        registered_access_token = str(session.get("access_token") or "").strip()
+        if probe_momo_after_register and registered_access_token:
+            # 勾选"注册后检测0元MoMo"：注册成功后立即探测并写回 sunny_accounts
+            try:
+                _probe_momo_promo_after_register(
+                    db,
+                    str(identity_email),
+                    registered_access_token,
+                    str(proxies.get("register") or ""),
+                )
+            except Exception as exc:
+                if _is_cancel_exception(exc):
+                    raise
+                db.event(
+                    f"[{email}] [0元MoMo] 注册后自动探测失败: {exc}",
+                    "warning",
+                    detail={"email": email, "scope": "selected"},
+                )
+        if (
+            setup_login_secret_enabled
+            and base_stage_complete
+            and (login_secret_result is None or not login_secret_result.get("complete"))
+        ):
+            # 严格执行：注册主体成功但勾选"添加密码+2FA"未完成 → 任务失败，
+            # 账号保留已注册状态可重试补设；注册主体本身失败则保留原有失败原因
+            ls_errors = list((login_secret_result or {}).get("errors") or []) if isinstance(login_secret_result, dict) else []
+            ls_error = "；".join(ls_errors[:3]) if ls_errors else "密码与 2FA 未全部完成"
+            err = f"添加密码与2FA未完成: {ls_error}"
+            db.upsert_account(identity_email, mailbox_id=mailbox_id, status=_account_status_for_mailbox(mailbox_status), last_error=err)
+            db.mark_mailbox(mailbox_id, mailbox_status, err, openai_rt=rt_value)
+            db.event(
+                f"[{email}] [登录密钥] 严格执行：{err}（账号保留为{mailbox_status}，可重试补设）",
+                "error",
+                detail={"email": email, "scope": "selected", "login_secret_strict_failed": True, "completed_status": mailbox_status},
+            )
+            return False, err
         return True, result
     except Exception as exc:
         if _is_cancel_exception(exc):
