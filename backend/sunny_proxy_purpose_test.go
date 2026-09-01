@@ -125,3 +125,24 @@ func TestSunnyCommerceProxyURLPrefersCheckoutCountryAndPurpose(t *testing.T) {
 		t.Fatalf("register proxy=%q", got)
 	}
 }
+
+func TestSunnyCommerceProbeRouteMatchesFallbackProxyCountry(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&SunnyProxy{}); err != nil {
+		t.Fatal(err)
+	}
+	proxy := SunnyProxy{Address: "http://commerce-vn.example:8080", Country: "VN", PurposeTags: "commerce", Status: "enabled", Enabled: true, LastCheckOK: true}
+	if err := db.Create(&proxy).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUNNY_CHECKOUT_COUNTRY", "US")
+	t.Setenv("SUNNY_CHECKOUT_CURRENCY", "USD")
+	server := &Server{db: db}
+	address, country, currency := server.sunnyCommerceProbeRoute("account@example.com")
+	if address != proxy.Address || country != "VN" || currency != "VND" {
+		t.Fatalf("route=%q %s/%s", address, country, currency)
+	}
+}

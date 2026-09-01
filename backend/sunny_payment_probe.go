@@ -15,7 +15,11 @@ import (
 	"time"
 )
 
-const sunnyPaymentProbeTaskType = "sunny_account_payment_probe"
+const (
+	sunnyPaymentProbeTaskType      = "sunny_account_payment_probe"
+	sunnyPaymentProbeModeMethods   = "methods"
+	sunnyPaymentProbeModeMomoPromo = "momo_promo"
+)
 
 type sunnyPaymentProbeCandidate struct {
 	SessionID   uint
@@ -27,14 +31,18 @@ type sunnyPaymentProbeCandidate struct {
 }
 
 type sunnyPaymentCountryProbe struct {
-	Country      string
-	Methods      []string
-	ProxyID      uint
-	Attempts     int
-	HTTP         int
-	InvalidToken bool
-	Error        string
-	TrafficBytes int64
+	Country        string
+	Kind           string
+	Methods        []string
+	Amount         *int
+	Currency       string
+	MomoDiscounted bool
+	ProxyID        uint
+	Attempts       int
+	HTTP           int
+	InvalidToken   bool
+	Error          string
+	TrafficBytes   int64
 }
 
 type sunnyPaymentAccountProbe struct {
@@ -48,15 +56,41 @@ type sunnyPaymentAccountProbe struct {
 }
 
 type sunnyPaymentProbeResponse struct {
-	Kind         string
-	Methods      []string
-	HTTP         int
-	InvalidToken bool
-	Error        string
-	TrafficBytes int64
+	Kind           string
+	Methods        []string
+	Amount         *int
+	Currency       string
+	MomoDiscounted bool
+	HTTP           int
+	InvalidToken   bool
+	Error          string
+	TrafficBytes   int64
 }
 
 var sunnyProbePaymentMethods = probeSunnyPaymentMethods
+var sunnyProbeMomoPromo = probeSunnyMomoPromo
+
+func normalizeSunnyPaymentProbeMode(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), sunnyPaymentProbeModeMomoPromo) {
+		return sunnyPaymentProbeModeMomoPromo
+	}
+	return sunnyPaymentProbeModeMethods
+}
+
+func sunnyMomoPromoStatus(methods []string, amount *int, currency string) string {
+	hasMomo := containsString(normalizeSunnyPaymentMethods(methods), "momo")
+	discounted := amount != nil && *amount >= 0 && *amount <= 50 && strings.EqualFold(strings.TrimSpace(currency), "VND")
+	switch {
+	case discounted && hasMomo:
+		return "supported"
+	case discounted:
+		return "promo_only"
+	case hasMomo:
+		return "momo_only"
+	default:
+		return "unsupported"
+	}
+}
 
 func normalizeSunnyPaymentMethod(value string) string {
 	method := strings.ToLower(strings.TrimSpace(value))
@@ -122,6 +156,15 @@ func normalizeSunnyPaymentMethodFilter(value string) []string {
 	}))
 }
 
+func normalizeSunnyMomoPromoStatus(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "supported", "promo_only", "momo_only", "unsupported", "unknown":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
 func normalizeSunnyLoginSecretFilter(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "present", "has", "1", "true", "有", "有ls":
@@ -171,13 +214,25 @@ func probeSunnyPaymentMethods(ctx context.Context, accessToken, country, currenc
 }
 
 func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country, currency, proxyURL string) (sunnyPaymentProbeResponse, bool) {
+	return probeSunnyPaymentViaWorker(ctx, "/probe-payment-methods", accessToken, country, currency, proxyURL)
+}
+
+func probeSunnyMomoPromo(ctx context.Context, accessToken, country, currency, proxyURL string) sunnyPaymentProbeResponse {
+	result, ok := probeSunnyPaymentViaWorker(ctx, "/probe-momo-promo", accessToken, country, currency, proxyURL)
+	if !ok {
+		result.Error = fallback(result.Error, "Python worker 优惠 MoMo 探测不可用")
+	}
+	return result
+}
+
+func probeSunnyPaymentViaWorker(ctx context.Context, endpoint, accessToken, country, currency, proxyURL string) (sunnyPaymentProbeResponse, bool) {
 	result := sunnyPaymentProbeResponse{}
 	workerURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PYTHON_WORKER_URL")), "/")
 	if workerURL == "" {
 		workerURL = "http://127.0.0.1:8765"
 	}
 	body, _ := json.Marshal(map[string]string{"access_token": accessToken, "proxy_url": proxyURL, "country": country, "currency": currency})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, workerURL+"/probe-payment-methods", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, workerURL+endpoint, bytes.NewReader(body))
 	if err != nil {
 		return result, false
 	}
@@ -198,6 +253,9 @@ func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country
 		Checkout struct {
 			Kind           string   `json:"kind"`
 			PaymentMethods []string `json:"payment_methods"`
+			Amount         *int     `json:"amount"`
+			Currency       string   `json:"currency"`
+			MomoDiscounted bool     `json:"momo_discounted"`
 			HTTP           int      `json:"http"`
 			Error          string   `json:"error"`
 		} `json:"checkout"`
@@ -210,6 +268,9 @@ func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country
 	}
 	result.Kind = normalizeSunnyCheckoutKind(payload.Checkout.Kind)
 	result.Methods = normalizeSunnyPaymentMethods(payload.Checkout.PaymentMethods)
+	result.Amount = payload.Checkout.Amount
+	result.Currency = strings.ToUpper(strings.TrimSpace(payload.Checkout.Currency))
+	result.MomoDiscounted = payload.Checkout.MomoDiscounted
 	result.HTTP = payload.Checkout.HTTP
 	result.InvalidToken = payload.Checkout.HTTP == http.StatusUnauthorized
 	result.Error = strings.TrimSpace(payload.Checkout.Error)
@@ -346,11 +407,15 @@ func (s *Server) createSunnyPaymentProbeTask(body map[string]any) (Task, error) 
 	if err != nil {
 		return Task{}, err
 	}
+	mode := normalizeSunnyPaymentProbeMode(text(body["mode"]))
+	requestedCountries := []string{"VN"}
 	rawCountries, exists := body["countries"]
-	if !exists {
-		return Task{}, fmt.Errorf("请至少选择一个支付探测国家")
+	if mode == sunnyPaymentProbeModeMethods {
+		if !exists {
+			return Task{}, fmt.Errorf("请至少选择一个支付探测国家")
+		}
+		requestedCountries = stringSlice(rawCountries)
 	}
-	requestedCountries := stringSlice(rawCountries)
 	_, countries, err := selectSunnyPaymentProxyGroups(groups, requestedCountries)
 	if err != nil {
 		return Task{}, err
@@ -365,7 +430,7 @@ func (s *Server) createSunnyPaymentProbeTask(body map[string]any) (Task, error) 
 			skipped = append(skipped, candidate.SessionID)
 		}
 	}
-	payload := map[string]any{"session_ids": ids, "skip_session_ids": skipped, "countries": countries}
+	payload := map[string]any{"session_ids": ids, "skip_session_ids": skipped, "countries": countries, "mode": mode}
 	return s.createTask(sunnyPaymentProbeTaskType, "sunny", payload, len(candidates)), nil
 }
 
@@ -376,10 +441,14 @@ func shuffledSunnyProxies(proxies []SunnyProxy) []SunnyProxy {
 }
 
 func (s *Server) probeSunnyPaymentCountry(candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy) sunnyPaymentCountryProbe {
-	return s.probeSunnyPaymentCountryContext(context.Background(), candidate, country, proxies)
+	return s.probeSunnyPaymentCountryModeContext(context.Background(), candidate, country, proxies, sunnyPaymentProbeModeMethods)
 }
 
 func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy) sunnyPaymentCountryProbe {
+	return s.probeSunnyPaymentCountryModeContext(ctx, candidate, country, proxies, sunnyPaymentProbeModeMethods)
+}
+
+func (s *Server) probeSunnyPaymentCountryModeContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy, mode string) sunnyPaymentCountryProbe {
 	result := sunnyPaymentCountryProbe{Country: country}
 	currency := checkoutCountryCurrency[country]
 	if currency == "" {
@@ -394,10 +463,16 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 		probeCtx, cancel := context.WithTimeout(ctx, 105*time.Second)
 		meter := &sunnyTrafficMeter{}
 		probeCtx = withSunnyTrafficMeter(probeCtx, meter)
-		probed := sunnyProbePaymentMethods(probeCtx, candidate.AccessToken, country, currency, normalizeSunnyProxyAddress(proxy.Address))
+		var probed sunnyPaymentProbeResponse
+		if normalizeSunnyPaymentProbeMode(mode) == sunnyPaymentProbeModeMomoPromo {
+			probed = sunnyProbeMomoPromo(probeCtx, candidate.AccessToken, country, currency, normalizeSunnyProxyAddress(proxy.Address))
+		} else {
+			probed = sunnyProbePaymentMethods(probeCtx, candidate.AccessToken, country, currency, normalizeSunnyProxyAddress(proxy.Address))
+		}
 		cancel()
 		result.TrafficBytes += meter.totalBytes() + probed.TrafficBytes
 		result.ProxyID, result.HTTP, result.InvalidToken, result.Error = proxy.ID, probed.HTTP, probed.InvalidToken, probed.Error
+		result.Kind, result.Amount, result.Currency, result.MomoDiscounted = probed.Kind, probed.Amount, probed.Currency, probed.MomoDiscounted
 		if probed.InvalidToken {
 			return result
 		}
@@ -411,10 +486,14 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 }
 
 func (s *Server) probeSunnyPaymentAccount(candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy) sunnyPaymentAccountProbe {
-	return s.probeSunnyPaymentAccountContext(context.Background(), candidate, groups)
+	return s.probeSunnyPaymentAccountModeContext(context.Background(), candidate, groups, sunnyPaymentProbeModeMethods)
 }
 
 func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy) sunnyPaymentAccountProbe {
+	return s.probeSunnyPaymentAccountModeContext(ctx, candidate, groups, sunnyPaymentProbeModeMethods)
+}
+
+func (s *Server) probeSunnyPaymentAccountModeContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy, mode string) sunnyPaymentAccountProbe {
 	result := sunnyPaymentAccountProbe{Candidate: candidate, Countries: map[string]any{}}
 	if candidate.SkipReason != "" || candidate.Error != "" {
 		return result
@@ -425,12 +504,22 @@ func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate 
 	}
 	sort.Strings(countries)
 	probes := streamSunnyWorkerPoolContext(ctx, countries, s.sunnyPaymentCountryConcurrency(), func(country string) sunnyPaymentCountryProbe {
-		return s.probeSunnyPaymentCountryContext(ctx, candidate, country, groups[country])
+		return s.probeSunnyPaymentCountryModeContext(ctx, candidate, country, groups[country], mode)
 	})
 	allMethods := []string{}
 	for probe := range probes {
 		result.TrafficBytes += probe.TrafficBytes
-		detail := map[string]any{"methods": probe.Methods, "proxy_id": probe.ProxyID, "attempts": probe.Attempts, "http": probe.HTTP}
+		detail := map[string]any{"kind": probe.Kind, "methods": probe.Methods, "proxy_id": probe.ProxyID, "attempts": probe.Attempts, "http": probe.HTTP}
+		if probe.Amount != nil {
+			detail["amount"] = *probe.Amount
+		}
+		if probe.Currency != "" {
+			detail["currency"] = probe.Currency
+		}
+		if normalizeSunnyPaymentProbeMode(mode) == sunnyPaymentProbeModeMomoPromo {
+			detail["momo_discounted"] = probe.MomoDiscounted
+			detail["status"] = sunnyMomoPromoStatus(probe.Methods, probe.Amount, probe.Currency)
+		}
 		if probe.Error != "" {
 			detail["error"] = probe.Error
 			result.Errors = append(result.Errors, probe.Country+": "+probe.Error)
@@ -481,6 +570,25 @@ func mergeSunnyPaymentProbeResults(existingJSON string, current map[string]any) 
 	return merged, normalizeSunnyPaymentMethods(methods)
 }
 
+func sunnyPaymentProbeCheckoutKind(countries map[string]any) string {
+	for _, country := range sunnyPaymentProbeCountryListFromResults(countries) {
+		detail, _ := countries[country].(map[string]any)
+		if kind := normalizeSunnyCheckoutKind(text(detail["kind"])); kind != sunnyCheckoutUnknown {
+			return kind
+		}
+	}
+	return sunnyCheckoutUnknown
+}
+
+func sunnyPaymentProbeCountryListFromResults(results map[string]any) []string {
+	countries := make([]string, 0, len(results))
+	for country := range results {
+		countries = append(countries, country)
+	}
+	sort.Strings(countries)
+	return countries
+}
+
 func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any) {
 	task.Status = TaskRunning
 	task.StartedAt = sql.NullTime{Time: time.Now(), Valid: true}
@@ -508,9 +616,14 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		s.failSunnyPaymentProbeTask(task, err.Error())
 		return
 	}
+	mode := normalizeSunnyPaymentProbeMode(text(payload["mode"]))
 	selectedCountries := sunnyPaymentProbeCountryList(groups)
+	probeLabel := "支付方式"
+	if mode == sunnyPaymentProbeModeMomoPromo {
+		probeLabel = "0元 MoMo"
+	}
 	s.appendTaskEvent(task.ID,
-		fmt.Sprintf("账户支付方式探测开始：账户 %d 个，国家 %d 个（%s）", len(candidates), len(selectedCountries), strings.Join(selectedCountries, ", ")),
+		fmt.Sprintf("账户%s探测开始：账户 %d 个，国家 %d 个（%s）", probeLabel, len(candidates), len(selectedCountries), strings.Join(selectedCountries, ", ")),
 		"log", "info", map[string]any{
 			"scope": "global", "progress_type": "payment_probe", "current": 0, "total": len(candidates),
 			"countries": selectedCountries,
@@ -527,7 +640,7 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 	result := map[string]any{"requested": len(candidates), "detected": 0, "partial": 0, "skipped": 0, "failed": 0, "items": []any{}}
 	items := make([]any, 0, len(candidates))
 	outcomes := streamSunnyWorkerPoolContext(ctx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
-		return s.probeSunnyPaymentAccountContext(ctx, candidate, groups)
+		return s.probeSunnyPaymentAccountModeContext(ctx, candidate, groups, mode)
 	})
 	for outcome := range outcomes {
 		if ctx.Err() != nil {
@@ -547,10 +660,10 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 				methods := stringSlice(detail["methods"])
 				errorText := text(detail["error"])
 				level := "info"
-				message := fmt.Sprintf("[%s] [支付探测] %s 探测完成：%s（HTTP %d，代理 #%d，尝试 %d 次）", outcome.Candidate.Email, country, fallback(strings.Join(methods, ", "), "未识别支付方式"), intValue(detail["http"], 0), intValue(detail["proxy_id"], 0), intValue(detail["attempts"], 0))
+				message := fmt.Sprintf("[%s] [%s探测] %s 探测完成：%s（HTTP %d，代理 #%d，尝试 %d 次）", outcome.Candidate.Email, probeLabel, country, fallback(strings.Join(methods, ", "), "未识别支付方式"), intValue(detail["http"], 0), intValue(detail["proxy_id"], 0), intValue(detail["attempts"], 0))
 				if errorText != "" {
 					level = "warning"
-					message = fmt.Sprintf("[%s] [支付探测] %s 探测失败：%s（代理 #%d，尝试 %d 次）", outcome.Candidate.Email, country, errorText, intValue(detail["proxy_id"], 0), intValue(detail["attempts"], 0))
+					message = fmt.Sprintf("[%s] [%s探测] %s 探测失败：%s（代理 #%d，尝试 %d 次）", outcome.Candidate.Email, probeLabel, country, errorText, intValue(detail["proxy_id"], 0), intValue(detail["attempts"], 0))
 				}
 				s.appendAccountTaskEvent(task.ID, outcome.Candidate.Email, "payment", "payment_probe.country", message, level, map[string]any{
 					"session_id": outcome.Candidate.SessionID, "country": country, "methods": methods,
@@ -571,9 +684,13 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			item["status"], item["error"] = "failed", message
 			var account SunnyAccount
 			if queryErr := s.db.Where("email = ?", outcome.Candidate.Email).First(&account).Error; queryErr == nil {
-				mergedCountries, mergedMethods := mergeSunnyPaymentProbeResults(account.PaymentProbeResultsJSON, outcome.Countries)
-				item["payment_methods"] = mergedMethods
-				s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(map[string]any{"payment_methods_json": dumpJSON(mergedMethods), "payment_probe_methods_json": dumpJSON(mergedMethods), "payment_probe_results_json": dumpJSON(mergedCountries), "payment_probe_error": message})
+				if mode == sunnyPaymentProbeModeMomoPromo {
+					s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(map[string]any{"momo_promo_status": "unknown", "momo_promo_result_json": dumpJSON(outcome.Countries), "momo_promo_error": message})
+				} else {
+					mergedCountries, mergedMethods := mergeSunnyPaymentProbeResults(account.PaymentProbeResultsJSON, outcome.Countries)
+					item["payment_methods"] = mergedMethods
+					s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(map[string]any{"payment_methods_json": dumpJSON(mergedMethods), "payment_probe_methods_json": dumpJSON(mergedMethods), "payment_probe_results_json": dumpJSON(mergedCountries), "payment_probe_error": message})
+				}
 			}
 		default:
 			message := strings.Join(outcome.Errors, "; ")
@@ -591,8 +708,36 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			var account SunnyAccount
 			queryErr := s.db.Where("email = ?", outcome.Candidate.Email).First(&account).Error
 			mergedCountries, mergedMethods := mergeSunnyPaymentProbeResults(account.PaymentProbeResultsJSON, outcome.Countries)
-			item["payment_methods"] = mergedMethods
-			updates := map[string]any{"payment_methods_json": dumpJSON(mergedMethods), "payment_probe_methods_json": dumpJSON(mergedMethods), "payment_probe_results_json": dumpJSON(mergedCountries), "payment_probe_error": message, "payment_probed_at": now}
+			if mode == sunnyPaymentProbeModeMomoPromo {
+				item["payment_methods"] = outcome.Methods
+			} else {
+				item["payment_methods"] = mergedMethods
+			}
+			updates := map[string]any{}
+			checkoutKind := sunnyPaymentProbeCheckoutKind(outcome.Countries)
+			if checkoutKind != sunnyCheckoutUnknown {
+				updates["checkout_kind"] = checkoutKind
+				updates["commerce_check_error"] = ""
+				updates["commerce_checked_at"] = now
+			}
+			if mode == sunnyPaymentProbeModeMomoPromo {
+				detail, _ := outcome.Countries["VN"].(map[string]any)
+				promoStatus := text(detail["status"])
+				if promoStatus == "" {
+					promoStatus = "unsupported"
+				}
+				item["momo_promo_status"] = promoStatus
+				updates["momo_promo_status"] = promoStatus
+				updates["momo_promo_result_json"] = dumpJSON(detail)
+				updates["momo_promo_error"] = message
+				updates["momo_promo_probed_at"] = now
+			} else {
+				updates["payment_methods_json"] = dumpJSON(mergedMethods)
+				updates["payment_probe_methods_json"] = dumpJSON(mergedMethods)
+				updates["payment_probe_results_json"] = dumpJSON(mergedCountries)
+				updates["payment_probe_error"] = message
+				updates["payment_probed_at"] = now
+			}
 			updateErr := queryErr
 			if updateErr == nil {
 				updateErr = s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(updates).Error
@@ -611,7 +756,7 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		task.ProgressCurrent++
 		s.persistTaskProgress(task, intValue(result["detected"], 0)+intValue(result["partial"], 0), intValue(result["failed"], 0), now)
 		status := text(item["status"])
-		progressMessage := fmt.Sprintf("[%s] [支付探测] 账户任务完成：%d/%d，结果=%s，支付方式=%s", outcome.Candidate.Email, task.ProgressCurrent, task.ProgressTotal, status, fallback(strings.Join(outcome.Methods, ", "), "-"))
+		progressMessage := fmt.Sprintf("[%s] [%s探测] 账户任务完成：%d/%d，结果=%s，支付方式=%s", outcome.Candidate.Email, probeLabel, task.ProgressCurrent, task.ProgressTotal, status, fallback(strings.Join(outcome.Methods, ", "), "-"))
 		progressLevel := "info"
 		if status == "failed" {
 			progressLevel = "error"
@@ -630,7 +775,7 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 	task.ResultJSON = dumpJSON(result)
 	task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	s.db.Save(task)
-	s.appendTaskEvent(task.ID, "账户支付方式探测任务完成", "log", "info", result)
+	s.appendTaskEvent(task.ID, "账户"+probeLabel+"探测任务完成", "log", "info", result)
 }
 
 func (s *Server) failSunnyPaymentProbeTask(task *Task, message string) {

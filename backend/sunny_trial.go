@@ -1120,12 +1120,20 @@ func (s *Server) executeSunnyTrialTask(task *Task, payload map[string]any) {
 }
 
 func (s *Server) sunnyPurposeProxyURL(purpose, accountKey, preferredCountry string) string {
+	proxy, ok := s.sunnyPurposeProxy(purpose, accountKey, preferredCountry)
+	if !ok {
+		return ""
+	}
+	return normalizeSunnyProxyAddress(proxy.Address)
+}
+
+func (s *Server) sunnyPurposeProxy(purpose, accountKey, preferredCountry string) (SunnyProxy, bool) {
 	var proxies []SunnyProxy
 	query := "(',' || replace(lower(coalesce(purpose_tags, '')), ' ', '') || ',') LIKE ?"
 	if err := s.db.Where("status = ? AND enabled = ? AND last_check_ok = ?", "enabled", true, true).
 		Where(query, "%,"+purpose+",%").
 		Order("updated_at desc, id asc").Find(&proxies).Error; err != nil || len(proxies) == 0 {
-		return ""
+		return SunnyProxy{}, false
 	}
 	country := strings.ToUpper(strings.TrimSpace(preferredCountry))
 	matched := make([]SunnyProxy, 0, len(proxies))
@@ -1141,7 +1149,7 @@ func (s *Server) sunnyPurposeProxyURL(purpose, accountKey, preferredCountry stri
 	}
 	hash := fnv.New32a()
 	_, _ = hash.Write([]byte(strings.ToLower(strings.TrimSpace(accountKey))))
-	return normalizeSunnyProxyAddress(proxies[int(hash.Sum32())%len(proxies)].Address)
+	return proxies[int(hash.Sum32())%len(proxies)], true
 }
 
 // Registration/login and account-detection checks use separate proxy purposes.
@@ -1154,6 +1162,23 @@ func (s *Server) sunnyRegisterProxyURL(accountKey string) string {
 func (s *Server) sunnyCommerceProxyURL(accountKey string) string {
 	country, _ := sunnyCheckoutBilling()
 	return s.sunnyPurposeProxyURL(sunnyProxyPurposeCommerce, accountKey, country)
+}
+
+func (s *Server) sunnyCommerceProbeRoute(accountKey string) (string, string, string) {
+	preferredCountry, preferredCurrency := sunnyCheckoutBilling()
+	proxy, ok := s.sunnyPurposeProxy(sunnyProxyPurposeCommerce, accountKey, preferredCountry)
+	if !ok {
+		return "", preferredCountry, preferredCurrency
+	}
+	country := strings.ToUpper(strings.TrimSpace(proxy.Country))
+	if country == "" {
+		country = preferredCountry
+	}
+	currency := checkoutCountryCurrency[country]
+	if currency == "" {
+		currency = preferredCurrency
+	}
+	return normalizeSunnyProxyAddress(proxy.Address), country, currency
 }
 
 func (s *Server) failSunnyTrialTask(task *Task, message string) {

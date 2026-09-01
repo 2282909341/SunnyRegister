@@ -137,7 +137,7 @@ func TestSunnyPaymentProbeTaskUnionsCountriesAndPersistsImmediately(t *testing.T
 			return sunnyPaymentProbeResponse{Error: "missing routing data"}
 		}
 		if country == "JP" {
-			return sunnyPaymentProbeResponse{Methods: []string{"paypal", "card", "link"}, HTTP: http.StatusOK}
+			return sunnyPaymentProbeResponse{Kind: "oaics", Methods: []string{"paypal", "card", "link"}, HTTP: http.StatusOK}
 		}
 		return sunnyPaymentProbeResponse{Methods: []string{"card", "gcash"}, HTTP: http.StatusOK}
 	}
@@ -165,6 +165,9 @@ func TestSunnyPaymentProbeTaskUnionsCountriesAndPersistsImmediately(t *testing.T
 	if account.PaymentProbeMethodsJSON != account.PaymentMethodsJSON {
 		t.Fatalf("dedicated methods=%s compatibility methods=%s", account.PaymentProbeMethodsJSON, account.PaymentMethodsJSON)
 	}
+	if account.CheckoutKind != "oaics" {
+		t.Fatalf("checkout kind was not persisted from payment probe: %q", account.CheckoutKind)
+	}
 	if account.PaymentProbedAt == nil || account.PaymentProbeError != "" || !strings.Contains(account.PaymentProbeResultsJSON, `"JP"`) || !strings.Contains(account.PaymentProbeResultsJSON, `"PH"`) {
 		t.Fatalf("probe metadata not persisted: %#v", account)
 	}
@@ -186,6 +189,75 @@ func TestSunnyPaymentProbeTaskUnionsCountriesAndPersistsImmediately(t *testing.T
 	s.sunnySessions(recorder, httptest.NewRequest(http.MethodGet, "/api/sunny/sessions", nil), nil)
 	if !strings.Contains(recorder.Body.String(), `"payment_methods":["paypal","card","link","gcash"]`) {
 		t.Fatalf("dedicated payment methods were not preferred: %s", recorder.Body.String())
+	}
+}
+
+func TestSunnyMomoPromoStatusRequiresDiscountAndMomo(t *testing.T) {
+	zero, full := 0, 522500
+	cases := []struct {
+		methods  []string
+		amount   *int
+		currency string
+		want     string
+	}{
+		{[]string{"card", "momo"}, &zero, "VND", "supported"},
+		{[]string{"card"}, &zero, "VND", "promo_only"},
+		{[]string{"momo"}, &full, "VND", "momo_only"},
+		{[]string{"card"}, &full, "VND", "unsupported"},
+	}
+	for _, tc := range cases {
+		if got := sunnyMomoPromoStatus(tc.methods, tc.amount, tc.currency); got != tc.want {
+			t.Fatalf("methods=%v amount=%v currency=%s got=%s want=%s", tc.methods, tc.amount, tc.currency, got, tc.want)
+		}
+	}
+}
+
+func TestSunnyPaymentProbeMomoPromoPersistsSeparateResultAndCheckoutKind(t *testing.T) {
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	proxy := SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true}
+	if err := s.db.Create(&proxy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&SunnyAccount{}).Where("email = ?", session.Email).Updates(map[string]any{
+		"payment_methods_json": `["card","momo"]`, "payment_probe_methods_json": `["card","momo"]`,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbeMomoPromo
+	zero := 0
+	sunnyProbeMomoPromo = func(_ context.Context, token, country, currency, proxyURL string) sunnyPaymentProbeResponse {
+		if token == "" || country != "VN" || currency != "VND" || proxyURL == "" {
+			return sunnyPaymentProbeResponse{Error: "missing routing data"}
+		}
+		return sunnyPaymentProbeResponse{Kind: "oaics", Methods: []string{"card", "link", "momo"}, Amount: &zero, Currency: "VND", MomoDiscounted: true, HTTP: http.StatusOK}
+	}
+	t.Cleanup(func() { sunnyProbeMomoPromo = previousProbe })
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "mode": sunnyPaymentProbeModeMomoPromo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := jsonMap(task.PayloadJSON)
+	if got := strings.Join(stringSlice(payload["countries"]), ","); got != "VN" {
+		t.Fatalf("momo promo countries=%q", got)
+	}
+	s.executeSunnyPaymentProbeTask(&task, payload)
+	var account SunnyAccount
+	if err := s.db.Where("email = ?", session.Email).First(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if account.MomoPromoStatus != "supported" || account.MomoPromoProbedAt == nil || account.MomoPromoError != "" || account.CheckoutKind != "oaics" {
+		t.Fatalf("momo promo metadata not persisted: %#v", account)
+	}
+	if account.PaymentMethodsJSON != `["card","momo"]` || account.PaymentProbeMethodsJSON != `["card","momo"]` {
+		t.Fatalf("promo probe overwrote standard methods: %s / %s", account.PaymentMethodsJSON, account.PaymentProbeMethodsJSON)
+	}
+	if !strings.Contains(account.MomoPromoResultJSON, `"status":"supported"`) {
+		t.Fatalf("momo promo result=%s", account.MomoPromoResultJSON)
 	}
 }
 

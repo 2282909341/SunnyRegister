@@ -204,6 +204,9 @@ def test_task_style_probe_reads_stripe_init_and_elements_payment_methods() -> No
         "http": http,
     })
     app.fetch_custom_checkout_session_with_retry = MagicMock()
+    app.custom_checkout_amount_minor = MagicMock(return_value=None)
+    app.custom_checkout_currency = MagicMock(return_value="")
+    app.is_momo_promo_amount = MagicMock(return_value=False)
 
     stripe = ModuleType("stripe_checkout")
     stripe._profile = MagicMock(return_value={"browser_locale": "pl-PL"})

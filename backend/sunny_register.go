@@ -4541,6 +4541,10 @@ type sunnySessionAccountSummary struct {
 	PaymentProbeResultsJSON string     `gorm:"column:payment_probe_results_json"`
 	PaymentProbeError       string     `gorm:"column:payment_probe_error"`
 	PaymentProbedAt         *time.Time `gorm:"column:payment_probed_at"`
+	MomoPromoStatus         string     `gorm:"column:momo_promo_status"`
+	MomoPromoResultJSON     string     `gorm:"column:momo_promo_result_json"`
+	MomoPromoError          string     `gorm:"column:momo_promo_error"`
+	MomoPromoProbedAt       *time.Time `gorm:"column:momo_promo_probed_at"`
 	CommerceCheckError      string     `gorm:"column:commerce_check_error"`
 	CommerceCheckedAt       *time.Time `gorm:"column:commerce_checked_at"`
 	AccessToken             string     `gorm:"column:access_token"`
@@ -4625,6 +4629,10 @@ func serializeSunnySessionList(row sunnySessionListRow, accounts map[string]sunn
 	if err := json.Unmarshal([]byte(fallback(account.PaymentProbeResultsJSON, "{}")), &paymentProbeResults); err != nil {
 		paymentProbeResults = map[string]any{}
 	}
+	momoPromoResult := map[string]any{}
+	if err := json.Unmarshal([]byte(fallback(account.MomoPromoResultJSON, "{}")), &momoPromoResult); err != nil {
+		momoPromoResult = map[string]any{}
+	}
 	trialCheckedAt := account.TrialCheckedAt
 	if trialCheckedAt == nil {
 		trialCheckedAt = mailbox.TrialCheckedAt
@@ -4643,6 +4651,7 @@ func serializeSunnySessionList(row sunnySessionListRow, accounts map[string]sunn
 		"trial_country_results": sunnyTrialCountryResults(account.TrialCountryResultsJSON, mailbox.TrialCountryResultsJSON),
 		"checkout_kind":         checkoutKind, "checkout_result": sunnyCheckoutResultJSON(account.CheckoutResultJSON), "payment_methods": paymentMethods, "payment_probe_results": paymentProbeResults,
 		"payment_probe_error": account.PaymentProbeError, "payment_probed_at": nullableTime(account.PaymentProbedAt != nil, pointerTime(account.PaymentProbedAt)), "commerce_check_error": account.CommerceCheckError,
+		"momo_promo_status": fallback(account.MomoPromoStatus, "unknown"), "momo_promo_result": momoPromoResult, "momo_promo_error": account.MomoPromoError, "momo_promo_probed_at": nullableTime(account.MomoPromoProbedAt != nil, pointerTime(account.MomoPromoProbedAt)),
 		"phone_bound":          sunnyPhoneBindingCompleted(account.PhoneNumber, account.Status, mailbox.Status),
 		"rebind_email":         fallback(strings.TrimSpace(mailbox.RebindEmail), strings.TrimSpace(account.RebindEmail)),
 		"has_access_token":     row.HasAccessToken != 0 || account.HasAccessToken != 0,
@@ -4856,7 +4865,7 @@ func (s *Server) sunnySessionListSidecars(rows []sunnySessionListRow) (map[strin
 			accountIDs = append(accountIDs, row.AccountID)
 		}
 	}
-	accountQuery := s.db.Model(&SunnyAccount{}).Select(`id, mailbox_id, email, status, account_type, trial_eligibility, trial_country_results_json, trial_checked_at, checkout_kind, checkout_result_json, payment_methods_json, payment_probe_methods_json, payment_probe_results_json, payment_probe_error, payment_probed_at, commerce_check_error, commerce_checked_at, access_token, phone_number, last_health_checked_at, rebind_email,
+	accountQuery := s.db.Model(&SunnyAccount{}).Select(`id, mailbox_id, email, status, account_type, trial_eligibility, trial_country_results_json, trial_checked_at, checkout_kind, checkout_result_json, payment_methods_json, payment_probe_methods_json, payment_probe_results_json, payment_probe_error, payment_probed_at, momo_promo_status, momo_promo_result_json, momo_promo_error, momo_promo_probed_at, commerce_check_error, commerce_checked_at, access_token, phone_number, last_health_checked_at, rebind_email,
 		CASE WHEN access_token IS NOT NULL AND access_token <> '' THEN 1 ELSE 0 END AS has_access_token,
 		CASE WHEN openai_rt IS NOT NULL AND openai_rt <> '' THEN 1 ELSE 0 END AS has_refresh_token`).Where("email IN ?", emails)
 	if len(accountIDs) > 0 {
@@ -5007,12 +5016,13 @@ func (s *Server) sunnySessions(w http.ResponseWriter, r *http.Request, parts []s
 		trialFilter := normalizeSunnyTrialFilter(q.Get("trial_eligibility"))
 		checkoutFilter := normalizeSunnyCheckoutFilter(q.Get("checkout_kind"))
 		paymentMethodFilter := normalizeSunnyPaymentMethodFilter(q.Get("payment_methods"))
+		momoPromoFilter := normalizeSunnyMomoPromoStatus(q.Get("momo_promo_status"))
 		loginSecretFilter := normalizeSunnyLoginSecretFilter(q.Get("login_secret"))
 		rebindEmailFilter := normalizeSunnyRebindEmailFilter(q.Get("rebind_email"))
 		trialCountryFilter := normalizeSunnyTrialCountryFilter(q.Get("trial_countries"))
 		groupFilter := uint(intValue(q.Get("group_id"), 0))
 		sortBy := strings.ToLower(strings.TrimSpace(q.Get("sort_by")))
-		if statusFilter == "" && planFilter == "" && trialFilter == "" && checkoutFilter == "" && len(paymentMethodFilter) == 0 && loginSecretFilter == "" && rebindEmailFilter == "" && len(trialCountryFilter) == 0 && sortBy != "rebind_email" {
+		if statusFilter == "" && planFilter == "" && trialFilter == "" && checkoutFilter == "" && len(paymentMethodFilter) == 0 && momoPromoFilter == "" && loginSecretFilter == "" && rebindEmailFilter == "" && len(trialCountryFilter) == 0 && sortBy != "rebind_email" {
 			query := s.db.Model(&SunnySession{})
 			query = sunnyUniqueSessionIdentityScope(query)
 			if kw != "" {
@@ -5087,6 +5097,9 @@ func (s *Server) sunnySessions(w http.ResponseWriter, r *http.Request, parts []s
 				continue
 			}
 			if !sunnyHasAllPaymentMethods(item["payment_methods"], paymentMethodFilter) {
+				continue
+			}
+			if momoPromoFilter != "" && normalizeSunnyMomoPromoStatus(text(item["momo_promo_status"])) != momoPromoFilter {
 				continue
 			}
 			if groupFilter != 0 && uint(intValue(item["group_id"], 0)) != groupFilter {

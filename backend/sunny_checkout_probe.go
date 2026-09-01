@@ -12,6 +12,8 @@ const sunnyCheckoutProbeTaskType = "sunny_account_checkout_probe"
 
 var sunnyCheckCheckoutProbe = checkSunnyCheckoutProbe
 
+type sunnyCheckoutBillingContextKey struct{}
+
 type sunnyCheckoutProbeCandidate struct {
 	SessionID   uint
 	AccountID   uint
@@ -39,6 +41,9 @@ func checkSunnyCheckoutProbe(ctx context.Context, accessToken string) sunnyComme
 	}
 	proxyURL, _ := ctx.Value(sunnyCheckoutProxyContextKey{}).(string)
 	country, currency := sunnyCheckoutBilling()
+	if billing, ok := ctx.Value(sunnyCheckoutBillingContextKey{}).([2]string); ok {
+		country, currency = billing[0], billing[1]
+	}
 	probed := sunnyProbePaymentMethods(ctx, token, country, currency, proxyURL)
 	sunnyTrafficMeterFromContext(ctx).addExternal(probed.TrafficBytes)
 	result.CheckoutKind = normalizeSunnyCheckoutKind(probed.Kind)
@@ -170,7 +175,9 @@ func (s *Server) executeSunnyCheckoutProbeTask(task *Task, payload map[string]an
 		}
 		meter := &sunnyTrafficMeter{}
 		probeCtx := withSunnyTrafficMeter(ctx, meter)
-		probeCtx = context.WithValue(probeCtx, sunnyCheckoutProxyContextKey{}, s.sunnyCommerceProxyURL(candidate.Email))
+		proxyURL, country, currency := s.sunnyCommerceProbeRoute(candidate.Email)
+		probeCtx = context.WithValue(probeCtx, sunnyCheckoutProxyContextKey{}, proxyURL)
+		probeCtx = context.WithValue(probeCtx, sunnyCheckoutBillingContextKey{}, [2]string{country, currency})
 		probed, retried := checkSunnyCheckoutProbeWithRetry(probeCtx, candidate.AccessToken)
 		outcome.CheckoutKind = normalizeSunnyCheckoutKind(probed.CheckoutKind)
 		outcome.InvalidToken = probed.InvalidToken

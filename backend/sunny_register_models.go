@@ -118,6 +118,10 @@ type SunnyAccount struct {
 	PaymentProbeResultsJSON string     `gorm:"type:text;default:'{}'" json:"payment_probe_results_json"`
 	PaymentProbeError       string     `gorm:"type:text" json:"payment_probe_error"`
 	PaymentProbedAt         *time.Time `gorm:"index" json:"payment_probed_at"`
+	MomoPromoStatus         string     `gorm:"index;size:32;default:unknown" json:"momo_promo_status"`
+	MomoPromoResultJSON     string     `gorm:"type:text;default:'{}'" json:"momo_promo_result_json"`
+	MomoPromoError          string     `gorm:"type:text" json:"momo_promo_error"`
+	MomoPromoProbedAt       *time.Time `gorm:"index" json:"momo_promo_probed_at"`
 	CommerceCheckError      string     `gorm:"type:text" json:"commerce_check_error"`
 	CommerceCheckedAt       *time.Time `gorm:"index" json:"commerce_checked_at"`
 	OpenAIRT                string     `gorm:"column:openai_rt;type:text" json:"openai_rt"`
