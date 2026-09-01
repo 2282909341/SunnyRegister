@@ -19,6 +19,12 @@ const (
 	sunnyPaymentProbeTaskType      = "sunny_account_payment_probe"
 	sunnyPaymentProbeModeMethods   = "methods"
 	sunnyPaymentProbeModeMomoPromo = "momo_promo"
+	// 每次探测单个账号在每个国家建立 Checkout 会话的代理尝试上限。
+	// 老版本会对每个 VN 代理都创建一次 checkout，账号被反复建单数十次，
+	// 直接触发 OpenAI 账号级 checkout_creation_rate_limited 冷却（429）。
+	// 成功探测其实一次 HTTP 200 即返回，故统一限制为少量代理即可准确且不再误伤。
+	sunnyPaymentProbeMaxAttempts   = 3
+	sunnyMomoPromoAttemptTimeout   = 45 * time.Second
 )
 
 type sunnyPaymentProbeCandidate struct {
@@ -449,18 +455,35 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 }
 
 func (s *Server) probeSunnyPaymentCountryModeContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy, mode string) sunnyPaymentCountryProbe {
+	return s.probeSunnyPaymentCountryModeProgressContext(ctx, candidate, country, proxies, mode, nil)
+}
+
+func (s *Server) probeSunnyPaymentCountryModeProgressContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy, mode string, onAttempt func(current, total int)) sunnyPaymentCountryProbe {
 	result := sunnyPaymentCountryProbe{Country: country}
 	currency := checkoutCountryCurrency[country]
 	if currency == "" {
 		currency = "USD"
 	}
-	for _, proxy := range shuffledSunnyProxies(proxies) {
+	selected := shuffledSunnyProxies(proxies)
+	timeout := 105 * time.Second
+	if normalizeSunnyPaymentProbeMode(mode) == sunnyPaymentProbeModeMomoPromo {
+		timeout = sunnyMomoPromoAttemptTimeout
+	}
+	// 任意探测模式都限制每个账号在该国家的建单次数，避免反复建单触发
+	// OpenAI 账号级 checkout_creation_rate_limited 冷却（老版本全库探测的 429 即由此造成）。
+	if limit := sunnyPaymentProbeMaxAttempts; len(selected) > limit {
+		selected = selected[:limit]
+	}
+	for _, proxy := range selected {
 		if ctx.Err() != nil {
 			result.Error = "任务已取消"
 			return result
 		}
 		result.Attempts++
-		probeCtx, cancel := context.WithTimeout(ctx, 105*time.Second)
+		if onAttempt != nil {
+			onAttempt(result.Attempts, len(selected))
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
 		meter := &sunnyTrafficMeter{}
 		probeCtx = withSunnyTrafficMeter(probeCtx, meter)
 		var probed sunnyPaymentProbeResponse
@@ -480,6 +503,9 @@ func (s *Server) probeSunnyPaymentCountryModeContext(ctx context.Context, candid
 			result.Methods = normalizeSunnyPaymentMethods(probed.Methods)
 			return result
 		}
+		if probed.HTTP >= 400 && probed.HTTP < 500 && probed.HTTP != http.StatusForbidden && probed.HTTP != http.StatusRequestTimeout && probed.HTTP != http.StatusTooManyRequests {
+			return result
+		}
 	}
 	result.Error = fallback(result.Error, "该国家没有可用的支付探测代理")
 	return result
@@ -494,6 +520,10 @@ func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate 
 }
 
 func (s *Server) probeSunnyPaymentAccountModeContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy, mode string) sunnyPaymentAccountProbe {
+	return s.probeSunnyPaymentAccountModeProgressContext(ctx, candidate, groups, mode, nil)
+}
+
+func (s *Server) probeSunnyPaymentAccountModeProgressContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy, mode string, onAttempt func(country string, current, total int)) sunnyPaymentAccountProbe {
 	result := sunnyPaymentAccountProbe{Candidate: candidate, Countries: map[string]any{}}
 	if candidate.SkipReason != "" || candidate.Error != "" {
 		return result
@@ -504,7 +534,11 @@ func (s *Server) probeSunnyPaymentAccountModeContext(ctx context.Context, candid
 	}
 	sort.Strings(countries)
 	probes := streamSunnyWorkerPoolContext(ctx, countries, s.sunnyPaymentCountryConcurrency(), func(country string) sunnyPaymentCountryProbe {
-		return s.probeSunnyPaymentCountryModeContext(ctx, candidate, country, groups[country], mode)
+		return s.probeSunnyPaymentCountryModeProgressContext(ctx, candidate, country, groups[country], mode, func(current, total int) {
+			if onAttempt != nil {
+				onAttempt(country, current, total)
+			}
+		})
 	})
 	allMethods := []string{}
 	for probe := range probes {
@@ -640,7 +674,14 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 	result := map[string]any{"requested": len(candidates), "detected": 0, "partial": 0, "skipped": 0, "failed": 0, "items": []any{}}
 	items := make([]any, 0, len(candidates))
 	outcomes := streamSunnyWorkerPoolContext(ctx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
-		return s.probeSunnyPaymentAccountModeContext(ctx, candidate, groups, mode)
+		return s.probeSunnyPaymentAccountModeProgressContext(ctx, candidate, groups, mode, func(country string, current, total int) {
+			if mode != sunnyPaymentProbeModeMomoPromo {
+				return
+			}
+			s.appendAccountTaskEvent(task.ID, candidate.Email, "payment", "payment_probe.attempt",
+				fmt.Sprintf("[%s] [0元 MoMo探测] %s 正在尝试代理 %d/%d", candidate.Email, country, current, total), "info",
+				map[string]any{"session_id": candidate.SessionID, "country": country, "current": current, "total": total})
+		})
 	})
 	for outcome := range outcomes {
 		if ctx.Err() != nil {

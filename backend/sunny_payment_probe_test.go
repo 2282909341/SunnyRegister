@@ -212,6 +212,65 @@ func TestSunnyMomoPromoStatusRequiresDiscountAndMomo(t *testing.T) {
 	}
 }
 
+func TestSunnyMomoPromoLimitsProxyAttempts(t *testing.T) {
+	previousProbe := sunnyProbeMomoPromo
+	calls := 0
+	sunnyProbeMomoPromo = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		calls++
+		return sunnyPaymentProbeResponse{HTTP: http.StatusServiceUnavailable, Error: "temporary proxy failure"}
+	}
+	t.Cleanup(func() { sunnyProbeMomoPromo = previousProbe })
+
+	proxies := make([]SunnyProxy, 100)
+	for index := range proxies {
+		proxies[index] = SunnyProxy{ID: uint(index + 1), Address: "http://vn.example:8080"}
+	}
+	attempts := []int{}
+	result := (&Server{}).probeSunnyPaymentCountryModeProgressContext(context.Background(), sunnyPaymentProbeCandidate{AccessToken: "token"}, "VN", proxies, sunnyPaymentProbeModeMomoPromo, func(current, total int) {
+		attempts = append(attempts, current*10+total)
+	})
+	if calls != sunnyPaymentProbeMaxAttempts || result.Attempts != sunnyPaymentProbeMaxAttempts {
+		t.Fatalf("calls=%d attempts=%d, want %d", calls, result.Attempts, sunnyPaymentProbeMaxAttempts)
+	}
+	if len(attempts) != 3 || attempts[0] != 13 || attempts[1] != 23 || attempts[2] != 33 {
+		t.Fatalf("attempt progress=%v", attempts)
+	}
+}
+
+func TestSunnyPaymentProbeMethodsAlsoLimitsProxyAttempts(t *testing.T) {
+	previousProbe := sunnyProbePaymentMethods
+	calls := 0
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		calls++
+		return sunnyPaymentProbeResponse{HTTP: http.StatusServiceUnavailable, Error: "temporary proxy failure"}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	proxies := make([]SunnyProxy, 100)
+	for index := range proxies {
+		proxies[index] = SunnyProxy{ID: uint(index + 1), Address: "http://vn.example:8080"}
+	}
+	result := (&Server{}).probeSunnyPaymentCountryModeContext(context.Background(), sunnyPaymentProbeCandidate{AccessToken: "token"}, "VN", proxies, sunnyPaymentProbeModeMethods)
+	if calls != sunnyPaymentProbeMaxAttempts || result.Attempts != sunnyPaymentProbeMaxAttempts {
+		t.Fatalf("methods mode calls=%d attempts=%d, want limit %d (反复建单会触发账号级 429 冷却)", calls, result.Attempts, sunnyPaymentProbeMaxAttempts)
+	}
+}
+
+func TestSunnyMomoPromoDoesNotRetryDefinitiveClientError(t *testing.T) {
+	previousProbe := sunnyProbeMomoPromo
+	calls := 0
+	sunnyProbeMomoPromo = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		calls++
+		return sunnyPaymentProbeResponse{HTTP: http.StatusBadRequest, Error: "promotion unavailable"}
+	}
+	t.Cleanup(func() { sunnyProbeMomoPromo = previousProbe })
+
+	result := (&Server{}).probeSunnyPaymentCountryModeContext(context.Background(), sunnyPaymentProbeCandidate{AccessToken: "token"}, "VN", []SunnyProxy{{ID: 1}, {ID: 2}, {ID: 3}}, sunnyPaymentProbeModeMomoPromo)
+	if calls != 1 || result.Attempts != 1 {
+		t.Fatalf("calls=%d attempts=%d, want one definitive attempt", calls, result.Attempts)
+	}
+}
+
 func TestSunnyPaymentProbeMomoPromoPersistsSeparateResultAndCheckoutKind(t *testing.T) {
 	s := newSunnySessionTestServer(t)
 	var session SunnySession
