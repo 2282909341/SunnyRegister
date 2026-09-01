@@ -158,6 +158,13 @@ class ProbePaymentMethodsRequest(BaseModel):
     currency: str = "USD"
 
 
+class ProbeMomoPromoRequest(BaseModel):
+    access_token: str
+    proxy_url: str = ""
+    country: str = "VN"
+    currency: str = "VND"
+
+
 class CheckoutRequest(BaseModel):
     token: str
     checkout_proxies: list[str]
@@ -292,6 +299,14 @@ def probe_commerce(req: ProbeCommerceRequest, authorization: str | None = Header
 def probe_payment_methods(req: ProbePaymentMethodsRequest, authorization: str | None = Header(default=None)) -> dict:
     _check_token(authorization)
     from sunny_core.commerce_probe import probe_payment_methods as run_probe
+
+    return run_probe(req.access_token, req.proxy_url, req.country, req.currency)
+
+
+@app.post("/probe-momo-promo")
+def probe_momo_promo(req: ProbeMomoPromoRequest, authorization: str | None = Header(default=None)) -> dict:
+    _check_token(authorization)
+    from sunny_core.commerce_probe import probe_momo_promo as run_probe
 
     return run_probe(req.access_token, req.proxy_url, req.country, req.currency)
 
