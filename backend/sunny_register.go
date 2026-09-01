@@ -1788,7 +1788,7 @@ func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string) 
 			bad = append(bad, key+" => "+err.Error())
 			continue
 		}
-		total := intValue(quota["total_quota"], 0)
+		total := intValue(quota["remaining_quota"], 0)
 		if total < 1 {
 			bad = append(bad, key+" => 兑换码额度为 0，可能已用尽")
 			continue

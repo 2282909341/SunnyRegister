@@ -51,9 +51,30 @@ func icmeigoBearerPOST(client *http.Client, accessKey, endpoint string, bodyValu
 	return resp.StatusCode, payload, nil
 }
 
+// icmeigoBearerGET performs a GET with an Authorization: Bearer header (used by the quota endpoint).
+func icmeigoBearerGET(client *http.Client, accessKey, endpoint string) (int, map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(icmeigoAPIBaseURL, "/")+endpoint, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	payload := map[string]any{}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if len(bodyBytes) > 0 {
+		_ = json.Unmarshal(bodyBytes, &payload)
+	}
+	return resp.StatusCode, payload, nil
+}
+
 // icmeigoQuota reads a redeem code's quota. If the code is invalid, a terminal error is returned.
 func icmeigoQuota(client *http.Client, accessKey string) (map[string]any, error) {
-	status, payload, err := icmeigoBearerPOST(client, accessKey, "/api/hme/quota", map[string]any{})
+	status, payload, err := icmeigoBearerGET(client, accessKey, "/api/hme/quota")
 	if err != nil {
 		return nil, &outlookMailError{Code: "mailbox_network_error", Category: "network", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "iCloud 邮箱渠道网络连接失败，请检查服务器出网", Detail: err.Error()}
 	}
