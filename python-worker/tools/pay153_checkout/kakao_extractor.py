@@ -888,7 +888,12 @@ def elements_params(stripe_js_id: str, session_id: str = "") -> dict[str, str]:
     return params
 
 
-def create_checkout(session: Any, token: str) -> tuple[str, str, dict[str, Any]]:
+def create_checkout(
+    session: Any,
+    token: str,
+    *,
+    apply_promo: bool = True,
+) -> tuple[str, str, dict[str, Any]]:
     payload: dict[str, Any] = {
         "plan_name": "chatgptplusplan",
         "billing_details": {"country": CHECKOUT_COUNTRY, "currency": "KRW"},
@@ -897,7 +902,7 @@ def create_checkout(session: Any, token: str) -> tuple[str, str, dict[str, Any]]
     }
     promo_mode = os.environ.get("KAKAO_PROMO_MODE", "campaign").strip().lower()
     promo_id = os.environ.get("KAKAO_PROMO_ID", "plus-1-month-free").strip()
-    if promo_mode != "off" and promo_id:
+    if apply_promo and promo_mode != "off" and promo_id:
         payload["promo_campaign"] = {
             "promo_campaign_id": promo_id,
             "is_coupon_from_query_param": False,
@@ -943,7 +948,14 @@ def checkout_api_headers(token: str, referer: str, target_path: str) -> dict[str
     }
 
 
-def update_checkout_promotion(session: Any, token: str, checkout_id: str, checkout: dict[str, Any]) -> None:
+def update_checkout_promotion(
+    session: Any,
+    token: str,
+    checkout_id: str,
+    checkout: dict[str, Any],
+    *,
+    apply_promo: bool = True,
+) -> None:
     promo_mode = os.environ.get("KAKAO_PROMO_MODE", "campaign").strip().lower()
     promo_id = os.environ.get("KAKAO_PROMO_ID", "plus-1-month-free").strip()
     body: dict[str, Any] = {
@@ -953,7 +965,7 @@ def update_checkout_promotion(session: Any, token: str, checkout_id: str, checko
         "price_interval": "month",
         "seat_quantity": 1,
     }
-    if promo_mode != "off" and promo_id:
+    if apply_promo and promo_mode != "off" and promo_id:
         body["promo_campaign"] = {
             "promo_campaign_id": promo_id,
             "is_coupon_from_query_param": False,
@@ -1145,6 +1157,7 @@ def kakao_link(
     provider_proxy: str,
     *,
     stop_event: Event | None = None,
+    apply_promo: bool = True,
 ) -> dict[str, Any]:
     """Keep one sticky Seed across configured bootstrap, promotion, and provider stages."""
     ensure_running(stop_event)
@@ -1166,8 +1179,12 @@ def kakao_link(
             raise RuntimeError(f"ChatGPT /me failed {me.status_code}: {me_error}")
 
     ensure_running(stop_event)
-    log(f"{CHECKOUT_COUNTRY} 创建 KRW Kakao trial checkout")
-    checkout_id, publishable_key, checkout = create_checkout(checkout_session, token)
+    log(f"{CHECKOUT_COUNTRY} 创建 KRW Kakao checkout")
+    checkout_id, publishable_key, checkout = create_checkout(
+        checkout_session,
+        token,
+        apply_promo=apply_promo,
+    )
     checkout_page = activate_stripe_checkout(checkout_session, checkout_id)
 
     log(f"{CHECKOUT_COUNTRY} Bootstrap Stripe init")
@@ -1175,14 +1192,25 @@ def kakao_link(
     inspect_kakao_init(bootstrap_payload, f"{CHECKOUT_COUNTRY} Bootstrap", require_zero=False)
 
     ensure_running(stop_event)
-    log(f"{PROMOTION_COUNTRY} checkout/update")
-    update_checkout_promotion(promotion_session, token, checkout_id, checkout)
+    if apply_promo:
+        log(f"{PROMOTION_COUNTRY} checkout/update")
+        update_checkout_promotion(
+            promotion_session,
+            token,
+            checkout_id,
+            checkout,
+            apply_promo=True,
+        )
+    else:
+        log("未启用优惠配置，跳过 Kakao checkout/update 与 0 元金额校验")
 
     ensure_running(stop_event)
     log(f"{PROMOTION_COUNTRY} checkout/update 后通过 {PROVIDER_COUNTRY} 刷新 Stripe")
     init_payload, stripe_js_id = stripe_init(provider_session, checkout_id, publishable_key, checkout_page)
     amount = inspect_kakao_init(
-        init_payload, f"{PROMOTION_COUNTRY} 更新后 {PROVIDER_COUNTRY}", require_zero=True
+        init_payload,
+        f"{PROMOTION_COUNTRY} 更新后 {PROVIDER_COUNTRY}",
+        require_zero=apply_promo,
     )
 
     billing = random_kakao_billing(token)
@@ -1203,7 +1231,11 @@ def kakao_link(
     ensure_running(stop_event)
     log(f"{PROVIDER_COUNTRY} 税务同步后刷新 Stripe")
     init_payload, stripe_js_id = stripe_init(provider_session, checkout_id, publishable_key, checkout_page)
-    amount = inspect_kakao_init(init_payload, f"{PROVIDER_COUNTRY} 税务同步", require_zero=True)
+    amount = inspect_kakao_init(
+        init_payload,
+        f"{PROVIDER_COUNTRY} 税务同步",
+        require_zero=apply_promo,
+    )
     elements_session_id = f"elements_session_{uuid.uuid4().hex[:11]}"
 
     ensure_running(stop_event)
