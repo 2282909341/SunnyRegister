@@ -552,8 +552,8 @@ func (s *Server) executeSunnySubscriptionTask(task *Task, payload map[string]any
 	// already have a definitive subscription confirmation.
 	invalidForRenewal := make([]sunnySubscriptionATResult, 0)
 	atResults := streamSunnyWorkerPoolContext(ctx, noMailCandidates, concurrency, func(candidate sunnySubscriptionCandidate) sunnySubscriptionATResult {
-		if candidate.Error != "" {
-			return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "failed", Error: candidate.Error}
+		if strings.TrimSpace(candidate.AccessToken) == "" {
+			return sunnySubscriptionATResult{SessionID: candidate.SessionID, AccountID: candidate.AccountID, Email: candidate.Email, Status: "failed", Error: "账户没有可用的 Access Token"}
 		}
 		return sunnyProbeSubscriptionAT(ctx, s, candidate, proxyURL)
 	})
