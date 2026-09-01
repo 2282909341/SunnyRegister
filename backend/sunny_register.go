@@ -1223,7 +1223,7 @@ func (s *Server) sunnyMailboxFromBody(body map[string]any) (SunnyMailbox, error)
 		return SunnyMailbox{}, fmt.Errorf("%s", sunnyMailboxFormatHint(mailboxType, mailboxChannel))
 	}
 	if mailboxType == "apple" {
-		if mailboxChannel != "xbovo" && mailboxChannel != "url_api" {
+		if mailboxChannel != "xbovo" && mailboxChannel != "url_api" && mailboxChannel != "icmeigo" {
 			return SunnyMailbox{}, fmt.Errorf("暂不支持该 iCloud 邮箱渠道")
 		}
 		if mailboxChannel == "url_api" && accessKey != "" {
@@ -1276,6 +1276,9 @@ func normalizeSunnyMailboxChannel(mailboxType, value string) string {
 		}
 		if normalized == "url_api" || normalized == "url-api" {
 			return "url_api"
+		}
+		if normalized == "icmeigo" || normalized == "ic.meigo" || normalized == "meiguo" {
+			return "icmeigo"
 		}
 		return normalized
 	}
@@ -1669,7 +1672,7 @@ func parseSunnyMailboxLineForProvider(raw, mailboxType, channel string) (map[str
 		return parseSunnyMailboxLine(raw)
 	}
 	normalizedChannel := normalizeSunnyMailboxChannel(mailboxType, channel)
-	if normalizedChannel != "xbovo" && normalizedChannel != "url_api" {
+	if normalizedChannel != "xbovo" && normalizedChannel != "url_api" && normalizedChannel != "icmeigo" {
 		return nil, fmt.Errorf("暂不支持该苹果邮箱渠道")
 	}
 	if normalizedChannel == "url_api" {
@@ -1698,6 +1701,11 @@ func (s *Server) sunnyImportMailboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	if gid == 0 {
 		gid = s.sunnyEnsureDefaultGroup()
+	}
+	if mailboxType == "apple" && mailboxChannel == "icmeigo" {
+		imported, bad := s.importIcMeiGoCards(text(body["lines"]), gid)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported, "failed": len(bad), "errors": bad})
+		return
 	}
 	lines := strings.Split(text(body["lines"]), "\n")
 	ok, bad := 0, []string{}
@@ -1756,6 +1764,72 @@ func (s *Server) sunnyImportMailboxes(w http.ResponseWriter, r *http.Request) {
 		ok++
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "imported": ok, "failed": len(bad), "errors": bad})
+}
+
+// importIcMeiGoCards expands ic.meigo.lol redeem codes (one per line) into mailbox rows.
+// For each code it queries the quota, then generates that many hidden mailboxes, storing each
+// generated email as its own apple/icmeigo mailbox row sharing the same access key.
+func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string) {
+	client := icmeigoHTTPClient("")
+	imported := 0
+	bad := []string{}
+	seenKey := map[string]bool{}
+	for _, raw := range strings.Split(linesText, "\n") {
+		key := strings.TrimSpace(raw)
+		if key == "" || strings.HasPrefix(key, "===") || strings.HasPrefix(strings.ToLower(key), "http") || strings.Contains(key, "@") || strings.Contains(key, "----") {
+			continue
+		}
+		if seenKey[key] {
+			continue
+		}
+		seenKey[key] = true
+		quota, err := icmeigoQuota(client, key)
+		if err != nil {
+			bad = append(bad, key+" => "+err.Error())
+			continue
+		}
+		total := intValue(quota["total_quota"], 0)
+		if total < 1 {
+			bad = append(bad, key+" => 兑换码额度为 0，可能已用尽")
+			continue
+		}
+		okForCard := 0
+		cardErr := ""
+		for i := 0; i < total; i++ {
+			email, genErr := icmeigoGenerate(client, key)
+			if genErr != nil {
+				cardErr = genErr.Error()
+				break
+			}
+			if err := s.upsertIcMeiGoMailbox(gid, email, key); err != nil {
+				cardErr = err.Error()
+				break
+			}
+			imported++
+			okForCard++
+		}
+		if cardErr != "" {
+			bad = append(bad, key+" => 已生成 "+fmt.Sprintf("%d", okForCard)+" 个邮箱后失败："+cardErr)
+		}
+	}
+	return imported, bad
+}
+
+func (s *Server) upsertIcMeiGoMailbox(gid uint, email, accessKey string) error {
+	var old SunnyMailbox
+	if err := s.db.Where("lower(email) = ?", strings.ToLower(email)).First(&old).Error; err == nil {
+		updates := map[string]any{
+			"group_id": gid, "mailbox_type": "apple", "mailbox_channel": "icmeigo",
+			"access_key": accessKey, "raw": email + "----" + accessKey, "enabled": true,
+		}
+		return s.db.Model(&old).Updates(updates).Error
+	}
+	m := SunnyMailbox{
+		GroupID: gid, Email: email, MailboxType: "apple", MailboxChannel: "icmeigo",
+		AccessKey: accessKey, Raw: email + "----" + accessKey, AccountType: "free",
+		Status: "未注册", Enabled: true, LatestMailJSON: "{}",
+	}
+	return s.db.Create(&m).Error
 }
 
 func (s *Server) sunnyReadImportBody(r *http.Request) map[string]any {
@@ -1824,6 +1898,8 @@ func (s *Server) sunnyLatestMail(w http.ResponseWriter, r *http.Request, m *Sunn
 			payload, err = fetchURLAPILatestMail(m.Email, m.AccessKey, limit, proxyURL)
 		case "xbovo":
 			payload, err = fetchXbovoLatestMail(m.Email, m.AccessKey, limit, proxyURL)
+		case "icmeigo":
+			payload, err = fetchIcMeiGoLatestMail(m.Email, m.AccessKey, limit, proxyURL)
 		default:
 			err = &outlookMailError{Code: "mailbox_channel_unsupported", Category: "format", HTTPStatus: http.StatusUnprocessableEntity, UserMessage: "暂不支持该 iCloud 邮箱渠道", Terminal: true}
 		}
