@@ -5938,6 +5938,16 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 			return
 		}
 		body = nextBody
+		if boolValue(body["probe_momo_promo"], false) {
+			// 0 元 MoMo 促销仅限越南，注册后自动探测必须走 VN 出口代理，
+			// 否则 OpenAI 会按注册国家（如 JP）的账单环境返回，检测不到 momo。
+			vpnProxy, proxyErr := s.sunnyPaymentProbeProxyForCountry("VN")
+			if proxyErr != nil {
+				writeError(w, http.StatusBadRequest, proxyErr.Error())
+				return
+			}
+			body["momo_promo_proxy"] = vpnProxy
+		}
 	}
 	task := s.createTask(typ, "sunny", body, total)
 	writeJSON(w, 200, serializeTask(task))

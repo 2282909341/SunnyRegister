@@ -519,3 +519,32 @@ func TestSunnySessionPaymentMethodFilterUsesANDSemantics(t *testing.T) {
 		t.Fatalf("dynamic payment method options=%v", payload.PaymentMethodOptions)
 	}
 }
+
+func TestSunnyPaymentProbeProxyForCountryPicksVN(t *testing.T) {
+	s := newSunnySessionTestServer(t)
+	vn := SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true}
+	jp := SunnyProxy{Address: "http://jp.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true}
+	if err := s.db.Create(&[]*SunnyProxy{&vn, &jp}).Error; err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.sunnyPaymentProbeProxyForCountry("VN")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "http://vn.example:8080" {
+		t.Fatalf("proxy=%q want VN address", got)
+	}
+}
+
+func TestSunnyPaymentProbeProxyForCountryRejectsMissingVN(t *testing.T) {
+	s := newSunnySessionTestServer(t)
+	jp := SunnyProxy{Address: "http://jp.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true}
+	if err := s.db.Create(&jp).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.sunnyPaymentProbeProxyForCountry("VN")
+	if err == nil || !strings.Contains(err.Error(), "VN") {
+		t.Fatalf("want VN-missing error, got %v", err)
+	}
+}
+

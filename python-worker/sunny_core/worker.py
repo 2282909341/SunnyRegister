@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -2526,22 +2526,33 @@ def _run_one_impl(
         result["proxy_traffic"] = finalize_traffic(True)
         registered_access_token = str(session.get("access_token") or "").strip()
         if probe_momo_after_register and registered_access_token:
-            # 勾选"注册后检测0元MoMo"：注册成功后立即探测并写回 sunny_accounts
-            try:
-                _probe_momo_promo_after_register(
-                    db,
-                    str(identity_email),
-                    registered_access_token,
-                    str(proxies.get("register") or ""),
-                )
-            except Exception as exc:
-                if _is_cancel_exception(exc):
-                    raise
+            # 勾选"注册后检测0元MoMo"：注册成功后立即探测并写回 sunny_accounts。
+            # 0 元 MoMo 仅限越南，必须走 backend 注入的 VN 出口代理（momo_promo_proxy），
+            # 不能用注册国家代理（如 JP），否则 OpenAI 按错误账单环境返回，检测不到 momo。
+            momo_proxy = str(payload.get("momo_promo_proxy") or "").strip()
+            if not momo_proxy:
+                db.save_momo_promo_result(str(identity_email), "unknown", "{}", "未配置越南(VN)支付探测代理，跳过0元MoMo自动检测")
                 db.event(
-                    f"[{email}] [0元MoMo] 注册后自动探测失败: {exc}",
+                    f"[{email}] [0元MoMo] 未配置越南(VN)支付探测代理，跳过0元MoMo自动检测",
                     "warning",
-                    detail={"email": email, "scope": "selected"},
+                    detail={"email": email, "scope": "selected", "momo_promo_proxy_missing": True},
                 )
+            else:
+                try:
+                    _probe_momo_promo_after_register(
+                        db,
+                        str(identity_email),
+                        registered_access_token,
+                        momo_proxy,
+                    )
+                except Exception as exc:
+                    if _is_cancel_exception(exc):
+                        raise
+                    db.event(
+                        f"[{email}] [0元MoMo] 注册后自动探测失败: {exc}",
+                        "warning",
+                        detail={"email": email, "scope": "selected"},
+                    )
         if (
             setup_login_secret_enabled
             and base_stage_complete
