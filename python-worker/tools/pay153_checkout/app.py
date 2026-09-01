@@ -91,7 +91,7 @@ DYNAMIC_PROXY_API_MIN_INTERVAL = max(
     0.1, float(os.getenv("PAY153_DYNAMIC_PROXY_MIN_INTERVAL") or 0.35)
 )
 GOPAY_BLOCKED_REBUILD_ATTEMPTS = 10
-MOMO_CHECKOUT_REBUILD_ATTEMPTS = 10
+MOMO_CHECKOUT_REBUILD_ATTEMPTS = 3
 GOPAY_CHECKOUT_CREATION_LIMIT = 100
 GOPAY_CHECKOUT_CREATION_DEADLINE_SECONDS = 600.0
 
@@ -4653,8 +4653,8 @@ class JobStore:
                 if momo_rebuild and momo_chain_attempt >= MOMO_CHECKOUT_REBUILD_ATTEMPTS:
                     self.log(
                         job_id,
-                        "MoMo 本轮顺序创建的 10 个 OAICS 均未形成兼容优惠链路；"
-                        "本次账户完整任务尝试结束",
+                        f"MoMo 本轮顺序创建的 {MOMO_CHECKOUT_REBUILD_ATTEMPTS} 个 OAICS "
+                        "均未形成兼容优惠链路；本次账户完整任务尝试结束",
                     )
                     break
                 if gopay_blocked:
@@ -4665,10 +4665,14 @@ class JobStore:
                     next_text = f"正在重建 GoPay CS Live {gopay_chain_attempt + 1}/10"
                 else:
                     rebuild_text = (
-                        f"MoMo 本轮 OAICS {momo_chain_attempt}/10 未兼容；"
-                        f"丢弃当前 Session 并重建完整链路 {momo_chain_attempt + 1}/10"
+                        f"MoMo 本轮 OAICS {momo_chain_attempt}/"
+                        f"{MOMO_CHECKOUT_REBUILD_ATTEMPTS} 未兼容；丢弃当前 Session 并重建完整链路 "
+                        f"{momo_chain_attempt + 1}/{MOMO_CHECKOUT_REBUILD_ATTEMPTS}"
                     )
-                    next_text = f"正在重建 MoMo OAICS {momo_chain_attempt + 1}/10"
+                    next_text = (
+                        f"正在重建 MoMo OAICS {momo_chain_attempt + 1}/"
+                        f"{MOMO_CHECKOUT_REBUILD_ATTEMPTS}"
+                    )
                 self.log(job_id, rebuild_text)
                 self.update(
                     job_id,

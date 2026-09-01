@@ -139,7 +139,7 @@ def test_momo_attempts_request_custom_oaics_and_keep_cs_live_fallback() -> None:
     ]
 
 
-def test_momo_rebuilds_ten_new_oaics_inside_one_account_attempt() -> None:
+def test_momo_rebuilds_up_to_configured_oaics_budget_inside_one_account_attempt() -> None:
     store = object.__new__(checkout_app.JobStore)
     state = {"status": "running", "error": "", "result": None}
     attempts: list[dict] = []
@@ -173,10 +173,10 @@ def test_momo_rebuilds_ten_new_oaics_inside_one_account_attempt() -> None:
 
     assert len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS
     assert len({id(options) for options in attempts}) == len(attempts)
-    assert [options["promo_on_create"] for options in attempts] == [True, False] * 5
+    assert [options["promo_on_create"] for options in attempts] == [True, False, True]
     assert [options["local_method_strategy"] for options in attempts] == [
-        "standalone", "late_promo",
-    ] * 5
+        "standalone", "late_promo", "standalone",
+    ]
     assert state["status"] == "done"
     assert state["result"]["attempt"] == 1
 
@@ -220,10 +220,11 @@ def test_momo_exhausts_inner_budget_before_rotating_outer_proxy() -> None:
         })
 
     assert len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS + 1
-    assert len({attempt[:2] for attempt in attempts[:10]}) == 1
-    assert attempts[10][:2] != attempts[0][:2]
+    inner_budget = checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS
+    assert len({attempt[:2] for attempt in attempts[:inner_budget]}) == 1
+    assert attempts[inner_budget][:2] != attempts[0][:2]
     assert attempts[0][2:] == (True, "standalone")
-    assert attempts[10][2:] == (False, "late_promo")
+    assert attempts[inner_budget][2:] == (False, "late_promo")
     assert state["status"] == "done"
     assert state["result"]["attempt"] == 2
 
