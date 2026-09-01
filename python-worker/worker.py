@@ -187,6 +187,7 @@ class CheckoutRequest(BaseModel):
     ideal_bank: str = ""
     pix_tax_id: str = ""
     pix_auto_kind: str = "cpf"
+    force_momo: bool = False
 
 
 @app.get("/health")

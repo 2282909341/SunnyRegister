@@ -6407,6 +6407,12 @@ class JobStore:
                     self.update(job_id, percent=100, text="OAICS iDEAL 签名支付链接生成完成", status="done", result=result)
                     return
                 if provider == "momo":
+                    force_momo = bool(options.get("force_momo"))
+                    if force_momo:
+                        self.log(
+                            job_id,
+                            "MoMo 强制支付方式已开启：当 OAICS 未发布原生 momo 时仍按原生 momo 流程强制提交",
+                        )
                     self.update(job_id, percent=58, text="正在读取 OAICS 原生 MoMo 支付方式")
                     custom_state = fetch_oaics_native_checkout_with_retry(
                         chatgpt_http, token, session_id, custom_processor, device_id, "momo",
@@ -6520,7 +6526,7 @@ class JobStore:
                             promo_action,
                         ),
                     )
-                    if promo_action == "rebuild":
+                    if promo_action == "rebuild" and not force_momo:
                         raise RuntimeError(
                             "MOMO_CHECKOUT_REBUILD_REQUIRED: OAICS 首次响应和详情均未发布 "
                             "MoMo 支付方式，不能对不兼容的支付方式集合提交优惠；"
@@ -6592,7 +6598,7 @@ class JobStore:
                                 custom_currency,
                             ),
                         )
-                        if "momo" not in native_methods and not custom_method_id:
+                        if "momo" not in native_methods and not custom_method_id and not force_momo:
                             raise RuntimeError(
                                 "MOMO_METHOD_REMOVED_REBUILD_REQUIRED: 优惠更新后的最新 OAICS "
                                 "状态已撤下 MoMo 支付方式；available={}；custom={}".format(
@@ -6641,7 +6647,7 @@ class JobStore:
                     custom_method_id = oaics_stage_custom_payment_method_id(
                         custom_state, tax_checkout, "momo",
                     )
-                    if "momo" not in native_methods and not custom_method_id:
+                    if "momo" not in native_methods and not custom_method_id and not force_momo:
                         raise RuntimeError(
                             "MOMO_METHOD_REMOVED_REBUILD_REQUIRED: VN taxes 后的最新 OAICS "
                             "状态未发布 MoMo 支付方式；available={}；custom={}".format(
@@ -6657,7 +6663,7 @@ class JobStore:
                         ),
                     )
                     momo_discounted = is_momo_promo_amount(custom_amount, custom_currency)
-                    if promo_requested and not momo_discounted:
+                    if promo_requested and not momo_discounted and not (force_momo and "momo" not in native_methods):
                         raise RuntimeError(
                             "MOMO_PROMO_AMOUNT_REQUIRED: MoMo 优惠未生效或金额未知；"
                             f"要求 0 <= amount <= 50 VND，实际 amount={custom_amount} {custom_currency}"
@@ -6667,7 +6673,7 @@ class JobStore:
                     confirmation_kind = "custom_payment_method"
                     intent_result: dict[str, Any] = {}
                     approved: dict[str, Any] = {}
-                    if "momo" in native_methods:
+                    if "momo" in native_methods or (force_momo and not custom_method_id):
                         self.update(job_id, percent=80, text="正在创建 OAICS 原生 MoMo confirmation_token")
                         publishable_key = (
                             _nested_scalar(custom_state, ("publishable_key", "stripe_publishable_key", "public_key"))
@@ -6679,7 +6685,7 @@ class JobStore:
                         momo_ctx = {
                             "checkout_amount": custom_amount,
                             "currency": str(custom_currency or "VND").lower(),
-                            "payment_method_types": native_methods,
+                            "payment_method_types": (["momo"] if force_momo and "momo" not in native_methods else native_methods),
                             "runtime_version": _nested_scalar(
                                 custom_state, ("runtime_version", "stripe_js_version"),
                             ) or sc.DEFAULT_STRIPE_RUNTIME_VERSION,
@@ -7645,6 +7651,7 @@ def start_checkout():
         "paired_proxy_rotation": bool(data.get("paired_proxy_rotation", False)),
         "use_sen": data.get("use_sen", True) is not False,
         "use_so": data.get("use_so", True) is not False,
+        "force_momo": bool(data.get("force_momo")),
         "dynamic_proxy_api": dynamic_proxy_api,
         "allow_missing_customer_session": bool(data.get("allow_missing_customer_session")) and internal_request,
         "entry_proxy_country": str(data.get("entry_proxy_country") or (str(data.get("promo_country") or country) if link_type == "kakao" else ("VN" if link_type == "gcash" else ("US" if link_type == "ph_short" and country == "PH" else country)))).upper(),

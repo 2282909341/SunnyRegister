@@ -475,6 +475,7 @@ export default function CheckoutManager() {
   const [retryCount, setRetryCount] = useState(() => savedNumber(savedPreferences.retryCount, 10, 0, 50));
   const [concurrency, setConcurrency] = useState(() => savedNumber(savedPreferences.concurrency, 3, 1, 100));
   const [usePromo, setUsePromo] = useState(savedPreferences.usePromo ?? true);
+  const [forceMomo, setForceMomo] = useState(false);
   const [promoCampaign, setPromoCampaign] = useState(savedPreferences.promoCampaign ?? "plus-1-month-free");
   const [promoCode, setPromoCode] = useState(savedPreferences.promoCode ?? "");
   const [promoCountry, setPromoCountry] = useState(savedPreferences.promoCountry ?? "");
@@ -858,7 +859,7 @@ export default function CheckoutManager() {
       return Object.fromEntries(Object.entries(old).filter(([key]) => !currentBatchKeys.has(key)));
     });
     try {
-      const response = await apiFetch("/sunny/checkout", { method: "POST", body: JSON.stringify({ system_at: systemAT, session_ids: systemAT ? selected : [], external_ats: systemAT ? [] : selectedExternalRows.map((x) => x.token), checkout_kinds: systemAT ? [] : selectedExternalRows.map((x) => normalized(x.checkout_kind) || "unknown"), checkout_proxies: checkoutProxies, promotion_proxies: effectivePromotionProxies, plan, link_type: linkType, country, currency, retry_count: retryCount, concurrency, use_promo: usePromo, promo_campaign: promoCampaign, promo_country: linkType === "gcash" ? "PH" : promoCountry, promo_code: promoCode, ideal_bank: idealBank, workspace_name: workspaceName, workspace_id: workspaceId, seat_quantity: seatQuantity, price_interval: priceInterval, credit_quantity: creditQuantity, pix_tax_id: pixTaxID, pix_auto_kind: pixAutoKind }) });
+      const response = await apiFetch("/sunny/checkout", { method: "POST", body: JSON.stringify({ system_at: systemAT, session_ids: systemAT ? selected : [], external_ats: systemAT ? [] : selectedExternalRows.map((x) => x.token), checkout_kinds: systemAT ? [] : selectedExternalRows.map((x) => normalized(x.checkout_kind) || "unknown"), checkout_proxies: checkoutProxies, promotion_proxies: effectivePromotionProxies, plan, link_type: linkType, country, currency, retry_count: retryCount, concurrency, use_promo: usePromo, promo_campaign: promoCampaign, promo_country: linkType === "gcash" ? "PH" : promoCountry, promo_code: promoCode, force_momo: forceMomo, ideal_bank: idealBank, workspace_name: workspaceName, workspace_id: workspaceId, seat_quantity: seatQuantity, price_interval: priceInterval, credit_quantity: creditQuantity, pix_tax_id: pixTaxID, pix_auto_kind: pixAutoKind }) });
       const taskID = String(response.id || response.task_id);
       setTask(response);
       setActiveTaskID(taskID);
@@ -893,6 +894,7 @@ export default function CheckoutManager() {
         <label className="w-52 max-w-full"><span className="mb-1 flex h-5 items-center text-xs text-[var(--text-muted)]">优惠码（Team）</span><input className="h-10 w-full rounded-xl border border-[var(--border)] bg-transparent px-3 text-sm" value={promoCode} onChange={(e) => setPromoCode(e.target.value)} disabled={plan !== "team"} placeholder="选填" /></label>
         <label><span className="mb-1 flex h-5 items-center text-xs text-[var(--text-muted)]">失败重试次数</span><input className="h-10 w-24 rounded-xl border border-[var(--border)] bg-transparent px-3 text-sm" type="number" min={0} max={50} value={retryCount} onChange={(e) => setRetryCount(Number(e.target.value))} /></label>
         <label><span className="mb-1 flex h-5 items-center text-xs text-[var(--text-muted)]">提链并发</span><input className="h-10 w-24 rounded-xl border border-[var(--border)] bg-transparent px-3 text-sm" type="number" min={1} max={100} value={concurrency} onChange={(e) => setConcurrency(Number(e.target.value))} /></label>
+        {linkType === "momo" && <label className="flex flex-col"><span className="mb-1 flex h-5 items-center gap-2 text-xs text-[var(--text-muted)]"><span>强制 MoMo 支付方式</span><button type="button" className={`sr-switch-only scale-90 ${forceMomo ? "on" : ""}`} aria-label="强制 MoMo 支付方式" onClick={(event) => { event.preventDefault(); setForceMomo(!forceMomo); }}><span /></button></span><span className="h-10 w-24 text-[11px] leading-tight text-[var(--text-muted)]">支付方式类型无 momo 时仍强制提交</span></label>}
         <Button variant="outline" disabled={precheckBusy || selectedCount === 0} onClick={() => void precheck()}>{precheckBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{precheckBusy ? "检测中..." : "检测资格 / Checkout"}</Button>
         <Button className="ml-auto" disabled={checkoutBusy || selectedCount === 0} onClick={() => void start()}>{checkoutBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}{checkoutBusy ? "提链中..." : "开始提链"}</Button>
       </div>

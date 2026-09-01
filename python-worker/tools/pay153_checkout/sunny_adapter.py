@@ -81,6 +81,7 @@ def start_checkout(payload: dict[str, Any]) -> str:
         "paired_proxy_rotation": True,
         "use_sen": True,
         "use_so": True,
+        "force_momo": bool(payload.get("force_momo")),
         "entry_proxy_country": str(payload.get("promo_country") or payload.get("country") or default_country).upper(),
         "exit_proxy_country": str(payload.get("country") or default_country).upper(),
     }
