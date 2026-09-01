@@ -465,7 +465,7 @@ func TestFetchXbovoMailSubjectsDoesNotFetchBodies(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/messages":
-			fmt.Fprint(w, `{"ok":true,"messages":[{"id":12,"subject":"ChatGPT - Your new plan"}]}`)
+			fmt.Fprint(w, `{"ok":true,"messages":[{"id":12,"subject":"ChatGPT - Your new plan","preview":"Access has been deactivated"}]}`)
 		case "/api/v1/message/raw":
 			rawRequests++
 			fmt.Fprint(w, `{"ok":true,"text":"Manage subscription"}`)
@@ -484,5 +484,9 @@ func TestFetchXbovoMailSubjectsDoesNotFetchBodies(t *testing.T) {
 	}
 	if rawRequests != 0 {
 		t.Fatalf("subject-only query fetched %d message bodies", rawRequests)
+	}
+	evidence, err := fetchXbovoHealthMailEvidence("user@icloud.com", "key", 5, "")
+	if err != nil || strings.Join(evidence, "|") != "ChatGPT - Your new plan\nAccess has been deactivated" {
+		t.Fatalf("health evidence=%#v err=%v", evidence, err)
 	}
 }

@@ -964,13 +964,20 @@ func TestSunnyHealthBanMarkers(t *testing.T) {
 	for _, title := range []string{
 		"Access Deactivated",
 		"Your account [C-75ROCz5moZsB] has been deactivated",
-		"[c-Ab12CD34] verification notice",
+		"账户已被停用",
+		"アカウントが無効になりました",
 	} {
 		if !sunnyHealthBanMarker.MatchString(title) {
 			t.Fatalf("title %q was not recognized as banned", title)
 		}
 	}
-	for _, title := range []string{"Welcome to ChatGPT", "Access restored"} {
+	for _, title := range []string{
+		"Welcome to ChatGPT",
+		"Access restored",
+		"Account notice [C-75ROCz5moZsB]",
+		"OpenAI ChatGPT - 規定違反と無効化についての警告 [C-gzvRqiPNpDSe]",
+		"規定違反が繰り返される場合は、サービスへのアクセスを無効にする可能性があります。",
+	} {
 		if sunnyHealthBanMarker.MatchString(title) {
 			t.Fatalf("title %q was incorrectly recognized as banned", title)
 		}
@@ -1475,7 +1482,7 @@ func TestSunnyHealthTaskMarksAccountBanned(t *testing.T) {
 		if email != "session@example.com" || limit != 5 {
 			t.Fatalf("unexpected health query: email=%s limit=%d", email, limit)
 		}
-		return []string{"Account notice [C-75ROCz5moZsB]"}, nil
+		return []string{"Your account [C-75ROCz5moZsB] has been deactivated"}, nil
 	}
 	defer func() { sunnyFetchOutlookMailSubjects = previousFetch }()
 
@@ -1517,7 +1524,10 @@ func TestSunnyHealthTaskAliveDoesNotChangeEditOrStatusTime(t *testing.T) {
 	previousFetch := sunnyFetchOutlookMailSubjects
 	previousEndpoint := sunnyProbeAccessTokenEndpoint
 	sunnyFetchOutlookMailSubjects = func(email, clientID, refreshToken string, limit int, proxyURL string) ([]string, error) {
-		return []string{"Your weekly account update"}, nil
+		return []string{
+			"OpenAI ChatGPT - 規定違反と無効化についての警告 [C-gzvRqiPNpDSe]\n" +
+				"規定違反が繰り返される場合は、サービスへのアクセスを無効にする可能性があります。",
+		}, nil
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

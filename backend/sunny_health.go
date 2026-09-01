@@ -23,7 +23,10 @@ import (
 
 const sunnyHealthTaskType = "sunny_account_health_check"
 
-var sunnyHealthBanMarker = regexp.MustCompile(`(?i)access\s+deactivated|\[\s*C-[A-Za-z0-9]{6,32}\s*\]`)
+// The [C-...] value is a trust-and-safety case identifier, not a ban signal.
+// Only completed deactivation statements are terminal evidence; warning and
+// restriction notices must remain eligible for normal account checks.
+var sunnyHealthBanMarker = regexp.MustCompile(`(?i)(?:access|account)(?:\s+\[\s*C-[A-Za-z0-9_-]{6,64}\s*\])?\s+(?:has\s+been\s+|was\s+|is\s+)?(?:deactivated|disabled)|(?:账户|账号)(?:已被|已经被|已|已经|被)(?:封禁|停用|禁用)|(?:アカウント|アクセス)(?:が|は)?(?:無効になりました|無効化されました|停止されました)|(?:계정|액세스)(?:이|가|은|는)?\s*(?:비활성화되었습니다|사용\s*중지되었습니다)`)
 var sunnyFetchOutlookMailSubjects = fetchOutlookMailSubjects
 var sunnyFetchMailSubjectsViaGraph = fetchMailSubjectsViaGraph
 var sunnyFetchMailHeadersViaIMAP = fetchMailHeadersViaIMAP
@@ -226,7 +229,7 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 				}
 			}
 		} else if candidate.MailboxType == "apple" && candidate.Channel == "xbovo" {
-			subjects, fetchErr = fetchXbovoMailSubjects(candidate.Email, candidate.AccessKey, 5, proxyURL)
+			subjects, fetchErr = fetchXbovoHealthMailEvidence(candidate.Email, candidate.AccessKey, 5, proxyURL)
 		} else if candidate.MailboxType == "apple" && candidate.Channel == "url_api" {
 			subjects, fetchErr = fetchURLAPIMailSubjects(candidate.Email, candidate.AccessKey, 5, proxyURL)
 		} else if strings.TrimSpace(proxyURL) != "" {
@@ -279,11 +282,11 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 				s.appendAccountTaskEvent(task.ID, outcome.Email, "health", "health.banned", fmt.Sprintf("账户 %s：已封禁", outcome.Email), "warning", nil)
 				s.db.Model(&SunnyMailbox{}).Where("email = ?", outcome.Email).UpdateColumns(map[string]any{
 					"last_health_checked_at": now, "status": "已封禁", "status_changed_at": now,
-					"last_error": "测活邮件标题命中账户封禁标记", "updated_at": now,
+					"last_error": "测活邮件内容明确显示账户已封禁或停用", "updated_at": now,
 				})
 				s.db.Model(&SunnyAccount{}).Where("email = ?", outcome.Email).UpdateColumns(map[string]any{
 					"last_health_checked_at": now, "status": "已封禁", "status_changed_at": now,
-					"last_error": "测活邮件标题命中账户封禁标记", "updated_at": now,
+					"last_error": "测活邮件内容明确显示账户已封禁或停用", "updated_at": now,
 				})
 				s.db.Model(&SunnySession{}).Where("email = ?", outcome.Email).Updates(map[string]any{
 					"health_check_status": "banned", "health_check_error": "",
@@ -382,7 +385,7 @@ func fetchMailSubjectsViaGraphWithMeter(accessToken string, limit int, proxyURL 
 	query := endpoint.Query()
 	query.Set("$top", strconv.Itoa(limit))
 	query.Set("$orderby", "receivedDateTime desc")
-	query.Set("$select", "subject")
+	query.Set("$select", "subject,bodyPreview")
 	endpoint.RawQuery = query.Encode()
 
 	client := &http.Client{Timeout: 15 * time.Second}
@@ -415,7 +418,8 @@ func fetchMailSubjectsViaGraphWithMeter(accessToken string, limit int, proxyURL 
 	}
 	var payload struct {
 		Value []struct {
-			Subject string `json:"subject"`
+			Subject     string `json:"subject"`
+			BodyPreview string `json:"bodyPreview"`
 		} `json:"value"`
 		Error struct {
 			Code    string `json:"code"`
@@ -431,7 +435,9 @@ func fetchMailSubjectsViaGraphWithMeter(accessToken string, limit int, proxyURL 
 	}
 	subjects := make([]string, 0, len(payload.Value))
 	for _, message := range payload.Value {
-		subjects = append(subjects, message.Subject)
+		if evidence := strings.TrimSpace(message.Subject + "\n" + message.BodyPreview); evidence != "" {
+			subjects = append(subjects, evidence)
+		}
 	}
 	return subjects, nil
 }
