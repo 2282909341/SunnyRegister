@@ -515,6 +515,32 @@ func TestSunnyCommerceWorkerResponse(t *testing.T) {
 	}
 }
 
+func TestSunnyCommerceWorkerUsesBillingContextOverride(t *testing.T) {
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var requestBody struct {
+			Country  string `json:"country"`
+			Currency string `json:"currency"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Fatalf("decode worker request: %v", err)
+		}
+		if requestBody.Country != "VN" || requestBody.Currency != "VND" {
+			t.Fatalf("unexpected billing override: %#v", requestBody)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"trial":    map[string]any{"state": "eligible", "http": 200},
+			"checkout": map[string]any{"kind": "oaics", "payment_methods": []string{"momo"}, "http": 200},
+		})
+	}))
+	defer worker.Close()
+	t.Setenv("PYTHON_WORKER_URL", worker.URL)
+	ctx := context.WithValue(context.Background(), sunnyCheckoutBillingContextKey{}, sunnyCheckoutBillingOverride{Country: "VN", Currency: "VND"})
+	result, ok := probeSunnyCommerceViaWorker(ctx, "secret-at", "http://promotion-proxy", "http://checkout-proxy")
+	if !ok || result.CheckoutKind != "oaics" || !strings.Contains(strings.Join(result.PaymentMethods, ","), "momo") {
+		t.Fatalf("unexpected MOMO commerce result: ok=%v result=%#v", ok, result)
+	}
+}
+
 func TestSunnyCommerceUsesWorkerWhenTrafficMeterIsActive(t *testing.T) {
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{

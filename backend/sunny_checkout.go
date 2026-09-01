@@ -83,6 +83,9 @@ type sunnyCheckoutPrecheckRequest struct {
 	ExternalATs      []string `json:"external_ats"`
 	CheckoutProxies  string   `json:"checkout_proxies"`
 	PromotionProxies string   `json:"promotion_proxies"`
+	UsePromo         bool     `json:"use_promo"`
+	Country          string   `json:"country"`
+	Currency         string   `json:"currency"`
 }
 
 type sunnyCheckoutCredential struct {
@@ -236,14 +239,40 @@ func normalizeCheckoutRequest(in sunnyCheckoutRequest) (sunnyCheckoutRequest, []
 	if err != nil {
 		return in, nil, nil, fmt.Errorf("Checkout 代理池: %w", err)
 	}
+	// Promotion is a separate route only when the caller explicitly enables
+	// the Plus promotion. With the toggle off, the Checkout route is enough and
+	// an empty Promotion pool must not block a no-promo payment task.
 	promotion := append([]string(nil), checkout...)
-	if in.LinkType != "gcash" {
+	if in.UsePromo && in.LinkType != "gcash" {
 		promotion, err = splitCheckoutPool(in.PromotionProxies)
 		if err != nil {
 			return in, nil, nil, fmt.Errorf("Promotion 代理池: %w", err)
 		}
 	}
 	return in, checkout, promotion, nil
+}
+
+func normalizeCheckoutPrecheckBilling(country, currency string) (string, string, error) {
+	country = strings.ToUpper(strings.TrimSpace(country))
+	currency = strings.ToUpper(strings.TrimSpace(currency))
+	if country == "" && currency == "" {
+		country, currency = sunnyCheckoutBilling()
+		return country, currency, nil
+	}
+	if country == "" {
+		return "", "", fmt.Errorf("预检国家/地区不能为空")
+	}
+	expected := checkoutCountryCurrency[country]
+	if expected == "" {
+		return "", "", fmt.Errorf("不支持的预检国家/地区")
+	}
+	if currency == "" {
+		currency = expected
+	}
+	if currency != expected {
+		return "", "", fmt.Errorf("预检国家/地区与币种不匹配")
+	}
+	return country, currency, nil
 }
 
 func checkoutCredentialID() string {
@@ -266,15 +295,23 @@ func (s *Server) sunnyCheckout(w http.ResponseWriter, r *http.Request, parts []s
 			writeError(w, http.StatusBadRequest, "请求格式无效")
 			return
 		}
+		country, currency, err := normalizeCheckoutPrecheckBilling(body.Country, body.Currency)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		checkout, err := splitCheckoutPool(body.CheckoutProxies)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "Checkout 代理池: "+err.Error())
 			return
 		}
-		promotion, err := splitCheckoutPool(body.PromotionProxies)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "Promotion 代理池: "+err.Error())
-			return
+		promotion := append([]string(nil), checkout...)
+		if body.UsePromo {
+			promotion, err = splitCheckoutPool(body.PromotionProxies)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "Promotion 代理池: "+err.Error())
+				return
+			}
 		}
 		type candidate struct {
 			Email, Token string
@@ -313,7 +350,16 @@ func (s *Server) sunnyCheckout(w http.ResponseWriter, r *http.Request, parts []s
 			}
 			probeCtx := context.WithValue(context.Background(), sunnyTrialProxyContextKey{}, promotion[candidateIndex%len(promotion)])
 			probeCtx = context.WithValue(probeCtx, sunnyCheckoutProxyContextKey{}, checkout[candidateIndex%len(checkout)])
-			commerce := sunnyCheckCommerce(probeCtx, item.Token)
+			probeCtx = context.WithValue(probeCtx, sunnyCheckoutBillingContextKey{}, sunnyCheckoutBillingOverride{Country: country, Currency: currency})
+			var commerce sunnyCommerceProbeResult
+			if body.UsePromo {
+				commerce = sunnyCheckCommerce(probeCtx, item.Token)
+			} else {
+				// No-promotion prechecks are intentionally Checkout-only. This
+				// avoids trial/coupon calls and keeps the disabled branch free of
+				// Promotion side effects.
+				commerce = checkSunnyCheckoutOnly(probeCtx, item.Token, checkout[candidateIndex%len(checkout)])
+			}
 			trial := normalizeSunnyTrialEligibility(commerce.Eligibility)
 			checkStatus := "checked"
 			if commerce.InvalidToken {
@@ -366,13 +412,18 @@ func (s *Server) sunnyCheckout(w http.ResponseWriter, r *http.Request, parts []s
 		} else {
 			for externalIndex, raw := range body.ExternalATs {
 				token, email := parseCheckoutExternalAT(raw)
-				if token != "" {
-					checkoutKind := sunnyCheckoutUnknown
-					if externalIndex < len(body.CheckoutKinds) {
-						checkoutKind = normalizeSunnyCheckoutKind(body.CheckoutKinds[externalIndex])
+				if token == "" {
+					if strings.EqualFold(strings.TrimSpace(body.LinkType), "momo") {
+						writeError(w, http.StatusBadRequest, fmt.Sprintf("第 %d 个外部 AT 为空、格式无效或已过期", externalIndex+1))
+						return
 					}
-					creds = append(creds, sunnyCheckoutCredential{Token: token, Email: email, CheckoutKind: checkoutKind, External: true})
+					continue
 				}
+				checkoutKind := sunnyCheckoutUnknown
+				if externalIndex < len(body.CheckoutKinds) {
+					checkoutKind = normalizeSunnyCheckoutKind(body.CheckoutKinds[externalIndex])
+				}
+				creds = append(creds, sunnyCheckoutCredential{Token: token, Email: email, CheckoutKind: checkoutKind, External: true})
 			}
 			if len(creds) == 0 {
 				writeError(w, 400, "请导入至少一个有效 AT")
@@ -468,23 +519,28 @@ func parseCheckoutExternalAT(raw string) (string, string) {
 	if raw == "" {
 		return "", ""
 	}
+	token := ""
+	email := ""
 	if strings.HasPrefix(raw, "{") {
 		var v map[string]any
 		if json.Unmarshal([]byte(raw), &v) == nil {
 			for _, k := range []string{"access_token", "accessToken", "token"} {
 				if t := strings.TrimSpace(text(v[k])); t != "" {
-					return t, text(v["email"])
+					token = t
+					break
 				}
 			}
+			email = strings.TrimSpace(text(v["email"]))
 		}
 	}
-	parts := strings.Fields(raw)
-	token := parts[0]
-	email := ""
-	if m := checkoutATEmail.FindString(raw); m != "" {
-		email = m
+	if token == "" {
+		parts := strings.Fields(raw)
+		token = parts[0]
+		if m := checkoutATEmail.FindString(raw); m != "" {
+			email = m
+		}
 	}
-	if !strings.Contains(token, ".") && !strings.HasPrefix(token, "eyJ") {
+	if !strings.Contains(token, ".") || !strings.HasPrefix(token, "eyJ") {
 		return "", ""
 	}
 	claims := decodeJWTPayload(token)
@@ -492,9 +548,13 @@ func parseCheckoutExternalAT(raw string) (string, string) {
 		return "", email
 	}
 	if email == "" {
-		email = firstText(claims["email"], claims["https://api.openai.com/profile"])
+		if value, ok := claims["email"].(string); ok {
+			email = strings.TrimSpace(value)
+		}
 		if profile, ok := claims["https://api.openai.com/profile"].(map[string]any); ok {
-			email = firstText(email, profile["email"])
+			if value, ok := profile["email"].(string); ok && email == "" {
+				email = strings.TrimSpace(value)
+			}
 		}
 	}
 	return token, email
@@ -507,20 +567,51 @@ func (s *Server) checkoutCredential(taskID string, index int) string {
 	return values.Tokens[fmt.Sprintf("%d", index)]
 }
 
+func (s *Server) releaseCheckoutCredential(credentialID string) {
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return
+	}
+	s.checkoutMu.Lock()
+	delete(s.checkoutCreds, credentialID)
+	s.checkoutMu.Unlock()
+}
+
 func (s *Server) executeSunnyCheckoutTask(task *Task, payload map[string]any) {
+	credentialID := text(payload["credential_id"])
+	defer s.releaseCheckoutCredential(credentialID)
 	now := time.Now()
+	// Claim the task atomically. The cancel endpoint can change a claimed task
+	// to cancel_requested before this goroutine gets scheduled; saving the
+	// stale in-memory task here would otherwise resurrect it as running.
+	started := s.db.Model(&Task{}).
+		Where("id = ? AND status = ?", task.ID, TaskClaimed).
+		Updates(map[string]any{
+			"status":     TaskRunning,
+			"started_at": now,
+			"updated_at": now,
+		})
+	if started.Error != nil {
+		s.appendTaskEvent(task.ID, "提链任务启动状态写入失败", "log", "error", map[string]any{"error": started.Error.Error()})
+		return
+	}
+	if started.RowsAffected == 0 {
+		// Re-read before deciding whether to stop. In particular, do not use the
+		// stale task pointer with Save, because it may still contain claimed.
+		var current Task
+		if err := s.db.First(&current, "id = ?", task.ID).Error; err == nil {
+			if current.Status == TaskCancelRequested {
+				_ = s.finishCancelledTask(&current, jsonMap(current.ResultJSON), "用户已停止提链任务")
+			}
+		}
+		return
+	}
 	task.Status = TaskRunning
 	task.StartedAt.Valid = true
 	task.StartedAt.Time = now
-	s.db.Save(task)
+	task.UpdatedAt = now
 	ctx, cancel := s.taskCancellationContext(task)
 	defer cancel()
-	credentialID := text(payload["credential_id"])
-	defer func() {
-		s.checkoutMu.Lock()
-		delete(s.checkoutCreds, credentialID)
-		s.checkoutMu.Unlock()
-	}()
 	var rows []map[string]any
 	if raw, ok := payload["credentials"].([]any); ok {
 		for _, v := range raw {
@@ -573,7 +664,10 @@ func (s *Server) executeSunnyCheckoutTask(task *Task, payload map[string]any) {
 			}
 			mu.Lock()
 			recordSunnyCheckoutResult(task, result, item)
-			s.db.Save(task)
+			s.persistTaskProgress(task, intValue(result["success"], 0), intValue(result["failed"], 0), time.Now())
+			// Keep partial result items available to polling clients without
+			// overwriting a concurrent cancel_requested status.
+			s.db.Model(&Task{}).Where("id = ?", task.ID).Updates(map[string]any{"result_json": task.ResultJSON})
 			mu.Unlock()
 			level := "info"
 			if text(item["status"]) != "succeeded" {
@@ -585,17 +679,37 @@ func (s *Server) executeSunnyCheckoutTask(task *Task, payload map[string]any) {
 		}()
 	}
 	wg.Wait()
+	s.finishSunnyCheckoutTask(task, result)
+}
+
+func (s *Server) finishSunnyCheckoutTask(task *Task, result map[string]any) {
 	if s.finishCancelledTask(task, result, "用户已停止提链任务") {
 		return
 	}
-	task.ResultJSON = dumpJSON(result)
-	task.Status = TaskSucceeded
+	status := TaskSucceeded
 	if intValue(result["success"], 0) == 0 {
-		task.Status = TaskFailed
+		status = TaskFailed
 	}
+	finishedAt := time.Now()
+	task.ResultJSON = dumpJSON(result)
+	task.Status = status
 	task.FinishedAt.Valid = true
-	task.FinishedAt.Time = time.Now()
-	s.db.Save(task)
+	task.FinishedAt.Time = finishedAt
+	// Complete only an active task. A cancel request may arrive after the
+	// worker goroutines finish but before this write; the conditional update
+	// preserves that request for the cancellation path to finalize.
+	updated := s.db.Model(&Task{}).
+		Where("id = ? AND status IN ?", task.ID, []string{TaskClaimed, TaskRunning}).
+		Updates(map[string]any{
+			"status":      status,
+			"error":       "",
+			"result_json": task.ResultJSON,
+			"finished_at": finishedAt,
+			"updated_at":  finishedAt,
+		})
+	if updated.RowsAffected == 0 {
+		_ = s.finishCancelledTask(task, result, "用户已停止提链任务")
+	}
 }
 
 func recordSunnyCheckoutResult(task *Task, result map[string]any, item map[string]any) {

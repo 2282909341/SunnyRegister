@@ -9,10 +9,11 @@ import { Button } from "@/components/ui/button";
 import { apiFetch, cn } from "@/lib/utils";
 import { useI18n } from "@/lib/i18n-context";
 import DirectCardPayment from "@/pages/payments/DirectCardPayment";
+import MomoPayment from "@/pages/payments/MomoPayment";
 
 type Row = Record<string, any>;
 type GoPayView = "overview" | "register" | "pool" | "accounts" | "payment" | "settings";
-type PaymentMethod = "gopay" | "paypal" | "direct_card";
+type PaymentMethod = "gopay" | "momo" | "paypal" | "direct_card";
 type RunAction = (key: string, action: () => Promise<any>, success: string, refresh?: () => Promise<void>) => Promise<boolean>;
 
 const api = (path: string, options?: RequestInit) => apiFetch(`/payments/gopay${path}`, options);
@@ -137,6 +138,7 @@ export default function PaymentManagement() {
 
     <nav className="payment-method-tabs" aria-label="支付方式">
       <button className={method === "gopay" ? "active" : ""} type="button" onClick={() => setMethod("gopay")}><span className="gopay-method-mark">Go</span><span><strong>GoPay 支付</strong><small>Indonesia</small></span></button>
+      <button className={method === "momo" ? "active" : ""} type="button" onClick={() => setMethod("momo")}><span className="momo-method-mark">M</span><span><strong>MOMO 支付</strong><small>Vietnam OAICS</small></span></button>
       <button className={method === "paypal" ? "active" : ""} type="button" onClick={() => setMethod("paypal")}><CreditCard /><span><strong>PayPal 支付</strong><small>Billing Agreement</small></span></button>
       <button className={method === "direct_card" ? "active" : ""} type="button" onClick={() => setMethod("direct_card")}><span className="direct-card-method-mark"><CreditCard /></span><span><strong>直卡协议</strong><small>Card Protocol</small></span></button>
     </nav>
@@ -154,7 +156,7 @@ export default function PaymentManagement() {
         </section>}
 
         {loading ? <div className="gopay-loading"><Loader2 className="animate-spin" />正在加载支付模块...</div> : <>
-          {method === "paypal" ? <PayPalView key={`${paypalConfig.country || ""}-${paypalConfig.buyer_mode || ""}`} jobs={paypalJobs} config={paypalConfig} busy={busy} run={run} refresh={loadPaypal} /> : method === "direct_card" ? <DirectCardPayment /> : <>
+          {method === "momo" ? <MomoPayment /> : method === "paypal" ? <PayPalView key={`${paypalConfig.country || ""}-${paypalConfig.buyer_mode || ""}`} jobs={paypalJobs} config={paypalConfig} busy={busy} run={run} refresh={loadPaypal} /> : method === "direct_card" ? <DirectCardPayment /> : <>
             {view === "overview" && <Overview registerJobs={registerJobs} paymentJobs={paymentJobs} onView={setView} />}
             {view === "register" && <RegisterView jobs={registerJobs} busy={busy} run={run} refresh={loadJobs} onLogs={setLogJob} />}
             {view === "pool" && <PoolView phones={phones} search={poolSearch} setSearch={setPoolSearch} busy={busy} run={run} refresh={loadPhones} />}

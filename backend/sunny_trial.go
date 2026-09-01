@@ -61,6 +61,12 @@ var (
 
 type sunnyTrialProxyContextKey struct{}
 type sunnyCheckoutProxyContextKey struct{}
+type sunnyCheckoutBillingContextKey struct{}
+
+type sunnyCheckoutBillingOverride struct {
+	Country  string
+	Currency string
+}
 
 type sunnyTrialCandidate struct {
 	SessionID   uint
@@ -272,6 +278,19 @@ func sunnyCheckoutBilling() (string, string) {
 	return country, currency
 }
 
+func sunnyCheckoutBillingForContext(ctx context.Context) (string, string) {
+	country, currency := sunnyCheckoutBilling()
+	if override, ok := ctx.Value(sunnyCheckoutBillingContextKey{}).(sunnyCheckoutBillingOverride); ok {
+		if value := strings.ToUpper(strings.TrimSpace(override.Country)); value != "" {
+			country = value
+		}
+		if value := strings.ToUpper(strings.TrimSpace(override.Currency)); value != "" {
+			currency = value
+		}
+	}
+	return country, currency
+}
+
 func sunnyFindStringByKeys(value any, keys map[string]bool) string {
 	switch node := value.(type) {
 	case map[string]any:
@@ -352,7 +371,7 @@ func sunnyPaymentMethods(value any) []string {
 }
 
 func probeSunnyCheckout(ctx context.Context, client *http.Client, accessToken string) (string, []string, bool, error) {
-	country, currency := sunnyCheckoutBilling()
+	country, currency := sunnyCheckoutBillingForContext(ctx)
 	return probeSunnyCheckoutForCountry(ctx, client, accessToken, country, currency)
 }
 
@@ -443,13 +462,37 @@ func checkSunnyCommerce(ctx context.Context, accessToken string, proxyURLs ...st
 	return result
 }
 
+// checkSunnyCheckoutOnly deliberately skips the promotion/trial endpoints.
+// It is used by the no-promotion branch so a diagnostic probe cannot mutate or
+// reject a task based on an offer the caller explicitly disabled.
+func checkSunnyCheckoutOnly(ctx context.Context, accessToken string, proxyURL string) sunnyCommerceProbeResult {
+	result := sunnyCommerceProbeResult{
+		Eligibility:    sunnyTrialUnknown,
+		CheckoutKind:   sunnyCheckoutUnknown,
+		PaymentMethods: []string{},
+	}
+	token := strings.TrimSpace(accessToken)
+	if token == "" {
+		result.CheckoutError = "账户缺少 Access Token"
+		return result
+	}
+	client := sunnyCommerceHTTPClientWithMeter(sunnyTrafficMeterFromContext(ctx), strings.TrimSpace(proxyURL))
+	checkoutKind, methods, invalid, err := probeSunnyCheckout(ctx, client, token)
+	result.CheckoutKind, result.PaymentMethods = checkoutKind, methods
+	result.InvalidToken = invalid
+	if err != nil {
+		result.CheckoutError = err.Error()
+	}
+	return result
+}
+
 func probeSunnyCommerceViaWorker(ctx context.Context, accessToken, promotionProxyURL string, checkoutProxyURLs ...string) (sunnyCommerceProbeResult, bool) {
 	result := sunnyCommerceProbeResult{Eligibility: sunnyTrialUnknown, CheckoutKind: sunnyCheckoutUnknown, PaymentMethods: []string{}}
 	workerURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PYTHON_WORKER_URL")), "/")
 	if workerURL == "" {
 		workerURL = "http://127.0.0.1:8765"
 	}
-	country, currency := sunnyCheckoutBilling()
+	country, currency := sunnyCheckoutBillingForContext(ctx)
 	checkoutProxyURL := promotionProxyURL
 	if len(checkoutProxyURLs) > 0 && strings.TrimSpace(checkoutProxyURLs[0]) != "" {
 		checkoutProxyURL = strings.TrimSpace(checkoutProxyURLs[0])

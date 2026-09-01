@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -45,10 +46,21 @@ func TestGoPayProviderDefaultsToIndonesia(t *testing.T) {
 	}
 }
 
+func TestNormalizeCheckoutPrecheckBillingUsesMomoRegion(t *testing.T) {
+	country, currency, err := normalizeCheckoutPrecheckBilling("vn", "vnd")
+	if err != nil || country != "VN" || currency != "VND" {
+		t.Fatalf("MOMO precheck billing=%s/%s err=%v", country, currency, err)
+	}
+	if _, _, err := normalizeCheckoutPrecheckBilling("VN", "USD"); err == nil {
+		t.Fatal("mismatched MOMO precheck currency should fail")
+	}
+}
+
 func TestNormalizeGoPayRequestUsesIndonesiaCheckout(t *testing.T) {
 	normalized, checkout, promotion, err := normalizeCheckoutRequest(sunnyCheckoutRequest{
 		Plan:             "plus",
 		LinkType:         "gopay",
+		UsePromo:         true,
 		Country:          "US",
 		Currency:         "USD",
 		CheckoutProxies:  "http://id-proxy.example:8080",
@@ -101,6 +113,37 @@ func TestNormalizeGCashRequestDoesNotRequirePromotionPool(t *testing.T) {
 	}
 }
 
+func TestNormalizeNoPromoRequestUsesCheckoutPoolForPromotion(t *testing.T) {
+	normalized, checkout, promotion, err := normalizeCheckoutRequest(sunnyCheckoutRequest{
+		Plan:            "plus",
+		LinkType:        "momo",
+		UsePromo:        false,
+		CheckoutProxies: "http://vn-checkout-proxy.example:8080",
+	})
+	if err != nil {
+		t.Fatalf("normalize no-promo MoMo request: %v", err)
+	}
+	if normalized.UsePromo {
+		t.Fatal("no-promo request unexpectedly enabled promotion")
+	}
+	if len(checkout) != 1 || len(promotion) != 1 || checkout[0] != promotion[0] {
+		t.Fatalf("checkout=%#v promotion=%#v", checkout, promotion)
+	}
+}
+
+func TestNormalizePromoRequestStillRequiresPromotionPool(t *testing.T) {
+	_, _, _, err := normalizeCheckoutRequest(sunnyCheckoutRequest{
+		Plan:             "plus",
+		LinkType:         "momo",
+		UsePromo:         true,
+		CheckoutProxies:  "http://vn-checkout-proxy.example:8080",
+		PromotionProxies: "",
+	})
+	if err == nil || !strings.Contains(err.Error(), "Promotion 代理池") {
+		t.Fatalf("expected promotion pool validation error, got %v", err)
+	}
+}
+
 func TestParseCheckoutExternalAT(t *testing.T) {
 	token, email := parseCheckoutExternalAT("eyJhbGciOiJub25lIn0.payload.signature user@example.com")
 	if token == "" || email != "user@example.com" {
@@ -113,9 +156,20 @@ func TestParseCheckoutExternalAT(t *testing.T) {
 	if token, _ = parseCheckoutExternalAT("not-an-at"); token != "" {
 		t.Fatalf("invalid token=%q", token)
 	}
+	if token, _ = parseCheckoutExternalAT(`{"access_token":"not.a.jwt"}`); token != "" {
+		t.Fatalf("invalid JSON token=%q", token)
+	}
 	expired := "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature user@example.com"
 	if token, _ = parseCheckoutExternalAT(expired); token != "" {
 		t.Fatal("expired JWT should be rejected")
+	}
+	expiredJSON := fmt.Sprintf(`{"access_token":%q,"email":"expired@example.com"}`, expired)
+	if token, _ = parseCheckoutExternalAT(expiredJSON); token != "" {
+		t.Fatal("expired JWT in JSON should be rejected")
+	}
+	profileToken := "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJwcm9maWxlQGV4YW1wbGUuY29tIn19.signature"
+	if token, email = parseCheckoutExternalAT(profileToken); token == "" || email != "profile@example.com" {
+		t.Fatalf("profile token=%q email=%q", token, email)
 	}
 }
 
