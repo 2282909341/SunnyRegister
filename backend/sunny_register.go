@@ -1863,7 +1863,7 @@ func (s *Server) releaseIcMeiGoCompletedMailbox(client *http.Client, key string)
 		return false
 	}
 	return s.db.Model(&m).Updates(map[string]any{
-		"enabled": false, "status": "已释放", "last_error": "已释放腾槽（登录已不依赖邮箱）", "updated_at": time.Now(),
+		"enabled": false, "status": "已注册", "last_error": "", "updated_at": time.Now(),
 	}).Error == nil
 }
 
@@ -6040,6 +6040,8 @@ func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
 		return
 	}
 	remaining := map[string]int{}
+	totalQuotas := map[string]int{}
+	totalConcurrencies := map[string]int{}
 	quotaErrors := map[string]bool{}
 	validCards := 0
 	client := icmeigoHTTPClient("")
@@ -6058,6 +6060,8 @@ func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
 			continue
 		}
 		remaining[key] = intValue(quota["remaining_quota"], 0)
+		totalQuotas[key] = intValue(quota["total_quota"], 0)
+		totalConcurrencies[key] = intValue(quota["total_concurrency"], 1)
 		validCards++
 	}
 	total := len(rows)
@@ -6065,13 +6069,17 @@ func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
 		total += count
 	}
 	type cardSummary struct {
-		ID              string `json:"id"`
-		Label           string `json:"label"`
-		ActiveMailboxes int    `json:"active_mailboxes"`
-		FailedMailboxes int    `json:"failed_mailboxes"`
-		RemainingQuota  int    `json:"remaining_quota"`
-		TotalAccounts   int    `json:"total_accounts"`
-		QuotaError      bool   `json:"quota_error"`
+		ID               string `json:"id"`
+		Label            string `json:"label"`
+		ActiveMailboxes  int    `json:"active_mailboxes"`
+		FailedMailboxes  int    `json:"failed_mailboxes"`
+		RemainingQuota   int    `json:"remaining_quota"`
+		TotalAccounts    int    `json:"total_accounts"`
+		TotalQuota       int    `json:"total_quota"`
+		TotalConcurrency int    `json:"total_concurrency"`
+		QuotaError       bool   `json:"quota_error"`
+		Latest           bool   `json:"latest"`
+		LatestMailboxID  uint   `json:"-"`
 	}
 	cards := make([]cardSummary, 0, len(remaining))
 	cardIndex := map[string]int{}
@@ -6085,17 +6093,24 @@ func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
 			index = len(cards)
 			cardIndex[key] = index
 			cards = append(cards, cardSummary{
-				ID: sunnyIcMeigoCardID(key), Label: fmt.Sprintf("卡密 %d", index+1),
-				RemainingQuota: remaining[key], QuotaError: quotaErrors[key],
+				ID: sunnyIcMeigoCardID(key), Label: "卡密 " + sunnyIcMeigoKeyHint(key),
+				RemainingQuota: remaining[key], TotalQuota: totalQuotas[key], TotalConcurrency: totalConcurrencies[key], QuotaError: quotaErrors[key],
 			})
 		}
 		cards[index].ActiveMailboxes++
+		if row.ID > cards[index].LatestMailboxID {
+			cards[index].LatestMailboxID = row.ID
+		}
 		if strings.TrimSpace(row.Status) == "失败" {
 			cards[index].FailedMailboxes++
 		}
 	}
 	for index := range cards {
 		cards[index].TotalAccounts = cards[index].ActiveMailboxes + cards[index].RemainingQuota
+	}
+	sort.SliceStable(cards, func(i, j int) bool { return cards[i].LatestMailboxID > cards[j].LatestMailboxID })
+	if len(cards) > 0 {
+		cards[0].Latest = true
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ready": validCards > 0, "cards": len(remaining), "active_mailboxes": len(rows),
@@ -6106,6 +6121,15 @@ func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
 func sunnyIcMeigoCardID(key string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
 	return hex.EncodeToString(sum[:12])
+}
+
+func sunnyIcMeigoKeyHint(key string) string {
+	runes := []rune(strings.TrimSpace(key))
+	visible := 6
+	if len(runes) < visible {
+		visible = len(runes)
+	}
+	return "••••" + string(runes[len(runes)-visible:])
 }
 
 // sunnyRemoveIcMeigoCard releases the provider mailboxes before removing a card

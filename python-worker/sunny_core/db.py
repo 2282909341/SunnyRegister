@@ -779,7 +779,7 @@ class SunnyDB:
 
     def mark_icmeigo_released(self, mailbox_id: int) -> None:
         self.conn.execute(
-            "update sunny_mailboxes set enabled=0,status='已释放',last_error='已自动释放腾槽（密码与2FA已完成）',updated_at=? where id=?",
+            "update sunny_mailboxes set enabled=0,status='已注册',last_error='',updated_at=? where id=?",
             (now_sql(), mailbox_id),
         )
         self.conn.commit()

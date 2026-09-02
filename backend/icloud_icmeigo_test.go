@@ -172,7 +172,7 @@ func TestIcMeiGoGenerateAndReleaseFlow(t *testing.T) {
 		if err := s.db.Where("email = ?", "done@icloud.com").First(&done).Error; err != nil {
 			t.Fatal(err)
 		}
-		if done.Enabled || done.Status != "已释放" {
+		if done.Enabled || done.Status != "已注册" {
 			t.Fatalf("released mailbox was not marked: enabled=%v status=%q", done.Enabled, done.Status)
 		}
 	})
@@ -249,6 +249,12 @@ func TestIcMeiGoTaskAutomaticallyRecognizesAllCardsAndQuota(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "api_card_") {
 		t.Fatal("summary must not expose card secrets")
+	}
+	if !strings.Contains(recorder.Body.String(), "••••card_b") || !strings.Contains(recorder.Body.String(), `"latest":true`) {
+		t.Fatalf("summary must identify the newest card by a masked suffix: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"total_quota":10`) || !strings.Contains(recorder.Body.String(), `"total_concurrency":1`) {
+		t.Fatalf("summary must expose card quota and concurrency without exposing the key: %s", recorder.Body.String())
 	}
 }
 

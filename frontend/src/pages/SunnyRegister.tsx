@@ -2245,7 +2245,7 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
       <div><h2 className="text-lg font-bold">ic.meigo 卡密管理</h2><p className="mt-1 text-sm text-slate-500">可随时移除卡密；系统会先释放当前邮箱，再停止该卡的自动注册，不删除历史记录。</p></div>
       <div className="mt-4 grid gap-3 md:grid-cols-2">
         {icmeigoCards.map((card:AnyObj)=><div key={card.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
-          <div><div className="font-bold">{card.label}</div><div className="mt-1 text-xs text-slate-500">{card.quota_error ? `额度读取失败 · 当前邮箱 ${Number(card.active_mailboxes||0)}` : `当前邮箱 ${Number(card.active_mailboxes||0)} · 失败 ${Number(card.failed_mailboxes||0)} · 剩余额度 ${Number(card.remaining_quota||0)}`}</div></div>
+          <div><div className="font-bold">{card.label}{card.latest && <span className="ml-2 rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-600">最近导入</span>}</div><div className="mt-1 text-xs text-slate-500">{card.quota_error ? `额度读取失败 · 当前邮箱 ${Number(card.active_mailboxes||0)}` : `卡面额度 ${Number(card.total_quota||0)} · 可用余额 ${Number(card.total_accounts||0)} · 并发 ${Number(card.total_concurrency||1)} · 当前邮箱 ${Number(card.active_mailboxes||0)} · 待生成 ${Number(card.remaining_quota||0)}`}</div></div>
           <ConfirmBubble message="确认移除这张卡密？" detail="当前邮箱会被释放，之后不再自动注册。" onConfirm={()=>removeIcmeigoCard(card)}><Button variant="outline" disabled={!!removingIcmeigoCard} className="rounded-xl border-red-200 text-red-500">{removingIcmeigoCard===card.id?<Loader2 className="h-4 w-4 animate-spin"/>:"移除卡密"}</Button></ConfirmBubble>
         </div>)}
       </div>
