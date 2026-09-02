@@ -39,11 +39,11 @@ const DATA_TABLE_COLUMNS: Record<string, DataTableColumn[]> = {
     { width: 180, minWidth: 140 }, { width: 140, minWidth: 110 }, { width: 190, minWidth: 150 }, { width: 170, minWidth: 130, maxWidth: 420 },
   ],
   sessions: [
-    { width: 44, minWidth: 44, maxWidth: 72 }, { width: 280, minWidth: 180 }, { width: 150, minWidth: 100 },
-    { width: 190, minWidth: 130 },
-    { width: 110, minWidth: 88 }, { width: 110, minWidth: 88 }, { width: 110, minWidth: 88 }, { width: 72, minWidth: 60 }, { width: 72, minWidth: 60 },
-    { width: 130, minWidth: 100 }, { width: 150, minWidth: 100 }, { width: 150, minWidth: 100 }, { width: 130, minWidth: 100 },
-    { width: 190, minWidth: 120 }, { width: 190, minWidth: 150 }, { width: 320, minWidth: 260, maxWidth: 640 },
+    { width: 44, minWidth: 44, maxWidth: 72 }, { width: 240, minWidth: 160 }, { width: 130, minWidth: 96 },
+    { width: 150, minWidth: 110 },
+    { width: 96, minWidth: 80 }, { width: 96, minWidth: 80 }, { width: 96, minWidth: 80 }, { width: 64, minWidth: 56 }, { width: 64, minWidth: 56 },
+    { width: 100, minWidth: 80 }, { width: 112, minWidth: 96 }, { width: 120, minWidth: 100 }, { width: 120, minWidth: 100 },
+    { width: 112, minWidth: 96 }, { width: 150, minWidth: 120 }, { width: 300, minWidth: 240, maxWidth: 560 },
   ],
 };
 
@@ -4590,7 +4590,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
       </div>
     </div>
     <div className="sr-table-scroll">
-      <ResizableDataTable tableKey="sessions-v4" columns={DATA_TABLE_COLUMNS.sessions} className="sr-session-table" headers={[<input type="checkbox" checked={allChecked} onChange={(e)=>setSelected(e.target.checked ? Array.from(new Set([...selected, ...items.map((x)=>x.id)])) : selected.filter((id)=>!items.some((x)=>x.id===id)))}/>,t.email,<RebindEmailFilterHeader t={t} value={rebindEmailFilter} onToggle={()=>setRebindEmailFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,t.groupFilter,t.status,t.planType,<LoginSecretFilterHeader t={t} value={loginSecretFilter} onToggle={()=>setLoginSecretFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,"SK","AT","RT",<TrialCountryFilterHeader t={t} value={trialCountryFilters} options={availableTrialCountries} onChange={setTrialCountryFilters}/>,t.checkoutKind,<PaymentMethodFilterHeader t={t} value={paymentMethods} status={paymentProbeFilter} options={paymentMethodOptions} onChange={setPaymentMethods} onStatusChange={setPaymentProbeFilter}/>,<SortTimeHeader label={t.atExpiresAt} order={sortBy==="access_token_expires_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("access_token_expires_at")}/>,<SortTimeHeader label={t.lastHealthCheckedAt} order={sortBy==="last_health_checked_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("last_health_checked_at")}/>,t.operation]}>
+      <ResizableDataTable tableKey="sessions-v5" columns={DATA_TABLE_COLUMNS.sessions} className="sr-session-table" headers={[<input type="checkbox" checked={allChecked} onChange={(e)=>setSelected(e.target.checked ? Array.from(new Set([...selected, ...items.map((x)=>x.id)])) : selected.filter((id)=>!items.some((x)=>x.id===id)))}/>,t.email,<RebindEmailFilterHeader t={t} value={rebindEmailFilter} onToggle={()=>setRebindEmailFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,t.groupFilter,t.status,t.planType,<LoginSecretFilterHeader t={t} value={loginSecretFilter} onToggle={()=>setLoginSecretFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,"SK","AT","RT",<TrialCountryFilterHeader t={t} value={trialCountryFilters} options={availableTrialCountries} onChange={setTrialCountryFilters}/>,t.checkoutKind,<PaymentMethodFilterHeader t={t} value={paymentMethods} status={paymentProbeFilter} options={paymentMethodOptions} onChange={setPaymentMethods} onStatusChange={setPaymentProbeFilter}/>,<SortTimeHeader label={t.atExpiresAt} order={sortBy==="access_token_expires_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("access_token_expires_at")}/>,<SortTimeHeader label={t.lastHealthCheckedAt} order={sortBy==="last_health_checked_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("last_health_checked_at")}/>,t.operation]}>
         <tbody>{items.length ? items.map((s)=>{
           const refreshing=refreshingSessionIds.includes(s.id);
           const checkingAT=atCheckingSessionIds.includes(s.id);
