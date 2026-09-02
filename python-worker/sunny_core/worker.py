@@ -192,6 +192,35 @@ class IcMeigoMailboxProvisioner:
         self.db.event(f"[{next_email}] [邮箱] 已自动补位生成下一个 ic.meigo 邮箱", detail={"email": next_email, "scope": "selected", "mailbox_id": created.get("id")})
         return created
 
+    def refill_after_failure(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        """注册失败时不释放并发槽，直接从同一卡密额度补位生成一个新邮箱继续任务。
+
+        失败邮箱保留原状态（不释放、不删除），可在后续任务或手动直接重试；其卡密
+        额度已在生成时消耗，本次补位再从剩余额度中消耗一个。避免单次偶发失败（如
+        验证码读取/页面时序）卡死整条流水的未完成数量。
+        """
+        self.db.ensure_not_cancelled()
+        key = str(mailbox.get("access_key") or "").strip()
+        email = str(mailbox.get("email") or "").strip()
+        mailbox_id = int(mailbox.get("id") or 0)
+        group_id = int(mailbox.get("group_id") or 0)
+        if not key or not email:
+            raise RuntimeError("ic.meigo 失败邮箱资料不完整，无法补位")
+        if self.remaining.get(key, 0) <= 0:
+            return None
+        payload = self._post(key, "/api/hme/generate", {})
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        next_email = str((data or {}).get("email") or "").strip()
+        if not next_email:
+            raise RuntimeError("ic.meigo 生成邮箱的响应中没有 email")
+        self.remaining[key] -= 1
+        created = self.db.create_icmeigo_mailbox(next_email, key, group_id)
+        self.db.event(
+            f"[{email}] [邮箱] 注册失败邮箱已保留待重试，已从卡密额度补位生成下一个 ic.meigo 邮箱 {next_email}",
+            detail={"email": email, "scope": "selected", "mailbox_id": mailbox_id, "replacement_email": next_email, "failed_kept": True},
+        )
+        return created
+
 _REGISTRATION_PROGRESS_STEPS = {
     "initializing": 1,
     "proxy_ready": 2,
@@ -3906,10 +3935,15 @@ def run_sunny_task(task_id: str) -> None:
 
             def rotate(mailbox: dict[str, Any], ok: bool) -> None:
                 nonlocal provider_stop_reason
-                if not ok or provider_stop_reason:
+                if provider_stop_reason:
                     return
                 try:
-                    replacement = icmeigo.rotate(mailbox)
+                    if ok:
+                        replacement = icmeigo.rotate(mailbox)
+                    else:
+                        # 失败不阻断整条流水线：失败邮箱保留供重试，同时从同一卡密
+                        # 额度补位生成一个新邮箱继续注册未完成的数量。
+                        replacement = icmeigo.refill_after_failure(mailbox)
                 except Exception as exc:
                     provider_stop_reason = f"ic.meigo 自动补位停止：{exc}"
                     db.event(f"[系统] {provider_stop_reason}", "error", detail={"scope": "global", "provider": "icmeigo"})

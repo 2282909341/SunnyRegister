@@ -1386,6 +1386,20 @@ class IcMeiGoICloudReader:
             "source": "icmeigo",
         }
 
+    @staticmethod
+    def _code_email_is_fresh(message: dict[str, Any], min_timestamp: float) -> bool:
+        """邮件必须在本次发码之后到达才可接受。
+
+        复用上一次尝试的旧验证码会被 OpenAI 以 Wrong code(HTTP 401) 拒绝，
+        尤其 resume/自动重试场景下，上一次的旧码邮件仍可能是邮箱里最新的一封，
+        新验证码尚未到达前必须继续等待而不是直接取旧码。
+        """
+        try:
+            received = datetime.fromisoformat(str(message.get("date") or "").replace("Z", "+00:00")).timestamp()
+        except Exception:
+            received = time.time()
+        return received + 30 >= float(min_timestamp or 0)
+
     def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
         started = time.monotonic()
         last_notice = 0.0
@@ -1410,6 +1424,14 @@ class IcMeiGoICloudReader:
                 continue
             code = str(message.get("otp") or "").strip()
             if re.fullmatch(r"\d{6}", code) and code not in self.seen_codes:
+                if not self._code_email_is_fresh(message, min_timestamp):
+                    # 只可能是上一次尝试留下的旧验证码邮件：新邮件尚未到达，继续等
+                    self.seen_codes.add(code)
+                    if time.monotonic() - last_notice >= 20:
+                        self.log(f"[{self.account.email}] 邮箱里只有旧验证码邮件，继续等待本次新验证码，about {remaining}s left")
+                        last_notice = time.monotonic()
+                    time.sleep(min(ICMEIGO_POLL_INTERVAL_SECONDS, max(0.0, remaining)))
+                    continue
                 self.seen_codes.add(code)
                 self.log(f"[{self.account.email}] Received OpenAI OTP from ic.meigo.lol iCloud API ({len(code)} digits, redacted)")
                 return code
