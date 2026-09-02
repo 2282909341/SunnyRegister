@@ -28,7 +28,7 @@ func TestSunnyProxyEmptyPurposeIsPersistedAndExcludedFromTasks(t *testing.T) {
 	}
 	register := SunnyProxy{
 		Address: "http://register.example:8080", PurposeTags: sunnyProxyPurposeRegister,
-		Country: "JP", Status: "enabled", Enabled: true, LastCheckOK: true,
+		Status: "enabled", Enabled: true, LastCheckOK: true,
 	}
 	if err := s.db.Create(&[]*SunnyProxy{&unused, &register}).Error; err != nil {
 		t.Fatalf("create proxies: %v", err)
@@ -65,10 +65,6 @@ func TestSunnyProxyEmptyPurposeIsPersistedAndExcludedFromTasks(t *testing.T) {
 	ids, ok := snapshot["proxy_ids"].([]uint)
 	if !ok || len(ids) != 1 || ids[0] != register.ID {
 		t.Fatalf("task proxy_ids = %#v", snapshot["proxy_ids"])
-	}
-	proxyCountries, ok := snapshot["proxy_countries"].([]string)
-	if !ok || len(proxyCountries) != 1 || proxyCountries[0] != "JP" {
-		t.Fatalf("task proxy_countries = %#v", snapshot["proxy_countries"])
 	}
 }
 

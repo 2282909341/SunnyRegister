@@ -1,7 +1,7 @@
 # SunnyRegister AI 接手文档（唯一权威版）
 
 > 更新日期：2026-09-03
-> 当前 HEAD：`8bf3a6e`（已推送 `origin/main`）
+> 当前 HEAD：以 `git rev-parse HEAD` 为准（`main` 与 `origin/main` 应保持同步）
 > 面向：后续接手本项目的 AI/开发者
 > 原则：不记录卡密、密码、Token、代理凭证或数据库密码。
 > 说明：本文件是**唯一**交接文档。历史上遗留的 `_HANDOFF*.md` / `_momo_probe_report.md` 均为 ic.meigo 时代的过期草稿，已归档到 `_delivery/_archive_handoffs/`，勿再当作现行事实。
@@ -26,7 +26,7 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 - 开发分支：`main`，直接 push 不做 PR
 - 用户远程（origin）：`https://github.com/2282909341/SunnyRegister.git`（fork）
 - 作者上游（upstream）：`https://github.com/pxygit/SunnyRegister.git`（原项目，无 ic.meigo 代码）
-- 上游状态：`merge-base == upstream/main == 37ec239`，即上游自分叉后**未再更新**；`main` 领先上游 50 个提交，无同步负担。
+- 上游基线：`upstream/main == 37ec239`。操作前仍需重新 `git fetch upstream`，不要把本文数值当成永久不变的事实。
 - 提交规则见根目录 `AGENTS.md`。修改前必须 `git pull --ff-only`，修改后审查 diff → 测试/构建 → 提交 → 推送 `origin/main`。
 - 工作树长期存在大量历史 `_*.sql` / `_*.txt` / `_probe_*` / `_delivery` 未跟踪文件，**禁止 `git add .`**（只暂存本次明确修改的文件）。
 
@@ -36,7 +36,7 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 |---|---|---|
 | 前端 | `frontend/` | React + TypeScript + Vite，工作台、邮箱配置、账号管理和任务日志 |
 | 后端 | `backend/` | Go HTTP API、数据模型、任务创建、静态资源嵌入 |
-| Worker | `python-worker/` | Python 认证状态机、协议/浏览器流程、邮箱取码、密码和 2FA、并发与随机间隔 |
+| Worker | `python-worker/` | Python 认证状态机、协议/浏览器流程、邮箱取码、密码和 2FA、并发调度 |
 | 数据库 | PostgreSQL | 本地 `127.0.0.1:5433`；凭证只从 `.env` 的 `DATABASE_URL` 读取 |
 
 运行端口：
@@ -46,64 +46,41 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 
 ## 4. 当前 git 状态与最近提交链
 
-HEAD=`8bf3a6e`，与 `origin/main` 同步。最近提交（倒序，ic.meigo 移除后仍有效的核心项）：
+当前 HEAD 以 Git 命令查询为准。下表仅保留当前仍有效的关键历史：
 
 | 提交 | 内容 |
 |---|---|
+| 当前提交 | 协议注册恢复作者上游实现，仅保留 CA 证书路径处理与默认本地代理 `7890` |
 | `8bf3a6e` | 前端：移除 Hero 光球常驻动画 + `will-change` 收敛 + 大阴影收窄（优化工作台滚动掉帧） |
 | `096f0e7` | 前端：移除吸顶栏与卡片 `backdrop-filter` 背景模糊（优化滚动掉帧） |
 | `f04823e` | 前端：`useCachedState` 去双写 + 任务持久化 250ms 防抖 + 表格紧凑化 |
 | `74b0ba0` | AI 交接文档唯一权威化整合 + 历史草稿归档 |
-| `fc86e8d` | 代理会话粘性**默认关闭**，回退轮换出口，修复坏出口 502 卡住 |
-| `f889f4e` | 账号级设备画像（persona）+ 代理会话粘性（`-session-<hash>`） |
-| `9ece5ae` | 移除 ic.meigo 全渠道 + 间隔改为 3-8 秒轻量抖动 |
-| `7f82221` | 账号指纹池（12 种 impersonate）+ 批量随机间隔 |
+| `9ece5ae` | 移除 ic.meigo 全渠道（该移除仍有效） |
 | `de227d0` | 账户列表紧凑化显示 |
-| `d98005c` | OTP 输入框未找到自动重试 + 429/400 限流如实上报 |
-| `4809558` | （已随 ic.meigo 移除而失效）默认 icmeigo 身份 |
+| `d98005c` | 429/400 限流如实上报；其中协议注册额外 OTP 自动重试已随本次回归移除 |
 
-## 5. 注册链路关键实现（防批量关联）
+## 5. 注册链路当前实现（作者上游基线）
 
-### 5.1 TLS 指纹池（`fingerprint_pool.py`）
+用户明确要求协议注册除两项本地兼容修复外回归 `upstream/main=37ec239`：
 
-`pick_impersonate(seed)` 用 `sha256(seed)` 从 12 个 curl_cffi 指纹确定性挑选：
-`chrome124/131/136/142/145、firefox133/135/144/147、safari17_0/safari18_0、edge101`。
-每个账号 TLS/JA3/HTTP2 指纹不同，全链路（`protocol_auth` / `agent_identity` / `access_token_probe`）已接入 seed。
+1. **保留 CA 证书路径处理**：`protocol_auth.py`、`agent_identity.py`、`access_token_probe.py` 仍使用 `verify=ca_bundle_path()`，避免 Windows 中文路径下 `curl (77)`。
+2. **保留默认本地代理端口 `7890`**：`backend/sunny_register.go` 的默认代理为 `http://127.0.0.1:7890`。
 
-### 5.2 账号设备画像（`account_persona.py`）
+已移除的定制项：账号指纹池、账号设备画像、国家代理注册选择、代理会话粘性、账号间 3-8 秒随机间隔、额外的新认证上下文重试、额外的密码/2FA 完整性强制判定、wuasai 取码适配。
 
-`AccountPersona` + `pick_persona(seed, country)`：按邮箱派生 impersonate / UA / 屏幕分辨率 / locale / 时区 / 硬件并发 / 内存，并按**代理出口国家**对齐 locale（JP→ja-JP/Tokyo、VN→vi-VN/Ho_Chi_Minh、US→en-US 等）。`protocol_auth`、`sentinel`（Sentinel 反爬 token 生成）、`openai_auth`（设备指纹）、`access_token_probe` 全部接入，确保同一账号的协议头/UA/屏幕/locale 全程一致。
-
-### 5.3 代理会话粘性（`proxy.py`，**默认关闭**）
-
-- `sticky_proxy_url(proxy_url, key)` 给轮换住宅代理用户名追加 `-session-<sha256(key)[:8]>`，让同一账号复用同一出口 IP。
-- **默认关闭**：`SUNNY_PROXY_STICKY` 默认 `"0"`。原因：轮换住宅会把账号钉在某个坏/过载出口上，导致注册报 `curl: (7) CONNECT tunnel failed, response 502` 卡死；轮换则每次连接换出口、坏出口一次就滚过去。
-- 想开启：`.env` 加 `SUNNY_PROXY_STICKY=1`（`start-windows.ps1` 会自动导出），但前提是代理池质量够好。
-
-### 5.4 账号间间隔（`worker.py`）
-
-`_register_pacing_range` / `_pacing_delay`：账号间随机冷却，默认 **3-8 秒**。可用 payload `register_pacing_min_sec/max_sec` 或 env `SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC` 覆盖，双 0 关闭。
-
-### 5.5 认证恢复（`auth_resilience.py`）
-
-`classify_auth_failure` 把可恢复错误（`stale_auth_context`，含 `wrong code` / `otp input was not found` 等）标记 retryable，用全新认证上下文自动重试一次；429/400 限流按真实 HTTP 状态上报（不再映射成 0）。
+当前协议注册的 `curl_cffi` impersonate 回归原版固定 `chrome136`；Sentinel、浏览器回退、Worker 并发和验证码错误处理均以上游实现为准。
 
 ## 6. 封号调查结论（2026-09-02 波浪式扫号）
 
 - 40 个 `banned` 全部集中在 2026-09-02，呈波浪式批量（06:39 一分钟 6 个、21:15-21:19 五个、21:40-21:41 两个，存活 9-60 分钟）。
 - `last_error` 统一 `account_deactivated`，多在 FORCE 密码+2FA 步骤被检出（注册后被 OpenAI 风控扫号波停用，流水线复核时撞死号）。
-- 根因（已修）：① 全库只有 `chrome136`+`firefox144` 两种 TLS 指纹；② 轮换住宅每连接换 IP（机械脚本特征）；③ 账号间无间隔。
-- 残余风险（未完全解决）：101 个 JP + 101 个 VN 账号**共用 2 组代理凭证串**=同一代理商同一 IP 池/ASN。粘性本可固定出口，但实测坏出口 502 导致卡死，故已默认关闭。若后续仍成波封号，升级路径=加第二家住宅代理商 + 少量静态独享 IP。
+- 这些是当时现象与推断，不是已证明的单一根因。指纹池、设备画像、粘性代理和随机间隔已按用户要求移除，不得继续写成“当前已修复”。
 
 ## 7. 已实现修复汇总（可靠性 + 前端性能/紧凑化）
 
-- 可恢复认证问题用全新认证上下文自动重试一次。
-- `wrong_email_otp_code` / `otp input was not found` 归类为可恢复旧认证上下文。
-- 旧验证码按时间过滤（`_code_email_is_fresh`），避免 resume 读旧码导致 `HTTP 401 Wrong code`。
-- Camoufox/Playwright 已跳转 ChatGPT 时，`interrupted by another navigation` 不再误判失败。
-- 任务成功/失败以密码、2FA、Session 实际落库为准，不以页面跳转为唯一成功信号。
-- 失败邮箱保留、允许直接重试，不自动释放或销毁。
 - CA 证书中文路径 curl 77 根治（`ca_bundle.py` 全局加载 + 各 session 补 `verify=ca_bundle_path()`）。
+- 默认本地代理端口保持 `7890`。
+- 其他协议注册行为与作者上游一致；后续不要根据历史提交误把已回退的定制再加回来。
 
 ### 前端性能与紧凑化（2026-09-03 本轮）
 
@@ -122,11 +99,10 @@ HEAD=`8bf3a6e`，与 `origin/main` 同步。最近提交（倒序，ic.meigo 移
 | 任务创建/邮箱/账户/代理/健康检查 | `backend/sunny_register.go`、`backend/sunny_health.go` |
 | 支付探测/试用/checkout | `backend/sunny_payment_probe.go`、`backend/sunny_trial.go`、`backend/sunny_checkout_probe.go` |
 | 认证状态机与协议 | `python-worker/sunny_core/protocol_auth.py`、`openai_auth.py` |
-| 设备画像 / 指纹池 | `python-worker/sunny_core/account_persona.py`、`fingerprint_pool.py` |
 | 认证错误分类 | `python-worker/sunny_core/auth_resilience.py` |
-| 代理（粘性/预检/TLS） | `python-worker/sunny_core/proxy.py`、`proxy_scheduler.py` |
+| 代理（作者原版预检/TLS） | `python-worker/sunny_core/proxy.py`、`proxy_scheduler.py` |
 | 邮箱读取器 | `python-worker/sunny_core/mailbox.py` |
-| Worker 主流程与并发/间隔 | `python-worker/sunny_core/worker.py` |
+| Worker 主流程与并发 | `python-worker/sunny_core/worker.py` |
 | Worker 数据库写回 | `python-worker/sunny_core/db.py` |
 | 前端工作台 | `frontend/src/pages/SunnyRegister.tsx` |
 | 前端全局样式/主题令牌 | `frontend/src/index.css` |
@@ -189,17 +165,15 @@ psql -h $h -p $p -U $u -d $d -c "SELECT ..."
 1. 查 `/api/ready` 和 `/health`，确认 Worker `running` 列表。
 2. 查最新 `tasks` 的 `status/progress_current/progress_total/success_count/error_count`。
 3. 查该任务最新 `task_events`，对邮箱、代理和 Token 脱敏后再记录结论。
-4. 核对任务 `payload_json` 的 `mailbox_ids/count/concurrency/identity/proxy_countries` 与代理快照，不输出敏感字段。
+4. 核对任务 `payload_json` 的 `mailbox_ids/count/concurrency/identity` 与代理快照，不输出敏感字段。
 5. 任务页看似“卡住”时，先判断数据库是 `running` 还是已终止；不能只依赖页面缓存。
-6. 代理类报错（如 `curl: (7) CONNECT tunnel failed, response 502`）→ 先确认粘性开关：默认轮换；`proxy_sticky: true` 出现率高且伴随 502，说明粘性钉到坏出口。
+6. 代理类报错（如 `curl: (7) CONNECT tunnel failed, response 502`）→ 按作者原版代理预检和代理池状态排查；当前无粘性代理开关。
 
 ## 13. 关键环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DATABASE_URL` | 无（必填） | PostgreSQL 连接串，来自 `.env` |
-| `SUNNY_PROXY_STICKY` | `0` | 1=开启代理会话粘性（防关联），0=轮换（防 502 卡死） |
-| `SUNNY_REGISTER_PACING_MIN_SEC` / `MAX_SEC` | `3.0` / `8.0` | 账号间随机冷却，双 0 关闭 |
 | `SUNNY_HEALTHCHECK_ENABLED` / `TIME` / `CONCURRENCY` | `true` / `06:00` / `2` | 定时健康检查 |
 
 ## 14. 接手者必做清单
@@ -214,11 +188,11 @@ psql -h $h -p $p -U $u -d $d -c "SELECT ..."
 
 ## 15. 开发理解
 
-注册链路的本质是资源轮转 + **批量关联规避**：每个账号尽量独立 TLS 指纹、独立出口 IP、账号间随机间隔，成功可确认、失败可重试、流速可接受。最重要的不是单次 100% 成功，而是：
+当前原则是“作者上游行为优先”：除 CA 路径和 `7890` 外，协议注册不再维护自定义指纹、设备画像、粘性代理、国家选择或随机间隔。继续开发时优先保证：
 
 - 成功可确认；
 - 失败可重试；
 - 外部页面/网络波动不被写成虚假成功；
-- 批量账号不因同指纹/同节奏被一次性聚类封禁。
+- 不误伤邮箱和账号数据。
 
-后续修复继续围绕这几点；同时注意“防封”与“可用性”的平衡——例如粘性固定出口防关联，但坏出口会卡死，因此做成默认关闭、可开关。
+后续若要再增加上述任一定制，必须先得到用户新的明确要求，并与 `upstream/main` 逐项对比。

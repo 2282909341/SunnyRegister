@@ -53,20 +53,6 @@ def test_auth_navigation_accepts_ns_error_abort_after_redirect() -> None:
     page.goto.assert_called_once()
 
 
-def test_auth_navigation_accepts_interrupted_navigation_after_chatgpt_redirect() -> None:
-    page = Mock()
-    page.url = "https://auth.openai.com/"
-
-    def redirected(*_args, **_kwargs):
-        page.url = "https://chatgpt.com/"
-        raise RuntimeError('Page.goto: Navigation is interrupted by another navigation to "https://chatgpt.com/"')
-
-    page.goto.side_effect = redirected
-
-    assert _goto_auth_page(page, "https://auth.openai.com/api/accounts/authorize") is None
-    page.goto.assert_called_once()
-
-
 def test_chatgpt_navigation_retries_transient_ssl_error() -> None:
     page = Mock()
     response = object()

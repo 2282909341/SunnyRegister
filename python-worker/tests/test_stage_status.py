@@ -87,38 +87,6 @@ def mailbox(status="未注册", openai_rt="") -> dict:
 
 
 class StageStatusTests(unittest.TestCase):
-    def test_registration_retries_incomplete_login_secret_with_fresh_login(self):
-        db = FakeDB()
-        payload = {"setup_login_secret": True}
-        with patch.object(worker, "_run_one_impl", side_effect=[
-            (True, {"login_secret_complete": False, "stage_error": "timed out"}),
-            (True, {"login_secret_complete": True}),
-        ]) as run:
-            ok, result = worker._run_one(db, "sunny_register", payload, mailbox(), 1, 1)
-        self.assertTrue(ok)
-        self.assertTrue(result["login_secret_complete"])
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[1].args[1], "sunny_login")
-
-    def test_registration_retries_transient_failure_once(self):
-        db = FakeDB()
-        with patch.object(worker, "_interruptible_delay") as delay, patch.object(worker, "_run_one_impl", side_effect=[
-            (False, "timed out"), (True, {"login_secret_complete": True}),
-        ]) as run:
-            ok, _ = worker._run_one(db, "sunny_register", {"setup_login_secret": True}, mailbox(), 1, 1)
-        self.assertTrue(ok)
-        delay.assert_called_once_with(db, 2)
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[1].args[1], "sunny_register")
-
-    def test_registration_never_reports_incomplete_login_secret_as_success(self):
-        db = FakeDB()
-        incomplete = (True, {"login_secret_complete": False, "stage_error": "2FA incomplete"})
-        with patch.object(worker, "_run_one_impl", side_effect=[incomplete, incomplete]):
-            ok, result = worker._run_one(db, "sunny_register", {"setup_login_secret": True}, mailbox(), 1, 1)
-        self.assertFalse(ok)
-        self.assertIn("密码与 2FA 未全部设置成功", result)
-
     def test_login_secret_result_message_distinguishes_credentials_from_at_refresh(self):
         message = worker._login_secret_result_message({
             "password": "password",

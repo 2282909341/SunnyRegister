@@ -189,7 +189,7 @@ def extract_otp_candidates(raw: str) -> list[dict[str, Any]]:
                 code = "".join(str(unicodedata.digit(char)) if char.isdigit() else char for char in match.group(1))
                 start, end = max(0, match.start() - 120), min(len(normalized), match.end() + 120)
                 context = re.sub(r"\s+", " ", normalized[start:end]).strip()
-                score = (40 if (_CONTEXT.search(context) or _CONTEXT.search(normalized)) else 0) + (40 if _CODE_KEY.search(path) else 0)
+                score = (40 if _CONTEXT.search(context) else 0) + (40 if _CODE_KEY.search(path) else 0)
                 score += 35 if _CONTENT_KEY.search(path) else 0
                 prefix = re.sub(r"\s+", " ", normalized[max(0, match.start() - 80):match.start()])
                 score += 80 if _DIRECT_CONTEXT.search(prefix) else 0
@@ -210,7 +210,7 @@ def extract_otp_candidates(raw: str) -> list[dict[str, Any]]:
                     continue
                 start, end = max(0, match.start() - 120), min(len(normalized), match.end() + 120)
                 context = re.sub(r"\s+", " ", normalized[start:end]).strip()
-                score = (40 if (_CONTEXT.search(context) or _CONTEXT.search(normalized)) else 0) + (40 if _CODE_KEY.search(path) else 0) - 5
+                score = (40 if _CONTEXT.search(context) else 0) + (40 if _CODE_KEY.search(path) else 0) - 5
                 score += 35 if _CONTENT_KEY.search(path) else 0
                 prefix = re.sub(r"\s+", " ", normalized[max(0, match.start() - 80):match.start()])
                 score += 80 if _DIRECT_CONTEXT.search(prefix) else 0

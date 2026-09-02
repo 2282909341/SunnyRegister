@@ -923,7 +923,6 @@ Object.assign(zh, {
   paymentProbeCountryEmpty: "暂无可用的支付探测国家代理", paymentProbeCountryRequired: "请至少选择一个探测国家", paymentProbeStart: "开始探测",
   rebindCountryTitle: "选择换绑国家", rebindCountryHint: "请选择本次邮箱换绑使用的国家代理",
   rebindCountryEmpty: "暂无可用的换绑国家代理", rebindCountryRequired: "请至少选择一个换绑国家", rebindCountryStart: "开始换绑",
-  registerCountryLabel: "注册国家", registerCountryNone: "未选择（使用全部注册代理）", registerCountryTitle: "选择注册国家", registerCountryHint: "请选择本次自动注册使用的国家代理（仅显示代理池中勾选注册用途的代理）", registerCountryEmpty: "暂无可用的注册国家代理", registerCountryRequired: "请至少选择一个注册国家", registerCountryStart: "确定",
   paymentProbeUnavailable: "该账户没有可用 Access Token", paymentProbeDone: "账户 {email}：探测到 {count} 种支付方式",
   paymentProbeSummary: "支付探测完成：检测成功 {detected} 个，部分完成 {partial} 个，跳过 {skipped} 个，失败 {failed} 个",
   checkoutProbe: "Checkout探测", checkoutProbing: "探测中...", checkoutProbeNoSelection: "请选择需要探测 Checkout 类型的账户",
@@ -979,7 +978,6 @@ Object.assign(en, {
   paymentProbeCountryEmpty: "No enabled payment-probe country proxies are available", paymentProbeCountryRequired: "Select at least one probe country", paymentProbeStart: "Start Probe",
   rebindCountryTitle: "Select Rebind Countries", rebindCountryHint: "Choose the country proxies to use for this mailbox rebind",
   rebindCountryEmpty: "No enabled rebind country proxies are available", rebindCountryRequired: "Select at least one rebind country", rebindCountryStart: "Start Rebind",
-  registerCountryLabel: "Register Countries", registerCountryNone: "Not selected (use all register proxies)", registerCountryTitle: "Select Register Countries", registerCountryHint: "Choose the country proxies to use for this registration (only proxies tagged with the register purpose in the proxy pool are shown)", registerCountryEmpty: "No enabled register country proxies are available", registerCountryRequired: "Select at least one register country", registerCountryStart: "Confirm",
   paymentProbeUnavailable: "This account has no usable Access Token", paymentProbeDone: "Account {email}: detected {count} payment methods",
   paymentProbeSummary: "Payment probe complete: {detected} succeeded, {partial} partial, {skipped} skipped, {failed} failed",
   checkoutProbe: "Checkout Probe", checkoutProbing: "Probing...", checkoutProbeNoSelection: "Select accounts to probe Checkout types",
@@ -1436,11 +1434,6 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
   const [stage, setStage] = useCachedState<RegisterStage>("workbench.stage", "register_only");
   const [setupLoginSecret, setSetupLoginSecret] = useCachedState("workbench.setupLoginSecret", false);
   const [allTrafficProxyPool, setAllTrafficProxyPool] = useState(false);
-  const [registerCountryPreference, setRegisterCountryPreference] = useCachedState<string[] | null>("workbench.registerCountries", null);
-  const [registerCountryDialog, setRegisterCountryDialog] = useState(false);
-  const [registerCountries, setRegisterCountries] = useState<string[]>([]);
-  const [registerCountrySelection, setRegisterCountrySelection] = useState<string[]>([]);
-  const [registerCountriesLoading, setRegisterCountriesLoading] = useState(false);
   const [globalLogs, setGlobalLogs] = useCachedState<LogEntry[]>("workbench.globalLogs", []);
   const [selectedLogs, setSelectedLogs] = useCachedState<LogEntry[]>("workbench.selectedLogs", []);
   const [registrationProgress, setRegistrationProgress] = useCachedState<RegistrationTaskProgress | null>("workbench.registrationProgress", null);
@@ -1519,30 +1512,6 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
   }, [mailboxes, selected]);
   useEffect(()=>{setPageNo(1)},[query, status, planFilter, trialFilter, groupFilter, pageSize, timeSort]);
   useEffect(()=>{if (pageNo !== safePageNo) setPageNo(safePageNo)},[pageNo, safePageNo]);
-  async function openRegisterCountryDialog() {
-    setRegisterCountryDialog(true);
-    setRegisterCountries([]);
-    setRegisterCountrySelection([]);
-    setRegisterCountriesLoading(true);
-    try {
-      const response = await apiFetch("/sunny/tasks/register/countries");
-      const countries = Array.from(new Set<string>((Array.isArray(response.countries) ? response.countries : []).map((value: any) => String(value).trim()).filter((value: string) => /^[A-Z]{2}$/.test(value)))).sort();
-      if (!countries.length) throw new Error(t.registerCountryEmpty);
-      setRegisterCountries(countries);
-      setRegisterCountrySelection(registerCountryPreference === null ? countries : countries.filter((country) => registerCountryPreference.includes(country)));
-    } catch (e: any) {
-      setRegisterCountryDialog(false);
-      notify("fail", e.message || String(e));
-    } finally {
-      setRegisterCountriesLoading(false);
-    }
-  }
-  function confirmRegisterCountries() {
-    const countries = registerCountries.filter((country) => registerCountrySelection.includes(country));
-    if (!countries.length) { notify("fail", t.registerCountryRequired); return; }
-    setRegisterCountryPreference(countries);
-    setRegisterCountryDialog(false);
-  }
   async function createRegisterTask(directIds?: number[]) {
     if (busy || activeTaskId) { notify("fail", t.registerTaskRunning); return; }
     const ids = directIds?.length ? directIds : selected;
@@ -1562,7 +1531,7 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
     setGlobalLogs((old) => [localLog(`${t.createTaskLog} ${requestedCount}`), sep, ...old]);
     setSelectedLogs((old) => [sep, ...old]);
     try {
-      const res = await apiFetch("/sunny/tasks/register", { method: "POST", body: JSON.stringify({ mailbox_ids: identity === "system" ? ids : [], count: requestedCount, concurrency: Math.max(1, Math.min(Number(modalConcurrency) || 1, requestedCount)), identity, execution_mode: mode, protocol_challenge_strategy: protocolChallengeStrategy, registration_stage: stage, proxy_all_traffic: allTrafficProxyPool, setup_login_secret: effectiveSetupLoginSecret, countries: registerCountrySelection }) });
+      const res = await apiFetch("/sunny/tasks/register", { method: "POST", body: JSON.stringify({ mailbox_ids: identity === "system" ? ids : [], count: requestedCount, concurrency: Math.max(1, Math.min(Number(modalConcurrency) || 1, requestedCount)), identity, execution_mode: mode, protocol_challenge_strategy: protocolChallengeStrategy, registration_stage: stage, proxy_all_traffic: allTrafficProxyPool, setup_login_secret: effectiveSetupLoginSecret }) });
       notify("ok", t.taskSubmitted);
       setGlobalLogs((old) => [localLog(t.taskSubmitted), ...old].slice(0, 160));
       const taskId = String(res.id || res.task_id || "");
@@ -1909,12 +1878,11 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
       <div className="sr-table-scroll"><ResizableDataTable tableKey="workbench" columns={DATA_TABLE_COLUMNS.workbench} headers={[<input type="checkbox" checked={allChecked} onChange={(e)=>selectCurrentPage(e.target.checked)}/>,t.email,t.rebindEmail,t.mailboxGroup,t.status,t.planType,t.trialEligibility,<SortTimeHeader label={t.statusChangedAt} order={timeSort} onToggle={()=>setTimeSort(nextSortOrder(timeSort))}/>,t.operation]}><tbody>{rows.length ? pagedRows.map((r) => <tr key={r.id}><td><input type="checkbox" checked={selected.includes(r.id)} onChange={(e)=>selectRow(r,e.target.checked)}/></td><td title={r.email}>{r.email}</td><td title={r.rebind_email || "-"}>{r.rebind_email || "-"}</td><td title={r.group_name || t.defaultGroup}>{r.group_name || t.defaultGroup}</td><td><StatusBadge t={t} status={r.status || "未注册"} /></td><td><PlanTypeBadge value={r.account?.plan_type || r.plan_type} /></td><td><TrialEligibilityBadge t={t} row={r}/></td><td>{formatDateTime(r.status_changed_at)}</td><td><button className="sr-link inline-flex items-center gap-1" title={t.refreshStatus} disabled={busy} onClick={()=>refreshAccountStatus(r)}><RefreshCw className="h-4 w-4"/>{t.refresh}</button></td></tr>) : <tr><td colSpan={9}><div className="sr-empty"><div className="sr-empty-icon"><Inbox className="h-7 w-7"/></div><div className="mt-3 text-base font-medium text-slate-900 dark:text-white">{t.noData}</div><p className="mt-2 text-sm text-slate-400">{t.noDataDesc}</p></div></td></tr>}</tbody></ResizableDataTable></div>
       <PaginationBar t={t} total={total} page={safePageNo} pageSize={pageSize} setPage={setPageNo} setPageSize={setPageSize} />
     </Card>
-    {autoOpen && <AutoRegisterModal t={t} busy={busy} selectedEmails={selectedRows.map((m)=>m.email)} selectedNeedPhone={selectedRows.some((m)=>m.has_openai_rt !== true)} concurrency={modalConcurrency} setConcurrency={setModalConcurrency} registerCount={modalRegisterCount} setRegisterCount={setModalRegisterCount} identity={identity} setIdentity={setIdentity} mode={mode} setMode={setMode} protocolChallengeStrategy={protocolChallengeStrategy} setProtocolChallengeStrategy={setProtocolChallengeStrategy} stage={stage} setStage={setStage} allTrafficProxyPool={allTrafficProxyPool} setAllTrafficProxyPool={setAllTrafficProxyPool} setupLoginSecret={setupLoginSecret} setSetupLoginSecret={setSetupLoginSecret} registerCountrySelection={registerCountrySelection} registerCountriesLoading={registerCountriesLoading} onOpenRegisterCountries={()=>void openRegisterCountryDialog()} onClose={()=>setAutoOpen(false)} onStart={()=>createRegisterTask()} notify={notify} />}
-    {registerCountryDialog && <CountryProbeModal title={t.registerCountryTitle} hint={t.registerCountryHint} empty={t.registerCountryEmpty} start={t.registerCountryStart} t={t} countries={registerCountries} selected={registerCountrySelection} loading={registerCountriesLoading} onToggle={(country)=>setRegisterCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setRegisterCountrySelection(registerCountries)} onClear={()=>setRegisterCountrySelection([])} onClose={()=>setRegisterCountryDialog(false)} onConfirm={confirmRegisterCountries}/>}
+    {autoOpen && <AutoRegisterModal t={t} busy={busy} selectedEmails={selectedRows.map((m)=>m.email)} selectedNeedPhone={selectedRows.some((m)=>m.has_openai_rt !== true)} concurrency={modalConcurrency} setConcurrency={setModalConcurrency} registerCount={modalRegisterCount} setRegisterCount={setModalRegisterCount} identity={identity} setIdentity={setIdentity} mode={mode} setMode={setMode} protocolChallengeStrategy={protocolChallengeStrategy} setProtocolChallengeStrategy={setProtocolChallengeStrategy} stage={stage} setStage={setStage} allTrafficProxyPool={allTrafficProxyPool} setAllTrafficProxyPool={setAllTrafficProxyPool} setupLoginSecret={setupLoginSecret} setSetupLoginSecret={setSetupLoginSecret} onClose={()=>setAutoOpen(false)} onStart={()=>createRegisterTask()} notify={notify} />}
   </div>;
 }
 
-function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurrency, setConcurrency, registerCount, setRegisterCount, identity, setIdentity, mode, setMode, protocolChallengeStrategy, setProtocolChallengeStrategy, stage, setStage, allTrafficProxyPool, setAllTrafficProxyPool, setupLoginSecret, setSetupLoginSecret, registerCountrySelection, registerCountriesLoading, onOpenRegisterCountries, onClose, onStart, notify }: { t: typeof zh; busy: boolean; selectedEmails: string[]; selectedNeedPhone: boolean; concurrency: number; setConcurrency: (v:number)=>void; registerCount: number; setRegisterCount: (v:number)=>void; identity: "system"|"domain"|"remail"|"google"|"microsoft"; setIdentity: (v:"system"|"domain"|"remail"|"google"|"microsoft")=>void; mode: "protocol"|"background"|"visible"; setMode:(v:"protocol"|"background"|"visible")=>void; protocolChallengeStrategy: ProtocolChallengeStrategy; setProtocolChallengeStrategy:(v:ProtocolChallengeStrategy)=>void; stage: RegisterStage; setStage:(v:RegisterStage)=>void; allTrafficProxyPool: boolean; setAllTrafficProxyPool: (v:boolean)=>void; setupLoginSecret: boolean; setSetupLoginSecret: (v:boolean)=>void; registerCountrySelection: string[]; registerCountriesLoading: boolean; onOpenRegisterCountries:()=>void; onClose:()=>void; onStart:()=>void; notify:(type:"ok"|"fail", text:string)=>void }) {
+function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurrency, setConcurrency, registerCount, setRegisterCount, identity, setIdentity, mode, setMode, protocolChallengeStrategy, setProtocolChallengeStrategy, stage, setStage, allTrafficProxyPool, setAllTrafficProxyPool, setupLoginSecret, setSetupLoginSecret, onClose, onStart, notify }: { t: typeof zh; busy: boolean; selectedEmails: string[]; selectedNeedPhone: boolean; concurrency: number; setConcurrency: (v:number)=>void; registerCount: number; setRegisterCount: (v:number)=>void; identity: "system"|"domain"|"remail"|"google"|"microsoft"; setIdentity: (v:"system"|"domain"|"remail"|"google"|"microsoft")=>void; mode: "protocol"|"background"|"visible"; setMode:(v:"protocol"|"background"|"visible")=>void; protocolChallengeStrategy: ProtocolChallengeStrategy; setProtocolChallengeStrategy:(v:ProtocolChallengeStrategy)=>void; stage: RegisterStage; setStage:(v:RegisterStage)=>void; allTrafficProxyPool: boolean; setAllTrafficProxyPool: (v:boolean)=>void; setupLoginSecret: boolean; setSetupLoginSecret: (v:boolean)=>void; onClose:()=>void; onStart:()=>void; notify:(type:"ok"|"fail", text:string)=>void }) {
 	const mailboxVerificationDescription = t === zh
 		? "系统将按邮箱类型自动选择 OAuth、iCloud 或域名邮箱 API 渠道完成邮箱验证。"
 		: "The system automatically selects the OAuth, iCloud, or domain-mail API channel based on each mailbox type.";
@@ -2015,7 +1983,7 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
         <Choice disabled={importDisabled} disabledMessage={t.registerStageUnavailable} active={!importDisabled && stage===IMPORT_REVERSE_PROXY} title={t.importReverseProxy} desc={t.importReverseProxyDesc + "\n" + phoneHint + "\n" + reverseHint + (importDisabled ? " · " + t.stageDisabledTip : "")} onClick={()=>setStage(IMPORT_REVERSE_PROXY)} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled={agentIdentityDisabled} disabledMessage={t.registerStageUnavailable} active={!agentIdentityDisabled && stage===AGENT_IDENTITY_REVERSE_PROXY} title={t.agentIdentityReverseProxy} desc={t.agentIdentityReverseProxyDesc + "\n" + reverseHint + (agentIdentityDisabled ? " · " + t.stageDisabledTip : "")} onClick={()=>setStage(AGENT_IDENTITY_REVERSE_PROXY)} onDisabledClick={(msg)=>notify("fail", msg)} />
       </div>
-      <div className="sr-summary sr-register-summary"><div><b>{t.identityLabel}</b><span>{identityText}</span></div><div><b>{t.modeLabel}</b><span>{modeText}</span></div><div><b>{t.stageLabel}</b><span>{stageText}</span></div><div><b>{t.registerCountryLabel}</b><button type="button" className="sr-link inline-flex items-center gap-1" onClick={onOpenRegisterCountries} title={t.registerCountryHint}>{registerCountriesLoading ? <Loader2 className="h-4 w-4 animate-spin"/> : <Globe2 className="h-4 w-4"/>}{registerCountrySelection.length ? registerCountrySelection.join(" / ") : t.registerCountryNone}</button></div><div><b>{identity === "remail" || identity === "domain" ? t.remailMailboxCount : t.registerAccounts}</b><input className="sr-concurrency-input" type="number" min={1} max={maxRegisterCount} disabled={identity === "system"} value={safeRegisterCount} onChange={(e)=>setRegisterCount(Math.max(1, Math.min(Number(e.target.value || 1), maxRegisterCount)))}/></div><div><b>{t.concurrency}</b><input className="sr-concurrency-input" type="number" min={1} max={safeRegisterCount} value={safeConcurrency} onChange={(e)=>setConcurrency(Math.max(1, Math.min(Number(e.target.value || 1), safeRegisterCount)))}/></div><div className="sr-register-account-list">{identity === "system" ? selectedEmails.map((email)=><div key={email}>{email}</div>) : <div>{identity === "domain" ? `${t.domainMailboxIdentity} · ${safeRegisterCount}` : template(t.remailOrderHint, {count:safeRegisterCount})}</div>}</div></div>
+      <div className="sr-summary sr-register-summary"><div><b>{t.identityLabel}</b><span>{identityText}</span></div><div><b>{t.modeLabel}</b><span>{modeText}</span></div><div><b>{t.stageLabel}</b><span>{stageText}</span></div><div><b>{identity === "remail" || identity === "domain" ? t.remailMailboxCount : t.registerAccounts}</b><input className="sr-concurrency-input" type="number" min={1} max={maxRegisterCount} disabled={identity === "system"} value={safeRegisterCount} onChange={(e)=>setRegisterCount(Math.max(1, Math.min(Number(e.target.value || 1), maxRegisterCount)))}/></div><div><b>{t.concurrency}</b><input className="sr-concurrency-input" type="number" min={1} max={safeRegisterCount} value={safeConcurrency} onChange={(e)=>setConcurrency(Math.max(1, Math.min(Number(e.target.value || 1), safeRegisterCount)))}/></div><div className="sr-register-account-list">{identity === "system" ? selectedEmails.map((email)=><div key={email}>{email}</div>) : <div>{identity === "domain" ? `${t.domainMailboxIdentity} · ${safeRegisterCount}` : template(t.remailOrderHint, {count:safeRegisterCount})}</div>}</div></div>
       <div className="sr-register-actions"><label className="mr-3 flex min-h-12 items-center gap-2 whitespace-nowrap text-sm text-slate-600" title={t.allTrafficProxyPoolTip}><input type="checkbox" checked={allTrafficProxyPool} onChange={(e)=>setAllTrafficProxyPool(e.target.checked)} disabled={busy}/><span>{t.allTrafficProxyPool}</span></label><label className="mr-3 flex min-h-12 items-center gap-2 whitespace-nowrap text-sm text-slate-600"><input type="checkbox" checked={setupLoginSecret} onChange={(e)=>setSetupLoginSecret(e.target.checked)} disabled={busy}/><span>{t.addPassword2FA}</span></label><Button className="h-12 flex-1 rounded-xl bg-blue-600 text-lg text-white hover:bg-blue-700" disabled={startDisabled} onClick={onStart}>{busy ? <Loader2 className="mr-2 h-5 w-5 animate-spin"/> : null}{t.startAutoRegister}</Button><button className="sr-register-cancel" onClick={onClose}>{t.cancel}</button></div>
     </div>
   </div></div>;

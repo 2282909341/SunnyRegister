@@ -15,7 +15,6 @@ class ProxyLease:
     address: str
     slot: int
     latency_ms: int = 0
-    country: str = ""
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -24,7 +23,6 @@ class ProxyLease:
             "address": self.address,
             "slot": self.slot,
             "latency_ms": self.latency_ms,
-            "country": self.country,
         }
 
 
@@ -86,7 +84,6 @@ class TaskProxyScheduler:
                 str(candidate.get("register") or ""),
                 slot,
                 int(state.get("latency_ms") or 0),
-                str(candidate.get("country") or ""),
             )
         return ProxyLease(key, 0, "", -1)
 

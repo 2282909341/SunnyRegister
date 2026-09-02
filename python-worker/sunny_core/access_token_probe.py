@@ -52,23 +52,20 @@ def _classify(response) -> dict[str, Any]:
     return {"status": "probe_failed", "error": f"AT 检测上游响应异常: {_preview(response)}", "http_status": response.status_code}
 
 
-def _request(access_token: str, proxy_url: str, seed: str = "", country: str = "") -> dict[str, Any]:
-    from .account_persona import pick_persona
-
-    persona = pick_persona(seed or "access-token-probe", country)
+def _request(access_token: str, proxy_url: str) -> dict[str, Any]:
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    session = curl_requests.Session(impersonate=persona.impersonate, proxies=proxies, timeout=18, verify=ca_bundle_path())
+    session = curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=18, verify=ca_bundle_path())
     try:
         response = session.get(
             MODELS_URL,
             headers={
                 "Accept": "application/json",
-                "Accept-Language": persona.accept_language,
+                "Accept-Language": "en-US,en;q=0.9",
                 "Authorization": f"Bearer {access_token}",
                 "Cache-Control": "no-cache",
                 "Origin": "https://chatgpt.com",
                 "Referer": "https://chatgpt.com/",
-                "oai-language": persona.locale,
+                "oai-language": "en-US",
             },
             allow_redirects=False,
         )
@@ -77,7 +74,7 @@ def _request(access_token: str, proxy_url: str, seed: str = "", country: str = "
         session.close()
 
 
-def probe_access_token(access_token: str, proxy_url: str = "", *, seed: str = "", country: str = "") -> dict[str, Any]:
+def probe_access_token(access_token: str, proxy_url: str = "") -> dict[str, Any]:
     token = str(access_token or "").strip()
     if not token:
         return {"status": "invalid", "error": "账户没有可用的 Access Token"}
@@ -94,7 +91,7 @@ def probe_access_token(access_token: str, proxy_url: str = "", *, seed: str = ""
     for source, proxy in attempts:
         try:
             with use_traffic_meter(meter):
-                result = _request(token, proxy, seed=seed, country=country)
+                result = _request(token, proxy)
         except Exception as exc:
             all_blocked = False
             errors.append(f"{source}={exc}")

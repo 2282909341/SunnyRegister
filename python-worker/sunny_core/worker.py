@@ -27,8 +27,7 @@ from .openai_auth import TaskCancelledError, login_or_register, refresh_openai_a
 from .phone_pool import read_sms_candidates, wait_sms_code
 from .protocol_auth import ProtocolChallengeRequired, ProtocolRegistrationError, login_or_register_protocol
 from .login_secret import setup_login_secret, setup_login_secret_protocol
-from .account_persona import pick_persona
-from .proxy import build_proxy, proxy_target_tls_check, redact_proxy_url, sticky_proxy_url
+from .proxy import build_proxy, proxy_target_tls_check, redact_proxy_url
 from .proxy_scheduler import ProxyLease, TaskProxyScheduler
 from .smsbower import SMSBowerClient
 from .smspool import SMSPOOL_CODE_TIMEOUT_SECONDS, SMSPoolClient
@@ -136,7 +135,6 @@ class RemailMailboxProvisioner:
             detail={"scope": "global", "provider": "remail", "mailbox_id": mailbox.get("id"), "sequence": sequence},
         )
         return mailbox
-
 
 _REGISTRATION_PROGRESS_STEPS = {
     "initializing": 1,
@@ -458,8 +456,6 @@ def _proxy_pool_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
     pool_items = raw_pool if isinstance(raw_pool, list) else []
     raw_ids = payload.get("proxy_ids")
     proxy_ids = raw_ids if isinstance(raw_ids, list) else []
-    raw_countries = payload.get("proxy_countries")
-    proxy_countries = raw_countries if isinstance(raw_countries, list) else []
     candidates: list[dict[str, Any]] = []
     for index, item in enumerate(pool_items):
         stored_address = build_proxy("", str(item or "")).url
@@ -469,12 +465,10 @@ def _proxy_pool_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
             proxy_id = max(0, int(proxy_ids[index])) if index < len(proxy_ids) else 0
         except (TypeError, ValueError):
             proxy_id = 0
-        country = str(proxy_countries[index] or "").strip() if index < len(proxy_countries) else ""
         candidates.append({
             "id": proxy_id,
             "address": stored_address,
             "register": _container_host_proxy(stored_address),
-            "country": country,
         })
     return candidates
 
@@ -494,7 +488,6 @@ def _proxy_snapshot(payload: dict[str, Any], slot: int = 0) -> dict[str, Any]:
             "proxy_id": int(lease.get("proxy_id") or 0),
             "proxy_slot": int(lease.get("slot") or -1),
             "proxy_latency_ms": int(lease.get("latency_ms") or 0),
-            "country": str(lease.get("country") or "").strip(),
         }
     base = str(payload.get("proxy") or "").strip()
     candidates = _proxy_pool_candidates(payload)
@@ -502,13 +495,11 @@ def _proxy_snapshot(payload: dict[str, Any], slot: int = 0) -> dict[str, Any]:
         selected = candidates[max(0, int(slot)) % len(candidates)]
         register_proxy = selected["register"]
         proxy_id = selected["id"]
-        proxy_country = str(selected.get("country") or "")
     else:
         register_proxy = _container_host_proxy(build_proxy("", str(payload.get("register_proxy") or base)).url)
         proxy_id = 0
-        proxy_country = ""
     local_proxy = _container_host_proxy(build_proxy(str(payload.get("local_proxy") or ""), "").url)
-    return {"register": register_proxy, "mode": "proxy_pool", "local_proxy": local_proxy, "proxy_id": proxy_id, "country": proxy_country}
+    return {"register": register_proxy, "mode": "proxy_pool", "local_proxy": local_proxy, "proxy_id": proxy_id}
 
 
 def _auxiliary_proxy(payload: dict[str, Any], proxies: dict[str, Any]) -> str:
@@ -558,7 +549,6 @@ def _prepare_register_proxy(db: SunnyDB, payload: dict[str, Any], email: str, sl
     for attempt, candidate in enumerate(candidates, start=1):
         proxy_id = int(candidate.get("id") or 0)
         candidate_proxy = str(candidate.get("register") or "")
-        candidate_country = str(candidate.get("country") or "").strip()
         if proxy_id > 0 and not db.proxy_is_usable(proxy_id):
             db.event(
                 f"[{email}] [代理] 跳过已被其他任务标记为失效的代理：{redact_proxy_url(candidate_proxy)}",
@@ -568,33 +558,11 @@ def _prepare_register_proxy(db: SunnyDB, payload: dict[str, Any], email: str, sl
             continue
         check = proxy_target_tls_check(candidate_proxy, timeout=10)
         if check.get("ok"):
-            selected = {**proxies, "register": candidate_proxy, "proxy_id": proxy_id, "country": candidate_country}
-            # Rotating-residential egress gives the account a NEW exit IP per
-            # connection; a -session-<hash> suffix pins one exit per account.
-            sticky_candidate = sticky_proxy_url(candidate_proxy, email)
-            if sticky_candidate and sticky_candidate != candidate_proxy:
-                sticky_check = proxy_target_tls_check(sticky_candidate, timeout=10)
-                if sticky_check.get("ok"):
-                    selected["register"] = sticky_candidate
-                    db.event(
-                        f"[{email}] [代理] 已为该账号绑定会话粘性出口（同账号复用同一出口 IP）：{redact_proxy_url(sticky_candidate)}，延迟 {sticky_check.get('latency_ms', 0)}ms",
-                        detail={"email": email, "scope": "selected", "proxy": redact_proxy_url(sticky_candidate), "proxy_id": proxy_id, "proxy_mode": selected.get("mode"), "proxy_country": candidate_country, "proxy_sticky": True, "proxy_precheck": sticky_check, "proxy_attempt": attempt},
-                    )
-                else:
-                    db.event(
-                        f"[{email}] [代理] 上游代理不支持会话粘性参数，本次沿用轮换出口：{redact_proxy_url(candidate_proxy)}；原因：{sticky_check.get('error') or 'unknown error'}",
-                        "warning",
-                        detail={"email": email, "scope": "selected", "proxy": redact_proxy_url(candidate_proxy), "proxy_id": proxy_id, "proxy_mode": selected.get("mode"), "proxy_sticky": False, "proxy_sticky_precheck": sticky_check, "proxy_attempt": attempt},
-                    )
-                    db.event(
-                        f"[{email}] [代理] 代理 HTTPS 隧道预检通过：{redact_proxy_url(candidate_proxy)}，延迟 {check.get('latency_ms', 0)}ms",
-                        detail={"email": email, "scope": "selected", "proxy": candidate_proxy, "proxy_id": proxy_id, "proxy_mode": selected.get("mode"), "proxy_country": candidate_country, "proxy_precheck": check, "proxy_attempt": attempt},
-                    )
-            else:
-                db.event(
-                    f"[{email}] [代理] 代理 HTTPS 隧道预检通过：{redact_proxy_url(candidate_proxy)}，延迟 {check.get('latency_ms', 0)}ms",
-                    detail={"email": email, "scope": "selected", "proxy": candidate_proxy, "proxy_id": proxy_id, "proxy_mode": selected.get("mode"), "proxy_country": candidate_country, "proxy_precheck": check, "proxy_attempt": attempt},
-                )
+            selected = {**proxies, "register": candidate_proxy, "proxy_id": proxy_id}
+            db.event(
+                f"[{email}] [代理] 代理 HTTPS 隧道预检通过：{redact_proxy_url(candidate_proxy)}，延迟 {check.get('latency_ms', 0)}ms",
+                detail={"email": email, "scope": "selected", "proxy": candidate_proxy, "proxy_id": proxy_id, "proxy_mode": selected.get("mode"), "proxy_precheck": check, "proxy_attempt": attempt},
+            )
             return selected
         err = str(check.get("error") or "unknown error")
         failures.append(f"{redact_proxy_url(candidate_proxy)}: {err}")
@@ -1705,21 +1673,6 @@ def _run_one_impl(
     if protocol_challenge_strategy not in {"native_headless", "sentinel_protocol"}:
         protocol_challenge_strategy = "native_headless"
     account = account_from_row(mailbox)
-    proxy_country = str(proxies.get("country") or "").strip()
-    persona = pick_persona(identity_email or str(email), proxy_country)
-    db.event(
-        f"[{email}] [指纹] 已绑定账号级设备画像：{persona.impersonate}，地区 {persona.locale}（{persona.timezone}），屏幕 {persona.screen}",
-        detail={
-            "email": email,
-            "scope": "selected",
-            "persona_impersonate": persona.impersonate,
-            "persona_locale": persona.locale,
-            "persona_timezone": persona.timezone,
-            "persona_screen": persona.screen,
-            "persona_user_agent": persona.user_agent,
-            "persona_country": proxy_country,
-        },
-    )
     mailbox_proxy_url = _mailbox_proxy_for_task(payload, proxies, auxiliary_proxy, account.mailbox_type)
     if mailbox_proxy_url and not auxiliary_proxy:
         db.event(
@@ -1988,7 +1941,6 @@ def _run_one_impl(
             traffic_meter=traffic_meter,
             traffic_config=payload.get("browser_traffic_optimization"),
             post_registration_callback=setup_login_secret_in_browser if setup_login_secret_enabled else None,
-            persona=persona,
         )
 
     try:
@@ -2006,7 +1958,6 @@ def _run_one_impl(
                     mailbox_proxy_url=mailbox_proxy_url,
                     traffic_meter=traffic_meter,
                     post_registration_callback=setup_login_secret_in_protocol if setup_login_secret_enabled else None,
-                    persona=persona,
                 )
             except (ProtocolChallengeRequired, ProtocolRegistrationError) as protocol_error:
                 is_challenge = isinstance(protocol_error, ProtocolChallengeRequired)
@@ -2117,7 +2068,6 @@ def _run_one_impl(
                             traffic_meter=traffic_meter,
                             traffic_config=payload.get("browser_traffic_optimization"),
                             post_registration_callback=setup_login_secret_in_browser if setup_login_secret_enabled else None,
-                            persona=persona,
                         )
                         session["requested_execution_mode"] = "protocol"
                         session["execution_mode"] = "protocol_post_stage"
@@ -2164,7 +2114,6 @@ def _run_one_impl(
                 traffic_meter=traffic_meter,
                 traffic_config=payload.get("browser_traffic_optimization"),
                 post_registration_callback=setup_login_secret_in_browser if setup_login_secret_enabled else None,
-                persona=persona,
             )
         db.ensure_not_cancelled()
         _persist_authenticated_login(db, identity_email, mailbox_id, session, account.raw)
@@ -2584,33 +2533,7 @@ def _run_one(
         db.event(message, "warning", detail={"email": email, "scope": "selected", "mailbox_id": mailbox_id, "mailbox_lease_busy": True})
         return False, message
     try:
-        ok, result = _run_one_impl(db, task_type, payload, mailbox, index, total, protocol_batch_policy)
-        login_secret_incomplete = (
-            task_type == "sunny_register"
-            and payload.get("setup_login_secret") is True
-            and ok
-            and isinstance(result, dict)
-            and not result.get("login_secret_complete")
-        )
-        retry_failure = classify_auth_failure(result) if task_type == "sunny_register" and not ok else None
-        retryable_failure = bool(retry_failure and retry_failure.retryable)
-        if login_secret_incomplete or retryable_failure:
-            email = str(mailbox.get("email") or "")
-            db.event(
-                f"[{email}] [系统] 首次流程未完整成功，将使用全新认证上下文自动重试一次",
-                "warning",
-                detail={"email": email, "scope": "selected", "automatic_retry": True},
-            )
-            if retry_failure and retry_failure.delay_seconds:
-                _interruptible_delay(db, retry_failure.delay_seconds)
-            mailbox = db.fetch_mailbox_by_email(email) or mailbox
-            ok, result = _run_one_impl(
-                db, "sunny_login" if login_secret_incomplete else task_type,
-                payload, mailbox, index, total, protocol_batch_policy,
-            )
-        if ok and payload.get("setup_login_secret") is True and isinstance(result, dict) and not result.get("login_secret_complete"):
-            return False, f"[{mailbox.get('email') or ''}] ChatGPT 注册已完成，但密码与 2FA 未全部设置成功"
-        return ok, result
+        return _run_one_impl(db, task_type, payload, mailbox, index, total, protocol_batch_policy)
     finally:
         if callable(release) and mailbox_id > 0:
             release(mailbox_id, owner)
@@ -2648,49 +2571,6 @@ def _interruptible_delay(db: SunnyDB, seconds: float) -> None:
         remaining -= chunk
 
 
-def _register_pacing_range(payload: dict[str, Any]) -> tuple[float, float]:
-    """Random pause range between two registrations (anti batch-correlation).
-
-    Honors payload overrides (register_pacing_min_sec/max_sec) before
-    SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC env vars; defaults to a light 3-8s jitter
-    that breaks mechanical rhythm without materially slowing a batch.
-    Set both to 0 to disable pacing entirely.
-    """
-
-    def _number(value: Any, fallback: float) -> float:
-        if value is None:
-            return fallback
-        try:
-            return max(0.0, float(value))
-        except (TypeError, ValueError):
-            return fallback
-
-    def _env_float(name: str, default: float) -> float:
-        try:
-            return max(0.0, float(os.getenv(name, str(default))))
-        except (TypeError, ValueError):
-            return default
-
-    low = _number(payload.get("register_pacing_min_sec"), _env_float("SUNNY_REGISTER_PACING_MIN_SEC", 3.0))
-    high = _number(payload.get("register_pacing_max_sec"), _env_float("SUNNY_REGISTER_PACING_MAX_SEC", 8.0))
-    if high < low:
-        high = low
-    return low, high
-
-
-def _pacing_delay(db: SunnyDB, payload: dict[str, Any]) -> None:
-    """Sleep a random per-account interval between batch registrations."""
-    low, high = _register_pacing_range(payload)
-    if high <= 0:
-        return
-    seconds = round(random.uniform(low, high), 2)
-    db.event(
-        f"[系统] 账号间随机冷却 {seconds}s（降低批量关联风险，可用 SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC 调整）",
-        detail={"scope": "global", "pacing_enabled": True, "pacing_seconds": seconds, "pacing_range_sec": [low, high]},
-    )
-    _interruptible_delay(db, seconds)
-
-
 def _refresh_with_retry(db: SunnyDB, refresh_token: str, proxy_url: str) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(3):
@@ -2706,8 +2586,8 @@ def _refresh_with_retry(db: SunnyDB, refresh_token: str, proxy_url: str) -> dict
     raise RuntimeError(str(last_error or "Refresh Token 续期失败"))
 
 
-def _verify_access_token(access_token: str, proxy_url: str, seed: str = "", country: str = "") -> dict[str, Any]:
-    result = probe_access_token(access_token, proxy_url, seed=seed, country=country)
+def _verify_access_token(access_token: str, proxy_url: str) -> dict[str, Any]:
+    result = probe_access_token(access_token, proxy_url)
     if result.get("status") != "valid":
         error = str(result.get("error") or "AT 二次验活未得到有效响应")
         marker = "token_invalid: " if result.get("status") == "invalid" else ""
@@ -2715,9 +2595,9 @@ def _verify_access_token(access_token: str, proxy_url: str, seed: str = "", coun
     return result
 
 
-def _verify_persisted_access_token(db: SunnyDB, email: str, access_token: str, proxy_url: str, country: str = "") -> dict[str, Any]:
+def _verify_persisted_access_token(db: SunnyDB, email: str, access_token: str, proxy_url: str) -> dict[str, Any]:
     try:
-        return _verify_access_token(access_token, proxy_url, seed=email, country=country)
+        return _verify_access_token(access_token, proxy_url)
     except Exception as exc:
         discard = getattr(db, "discard_unverified_access_token", None)
         if callable(discard):
@@ -2752,8 +2632,7 @@ def _refresh_sessions_sequential(db: SunnyDB, payload: dict[str, Any]) -> tuple[
                 try:
                     renewal_current = 5
                     _emit_renewal_progress(db, email, renewal_current, renewal_total, "refresh_token_ready")
-                    proxy_snapshot = _proxy_snapshot(payload, idx - 1)
-                    proxy_url = proxy_snapshot["register"]
+                    proxy_url = _proxy_snapshot(payload, idx - 1)["register"]
                     token = _refresh_with_retry(db, rt, proxy_url)
                     db.ensure_not_cancelled()
                     renewal_current = 6
@@ -2761,7 +2640,7 @@ def _refresh_sessions_sequential(db: SunnyDB, payload: dict[str, Any]) -> tuple[
                     new_access_token = str(token.get("access_token") or "").strip()
                     renewal_current = 7
                     _emit_renewal_progress(db, email, renewal_current, renewal_total, "secondary_probe")
-                    probe = _verify_access_token(new_access_token, proxy_url, seed=email, country=str(proxy_snapshot.get("country") or ""))
+                    probe = _verify_access_token(new_access_token, proxy_url)
                     account_id = int(acc.get("id") or db.upsert_account(email))
                     payload2 = {"access_token": new_access_token, "refresh_token": token.get("refresh_token") or rt, "id_token": token.get("id_token", ""), "expires_at": token.get("expires_at"), "session_json": token}
                     renewal_current = 8
@@ -2881,8 +2760,7 @@ def _refresh_sessions_sequential(db: SunnyDB, payload: dict[str, Any]) -> tuple[
                     refreshed_token = str(raw_session_json.get("accessToken") or raw_session_json.get("access_token") or "").strip()
             renewal_current = 8
             _emit_renewal_progress(db, email, renewal_current, renewal_total, "secondary_probe")
-            renewal_snapshot = _proxy_snapshot(payload, idx - 1)
-            probe = _verify_persisted_access_token(db, email, refreshed_token, renewal_snapshot["register"], country=str(renewal_snapshot.get("country") or ""))
+            probe = _verify_persisted_access_token(db, email, refreshed_token, _proxy_snapshot(payload, idx - 1)["register"])
             marker = getattr(db, "mark_access_token_probe", None)
             if callable(marker):
                 marker(email, "valid")
@@ -2988,10 +2866,9 @@ def _refresh_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[s
         account_id = int(account.get("id") or 0)
         if probe_payloads[account_id].get("_proxy_unavailable") is True:
             return {**spec, "probe": {"status": "probe_failed", "error": "代理池脉冲预检未找到可用 ChatGPT HTTPS 出口"}}
-        probe_snapshot = _proxy_snapshot(probe_payloads[account_id], int(spec["index"]))
-        proxy_url = probe_snapshot["register"]
+        proxy_url = _proxy_snapshot(probe_payloads[account_id], int(spec["index"]))["register"]
         token = str(spec.get("token") or "")
-        result = probe_access_token(token, proxy_url, seed=str(account.get("email") or ""), country=str(probe_snapshot.get("country") or ""))
+        result = probe_access_token(token, proxy_url)
         return {**spec, "probe": result}
 
     probe_results: list[dict[str, Any]] = []
@@ -3163,8 +3040,7 @@ def _acquire_refresh_token_recovery(
         saved = db.fetch_session_by_email(email) or {}
         access_token = str(saved.get("access_token") or "").strip()
         refresh_token = str(saved.get("refresh_token") or "").strip()
-        acquire_snapshot = _proxy_snapshot(payload, index - 1)
-        probe = _verify_persisted_access_token(db, email, access_token, acquire_snapshot["register"], country=str(acquire_snapshot.get("country") or ""))
+        probe = _verify_persisted_access_token(db, email, access_token, _proxy_snapshot(payload, index - 1)["register"])
         if not refresh_token:
             raise RuntimeError("Codex OAuth 登录完成但数据库中没有新的 Refresh Token")
         marker = getattr(db, "mark_access_token_probe", None)
@@ -3230,17 +3106,10 @@ def _acquire_refresh_tokens(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, 
         rt = str(spec.get("refresh_token") or "")
         if not rt:
             return {**spec, "status": "missing"}
-        inspect_snapshot = _proxy_snapshot(spec["payload"], int(spec["index"]) - 1)
-        proxy_url = inspect_snapshot["register"]
+        proxy_url = _proxy_snapshot(spec["payload"], int(spec["index"]) - 1)["register"]
         try:
             token = refresh_openai_access_token(rt, proxy_url)
-            inspect_account = spec.get("account") if isinstance(spec.get("account"), dict) else {}
-            probe = _verify_access_token(
-                str(token.get("access_token") or ""),
-                proxy_url,
-                seed=str(inspect_account.get("email") or ""),
-                country=str(inspect_snapshot.get("country") or ""),
-            )
+            probe = _verify_access_token(str(token.get("access_token") or ""), proxy_url)
             return {**spec, "status": "valid", "token": token, "probe": probe}
         except Exception as exc:
             failure = classify_auth_failure(exc)
@@ -3886,8 +3755,7 @@ def run_sunny_task(task_id: str) -> None:
             db.event(f"邮箱换绑任务总结：成功 {ok}，跳过 {skipped}，失败 {len(errors)}", "info" if not errors else "error", detail={"scope": "global", **result})
             return
 
-        identity = str(payload.get("identity") or "").strip().lower()
-        is_remail_task = identity == "remail"
+        is_remail_task = str(payload.get("identity") or "").strip().lower() == "remail"
         requested_total = max(1, int(payload.get("count") or 1))
         existing_remail_ids = _ids(payload.get("mailbox_ids")) if is_remail_task else []
         mailboxes = db.fetch_mailboxes(existing_remail_ids) if existing_remail_ids else ([] if is_remail_task else _choose_mailboxes(db, payload))
@@ -3961,8 +3829,6 @@ def run_sunny_task(task_id: str) -> None:
                             break
                 else:
                     idx, mailbox = entry
-                if idx > 1:
-                    _pacing_delay(db, payload)
                 ok, result = _run_one(db, task_type, payload, mailbox, idx, total, protocol_batch_policy)
                 db.ensure_not_cancelled()
                 record_result(ok, result)
@@ -4009,8 +3875,6 @@ def run_sunny_task(task_id: str) -> None:
                             ok, result = False, f"parallel worker failed: {exc}"
                         db.ensure_not_cancelled()
                         record_result(ok, result)
-                        if not provider_stop_reason:
-                            _pacing_delay(db, payload)
                         submit_next()
             finally:
                 # Do not let browser/OTP threads outlive the task. Running flows

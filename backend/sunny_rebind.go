@@ -176,27 +176,3 @@ func (s *Server) sunnyPurposeProxyPoolForCountries(requested []string, purpose s
 func (s *Server) sunnyRebindProxyPoolForCountries(requested []string) ([]string, []uint, []string, []string, error) {
 	return s.sunnyPurposeProxyPoolForCountries(requested, sunnyProxyPurposeRegister, "换绑")
 }
-
-// sunnyRegisterProxyGroups returns the enabled register-purpose proxies grouped
-// by validated country code for the auto-register country picker. Only proxies
-// tagged with the register purpose in the proxy pool are offered.
-func (s *Server) sunnyRegisterProxyGroups() (map[string][]SunnyProxy, error) {
-	return s.sunnyPurposeProxyGroups(sunnyProxyPurposeRegister, "注册")
-}
-
-func sunnyRegisterProxyCountryList(groups map[string][]SunnyProxy) []string {
-	countries := make([]string, 0, len(groups))
-	for country := range groups {
-		countries = append(countries, country)
-	}
-	sort.Strings(countries)
-	return countries
-}
-
-// sunnyRegisterProxyPoolForCountries validates the requested countries against
-// the register-purpose proxy pool and returns the flattened proxy addresses,
-// proxy ids, per-proxy countries and the normalized country list to pin this
-// register task to.
-func (s *Server) sunnyRegisterProxyPoolForCountries(requested []string) ([]string, []uint, []string, []string, error) {
-	return s.sunnyPurposeProxyPoolForCountries(requested, sunnyProxyPurposeRegister, "注册")
-}

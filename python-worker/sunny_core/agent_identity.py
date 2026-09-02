@@ -97,11 +97,9 @@ def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
         raise TaskCancelledError("Task cancelled by user")
 
 
-def _session(proxy_url: str, seed: str = ""):
-    from .fingerprint_pool import pick_impersonate
-
+def _session(proxy_url: str):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    return curl_requests.Session(impersonate=pick_impersonate(seed or proxy_url), proxies=proxies, timeout=30, verify=ca_bundle_path())
+    return curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=30, verify=ca_bundle_path())
 
 
 def _response_error(response, action: str) -> RuntimeError:
@@ -216,7 +214,7 @@ def create_agent_identity_auth(
         raise RuntimeError("Access Token 缺少 Agent Identity 所需的 account_id 或 chatgpt_user_id")
 
     private_key, public_key = generate_ed25519_keypair()
-    client = _session(proxy_url, seed=resolved_email)
+    client = _session(proxy_url)
     try:
         if log:
             log("[反代] 正在创建 Codex Agent Identity")
