@@ -4459,6 +4459,10 @@ func normalizeSunnyDisplayStatus(status string) string {
 		return "已接码"
 	case "reverse_proxied", "reverse-proxied", "proxied", "imported":
 		return "已反代"
+	// 历史数据里账号表存在英文 banned（旧版测活写入），必须归一化，
+	// 否则账户管理列表会直接显示原文，且「已封禁」筛选匹配不到这些账号。
+	case "banned", "disabled":
+		return "已封禁"
 	case "failed", "error":
 		return "失败"
 	case "pending", "":
