@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	icmeigoAPIBaseURL  = "https://ic.meiguo.lol"
-	icmeigoOTPPattern  = regexp.MustCompile(`(?m)(?:^|\D)(\d{6})(?:\D|$)`)
+	icmeigoAPIBaseURL    = "https://ic.meiguo.lol"
+	icmeigoOTPPattern    = regexp.MustCompile(`(?m)(?:^|\D)(\d{6})(?:\D|$)`)
 	icmeigoOpenAIPattern = regexp.MustCompile(`(?i)openai|chatgpt`)
 )
 
@@ -100,13 +100,16 @@ func icmeigoGenerate(client *http.Client, accessKey string) (string, error) {
 	}
 	upstreamCode := strings.ToUpper(strings.TrimSpace(text(payload["code"])))
 	detailLower := strings.ToLower(detail)
-	if upstreamCode != "" || status == http.StatusTooManyRequests || strings.Contains(detailLower, "quota") || strings.Contains(detailLower, "concurrency") || strings.Contains(detail, "并发") || strings.Contains(detail, "额度") {
+	if upstreamCode == "API_CONCURRENCY_LIMIT" || strings.Contains(detailLower, "concurrency") || strings.Contains(detail, "并发") {
 		// 并发已满与额度用完是两种状态：并发满时该卡名下完成密码+2FA 的邮箱
 		// 释放并发槽后还能继续生成；额度用完则只能停止。
-		if upstreamCode == "API_CONCURRENCY_LIMIT" || strings.Contains(detail, "并发") {
-			return "", &outlookMailError{Code: "mailbox_concurrency_limit", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "卡密并发已满，请释放邮箱后再生成", Detail: detail}
-		}
-		return "", &outlookMailError{Code: "mailbox_provider_busy", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "该兑换码额度已用完", Detail: detail}
+		return "", &outlookMailError{Code: "mailbox_concurrency_limit", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "卡密并发已满，请释放邮箱后再生成", Detail: detail}
+	}
+	if strings.Contains(upstreamCode, "QUOTA") || strings.Contains(detailLower, "quota") || strings.Contains(detail, "额度") {
+		return "", &outlookMailError{Code: "mailbox_quota_exhausted", Category: "service", HTTPStatus: http.StatusUnprocessableEntity, UserMessage: "该兑换码额度已用完", Detail: detail}
+	}
+	if status == http.StatusTooManyRequests {
+		return "", &outlookMailError{Code: "mailbox_provider_busy", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "iCloud 邮箱渠道当前请求较多，请稍后重试", Detail: detail}
 	}
 	if status < 200 || status >= 300 {
 		return "", &outlookMailError{Code: "mailbox_provider_failed", Category: "service", HTTPStatus: http.StatusBadGateway, UserMessage: "iCloud 邮箱渠道请求失败，请稍后重试", Detail: fmt.Sprintf("HTTP %d", status)}
@@ -139,8 +142,11 @@ func icmeigoReleaseMailbox(client *http.Client, accessKey, email string) error {
 		return &outlookMailError{Code: "mailbox_provider_failed", Category: "service", HTTPStatus: http.StatusBadGateway, UserMessage: "iCloud 邮箱渠道释放邮箱失败", Detail: detail}
 	}
 	data, _ := payload["data"].(map[string]any)
-	if intValue(data["success"], 1) < 1 {
+	if intValue(data["success"], 0) < 1 && intValue(data["pending"], 0) < 1 {
 		return &outlookMailError{Code: "mailbox_provider_failed", Category: "service", HTTPStatus: http.StatusBadGateway, UserMessage: "iCloud 邮箱渠道释放邮箱未成功", Detail: dumpJSON(data)}
+	}
+	if intValue(data["pending"], 0) > 0 {
+		time.Sleep(time.Second)
 	}
 	return nil
 }

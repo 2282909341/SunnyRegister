@@ -164,5 +164,101 @@ func TestIcMeiGoGenerateAndReleaseFlow(t *testing.T) {
 		if released != 1 {
 			t.Fatalf("release calls=%d, want 1", released)
 		}
+		var done SunnyMailbox
+		if err := s.db.Where("email = ?", "done@icloud.com").First(&done).Error; err != nil {
+			t.Fatal(err)
+		}
+		if done.Enabled || done.Status != "已释放" {
+			t.Fatalf("released mailbox was not marked: enabled=%v status=%q", done.Enabled, done.Status)
+		}
+	})
+
+	t.Run("skips a released row and releases the next completed mailbox", func(t *testing.T) {
+		successes, released = 0, 0
+		s := newSunnySessionTestServer(t)
+		rows := []SunnyMailbox{
+			{Email: "old-released@icloud.com", MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: "api_key", ChatGPTPassword: "pw", TOTPSecret: "totp", Status: "已释放", Enabled: false},
+			{Email: "next-done@icloud.com", MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: "api_key", ChatGPTPassword: "pw", TOTPSecret: "totp", Status: "已注册", Enabled: true},
+		}
+		if err := s.db.Create(&rows).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.Model(&rows[0]).UpdateColumn("enabled", false).Error; err != nil {
+			t.Fatal(err)
+		}
+		imported, bad, notes := s.importIcMeiGoCards("api_key", 0)
+		if imported != 2 || len(bad) != 0 || len(notes) != 0 || released != 1 {
+			t.Fatalf("released row shadowed next candidate: imported=%d bad=%v notes=%v released=%d", imported, bad, notes, released)
+		}
+		var old SunnyMailbox
+		if err := s.db.Where("email = ?", "old-released@icloud.com").First(&old).Error; err != nil || old.Enabled || old.Status != "已释放" {
+			t.Fatalf("old released row changed: row=%#v err=%v", old, err)
+		}
+	})
+
+	t.Run("releases a failed mailbox without credentials and continues", func(t *testing.T) {
+		successes, released = 0, 0
+		s := newSunnySessionTestServer(t)
+		failed := SunnyMailbox{Email: "failed@icloud.com", MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: "api_key", Status: "失败", Enabled: true, LastError: "registration failed"}
+		if err := s.db.Create(&failed).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.Model(&failed).UpdateColumn("enabled", false).Error; err != nil {
+			t.Fatal(err)
+		}
+		imported, bad, notes := s.importIcMeiGoCards("api_key", 0)
+		if imported != 2 || len(bad) != 0 || len(notes) != 0 || released != 1 {
+			t.Fatalf("failed mailbox did not free slot: imported=%d bad=%v notes=%v released=%d", imported, bad, notes, released)
+		}
+		if err := s.db.First(&failed, failed.ID).Error; err != nil || failed.Enabled || failed.Status != "已释放" {
+			t.Fatalf("failed mailbox was not marked released: row=%#v err=%v", failed, err)
+		}
+	})
+}
+
+func TestIcMeiGoGenerateErrorClassificationAndUpsertReset(t *testing.T) {
+	t.Run("pending release is accepted", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"data":{"success":0,"failed":0,"pending":1}}`))
+		}))
+		defer server.Close()
+		oldBase := icmeigoAPIBaseURL
+		icmeigoAPIBaseURL = server.URL
+		defer func() { icmeigoAPIBaseURL = oldBase }()
+
+		if err := icmeigoReleaseMailbox(server.Client(), "api_key", "pending@icloud.com"); err != nil {
+			t.Fatalf("pending release should be accepted: %v", err)
+		}
+	})
+
+	t.Run("provider code is not mislabeled as quota exhausted", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"code":"SERVICE_TEMPORARILY_UNAVAILABLE","message":"please retry"}`))
+		}))
+		defer server.Close()
+		oldBase := icmeigoAPIBaseURL
+		icmeigoAPIBaseURL = server.URL
+		defer func() { icmeigoAPIBaseURL = oldBase }()
+
+		_, err := icmeigoGenerate(server.Client(), "api_key")
+		mailErr, ok := err.(*outlookMailError)
+		if !ok || mailErr.Code != "mailbox_provider_failed" || strings.Contains(mailErr.UserMessage, "额度") {
+			t.Fatalf("unexpected transient error classification: %#v", err)
+		}
+	})
+
+	t.Run("repeat import clears dirty status", func(t *testing.T) {
+		s := newSunnySessionTestServer(t)
+		row := SunnyMailbox{Email: "dirty@icloud.com", MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: "old", Status: "失败", Enabled: false, LastError: "old failure"}
+		if err := s.db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := s.upsertIcMeiGoMailbox(0, row.Email, "new"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.First(&row, row.ID).Error; err != nil || !row.Enabled || row.Status != "未注册" || row.LastError != "" || row.AccessKey != "new" {
+			t.Fatalf("dirty mailbox was not reset: row=%#v err=%v", row, err)
+		}
 	})
 }
