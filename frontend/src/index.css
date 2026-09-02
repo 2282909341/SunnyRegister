@@ -166,7 +166,6 @@ a { color: inherit; text-decoration: none; }
 }
 .orb-panel, .login-card, .feature-row, .control-surface, .empty-state-panel, .log-box,
 [class*="bg-[var(--bg-card)]"] {
-  backdrop-filter: blur(22px) saturate(1.22);
   box-shadow: var(--surface-glow);
 }
 .feature-row { animation: rise-in .55s ease both; }
