@@ -1807,6 +1807,13 @@ func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string) 
 			}
 			imported++
 			okForCard++
+			// 立即释放该邮箱占用的并发槽。卡密并发上限通常只有 1，
+			// 不释放的话第二次 generate 就会被 API_CONCURRENCY_LIMIT 拒绝，
+			// 导致 N 额度卡只生成 1 个邮箱。释放不返还额度、不影响收信。
+			if releaseErr := icmeigoReleaseMailbox(client, key, email); releaseErr != nil {
+				cardErr = fmt.Sprintf("邮箱 %s 已入库，但释放并发槽失败（不影响收信，后续注册可正常使用）：%s", email, releaseErr.Error())
+				break
+			}
 		}
 		if cardErr != "" {
 			bad = append(bad, key+" => 已生成 "+fmt.Sprintf("%d", okForCard)+" 个邮箱后失败："+cardErr)

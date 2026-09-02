@@ -113,6 +113,32 @@ func icmeigoGenerate(client *http.Client, accessKey string) (string, error) {
 	return email, nil
 }
 
+// icmeigoReleaseMailbox frees the concurrency slot held by a generated mailbox.
+// ic.meigo.lol grants each redeem code a tiny concurrency budget (often 1);
+// generate() occupies one slot per mailbox and the API only frees it via
+// /api/hme/release-all. Releasing right after generation lets one card expand
+// to its full remaining quota in a single import instead of stopping after the
+// first mailbox. Releasing does not refund the quota, and the mailbox keeps
+// receiving mail, so the registration flow is unaffected.
+func icmeigoReleaseMailbox(client *http.Client, accessKey, email string) error {
+	status, payload, err := icmeigoBearerPOST(client, accessKey, "/api/hme/release-all", map[string]any{"email": email})
+	if err != nil {
+		return &outlookMailError{Code: "mailbox_network_error", Category: "network", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "iCloud 邮箱渠道网络连接失败", Detail: err.Error()}
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return &outlookMailError{Code: "mailbox_credential_invalid", Category: "credential", HTTPStatus: http.StatusUnprocessableEntity, UserMessage: "iCloud 邮箱查询 Key 无效，请检查 ic.meigo.lol 卡密", Detail: fmt.Sprintf("HTTP %d", status), Terminal: true}
+	}
+	if status < 200 || status >= 300 {
+		detail := firstText(payload["error"], payload["message"], fmt.Sprintf("HTTP %d", status))
+		return &outlookMailError{Code: "mailbox_provider_failed", Category: "service", HTTPStatus: http.StatusBadGateway, UserMessage: "iCloud 邮箱渠道释放邮箱失败", Detail: detail}
+	}
+	data, _ := payload["data"].(map[string]any)
+	if intValue(data["success"], 1) < 1 {
+		return &outlookMailError{Code: "mailbox_provider_failed", Category: "service", HTTPStatus: http.StatusBadGateway, UserMessage: "iCloud 邮箱渠道释放邮箱未成功", Detail: dumpJSON(data)}
+	}
+	return nil
+}
+
 func fetchIcMeiGoJSON(client *http.Client, accessKey, email string) (map[string]any, error) {
 	body, _ := json.Marshal(map[string]any{"email": email, "format": "text"})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(icmeigoAPIBaseURL, "/")+"/api/hme/mail", bytes.NewReader(body))
