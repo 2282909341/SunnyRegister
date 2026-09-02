@@ -9,7 +9,6 @@ from typing import Any
 from curl_cffi import requests as curl_requests
 
 from .browser_traffic import ProxyTrafficMeter, use_traffic_meter
-from .ca_bundle import ca_bundle_path
 
 try:
     from tools.pay153_checkout.paypal_routing import session_checkout_kind
@@ -91,7 +90,7 @@ def _request_with_retry(request: Any) -> Any:
 
 
 def _session(proxy_url: str) -> Any:
-    session = curl_requests.Session(impersonate="firefox144", verify=ca_bundle_path())
+    session = curl_requests.Session(impersonate="firefox144")
     try:
         session.trust_env = False
     except Exception:
@@ -101,13 +100,7 @@ def _session(proxy_url: str) -> Any:
     return session
 
 
-def _checkout_probe_options(
-    country: str,
-    currency: str,
-    *,
-    use_promo: bool = False,
-    promo_campaign: str = "",
-) -> dict[str, Any]:
+def _checkout_probe_options(country: str, currency: str, use_trial_promotion: bool = False) -> dict[str, Any]:
     indonesia_gopay_probe = country.upper() == "ID" and currency.upper() == "IDR"
     hosted_payment_probe = country.upper() in STRIPE_HOSTED_PAYMENT_COUNTRIES
     return {
@@ -118,12 +111,10 @@ def _checkout_probe_options(
         "checkout_currency": currency,
         "link_type": "gopay" if indonesia_gopay_probe else "paypal",
         "checkout_ui_mode": "redirect" if indonesia_gopay_probe or hosted_payment_probe else "custom",
-        "use_promo": use_promo,
-        "promo_campaign": promo_campaign if use_promo else "",
-        # VN probe uses link_type=paypal which sits in checkout_payload's
-        # excluded set, so promo only reaches the OAICS payload when created
-        # with it natively.
-        "promo_on_create": bool(use_promo),
+        "use_promo": bool(use_trial_promotion),
+        "promo_campaign": "plus-1-month-free" if use_trial_promotion else "",
+        "promo_on_create": bool(use_trial_promotion),
+        "promo_from_query_param": bool(use_trial_promotion),
     }
 
 
@@ -132,9 +123,7 @@ def _task_style_checkout_probe(
     country: str,
     currency: str,
     checkout_proxy_url: str,
-    *,
-    use_promo: bool = False,
-    promo_campaign: str = "",
+    use_trial_promotion: bool = False,
 ) -> dict[str, Any]:
     """Run the same Checkout creation path used by PayPal extraction tasks."""
     engine_dir = Path(__file__).resolve().parents[1] / "tools" / "pay153_checkout"
@@ -143,13 +132,10 @@ def _task_style_checkout_probe(
     from app import (
         checkout_payload,
         create_checkout,
-        custom_checkout_amount_minor,
-        custom_checkout_currency,
         fetch_custom_checkout_session_with_retry,
-        is_momo_promo_amount,
     )
 
-    options = _checkout_probe_options(country, currency, use_promo=use_promo, promo_campaign=promo_campaign)
+    options = _checkout_probe_options(country, currency, use_trial_promotion)
     payload = checkout_payload(options, {})
     device_id = str(uuid.uuid4())
     did = str(uuid.uuid4())
@@ -168,8 +154,6 @@ def _task_style_checkout_probe(
     session_id = str(data.get("checkout_session_id") or "")
     try:
         methods = _payment_methods(data)
-        amount: int | None = custom_checkout_amount_minor(data)
-        amount_currency = str(custom_checkout_currency(data) or "").upper()
         if session_id.startswith("oaics_"):
             processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
             custom_data = fetch_custom_checkout_session_with_retry(
@@ -182,12 +166,6 @@ def _task_style_checkout_probe(
                 delay_seconds=0.5,
             )
             methods = _merge_payment_methods(methods, _payment_methods(custom_data))
-            custom_amount = custom_checkout_amount_minor(custom_data)
-            custom_currency = str(custom_checkout_currency(custom_data) or "").upper()
-            if custom_amount is not None:
-                amount = custom_amount
-            if custom_currency:
-                amount_currency = custom_currency
         elif session_id.startswith(("cs_live_", "cs_test_")):
             import stripe_checkout as stripe
 
@@ -208,18 +186,9 @@ def _task_style_checkout_probe(
                 [str(item) for item in context.get("payment_method_types") or []],
                 [str(item) for item in context.get("elements_payment_method_types") or []],
             )
-            elements_amount = custom_checkout_amount_minor(elements_data)
-            elements_currency = str(custom_checkout_currency(elements_data) or "").upper()
-            if elements_amount is not None:
-                amount = elements_amount
-            if elements_currency:
-                amount_currency = elements_currency
         return {
             "kind": session_checkout_kind(session_id),
             "payment_methods": methods,
-            "amount": amount,
-            "currency": amount_currency,
-            "momo_discounted": is_momo_promo_amount(amount, amount_currency),
             "http": 200,
             "error": "",
         }
@@ -271,6 +240,7 @@ def probe_payment_methods(
     proxy_url: str = "",
     country: str = "US",
     currency: str = "USD",
+    use_trial_promotion: bool = False,
 ) -> dict[str, Any]:
     token = str(access_token or "").strip()
     if not token:
@@ -297,65 +267,7 @@ def probe_payment_methods(
                 billing_country,
                 billing_currency,
                 selected_proxy,
-            )
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {str(exc)[:240]}"
-        status = 401 if "HTTP 401" in message else 403 if "HTTP 403" in message else 0
-        result["checkout"]["http"] = status
-        result["checkout"]["error"] = message
-    result["traffic"] = meter.snapshot()
-    return result
-
-
-def probe_momo_promo(
-    access_token: str,
-    proxy_url: str = "",
-    country: str = "VN",
-    currency: str = "VND",
-) -> dict[str, Any]:
-    token = str(access_token or "").strip()
-    if not token:
-        return {
-            "checkout": {
-                "kind": "",
-                "payment_methods": [],
-                "amount": None,
-                "currency": "",
-                "momo_discounted": False,
-                "http": 0,
-                "error": "missing access token",
-            },
-            "traffic": {"requests": 0, "total_bytes": 0},
-        }
-    billing_country = str(country or "VN").strip().upper() or "VN"
-    billing_currency = str(currency or "VND").strip().upper() or "VND"
-    selected_proxy = str(proxy_url or "").strip()
-    meter = ProxyTrafficMeter(
-        proxy_url=selected_proxy,
-        tracked_proxy=bool(selected_proxy),
-        operation="momo_promo_probe",
-    )
-    result: dict[str, Any] = {
-        "checkout": {
-            "kind": "",
-            "payment_methods": [],
-            "amount": None,
-            "currency": "",
-            "momo_discounted": False,
-            "http": 0,
-            "error": "",
-        },
-        "traffic": {"requests": 0, "total_bytes": 0},
-    }
-    try:
-        with use_traffic_meter(meter):
-            result["checkout"] = _task_style_checkout_probe(
-                token,
-                billing_country,
-                billing_currency,
-                selected_proxy,
-                use_promo=True,
-                promo_campaign="plus-1-month-free",
+                use_trial_promotion,
             )
     except Exception as exc:
         message = f"{type(exc).__name__}: {str(exc)[:240]}"

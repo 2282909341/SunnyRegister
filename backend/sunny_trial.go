@@ -376,16 +376,27 @@ func probeSunnyCheckout(ctx context.Context, client *http.Client, accessToken st
 }
 
 func probeSunnyCheckoutForCountry(ctx context.Context, client *http.Client, accessToken, country, currency string) (string, []string, bool, error) {
+	return probeSunnyCheckoutForCountryWithPromotion(ctx, client, accessToken, country, currency, false)
+}
+
+func probeSunnyCheckoutForCountryWithPromotion(ctx context.Context, client *http.Client, accessToken, country, currency string, useTrialPromotion bool) (string, []string, bool, error) {
 	country = strings.ToUpper(strings.TrimSpace(country))
 	currency = strings.ToUpper(strings.TrimSpace(currency))
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"entry_point":      "all_plans_pricing_modal",
 		"plan_name":        "chatgptplusplan",
 		"billing_details":  map[string]string{"country": country, "currency": currency},
 		"cancel_url":       "https://chatgpt.com/",
 		"checkout_ui_mode": "custom",
 		"check_card_proxy": true,
-	})
+	}
+	if useTrialPromotion {
+		payload["promo_campaign"] = map[string]any{
+			"promo_campaign_id":          "plus-1-month-free",
+			"is_coupon_from_query_param": true,
+		}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return sunnyCheckoutUnknown, nil, false, err
 	}

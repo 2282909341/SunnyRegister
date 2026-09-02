@@ -5092,14 +5092,13 @@ func (s *Server) sunnySessions(w http.ResponseWriter, r *http.Request, parts []s
 		trialFilter := normalizeSunnyTrialFilter(q.Get("trial_eligibility"))
 		checkoutFilter := normalizeSunnyCheckoutFilter(q.Get("checkout_kind"))
 		paymentMethodFilter := normalizeSunnyPaymentMethodFilter(q.Get("payment_methods"))
-		momoPromoFilter := normalizeSunnyMomoPromoStatus(q.Get("momo_promo_status"))
 		paymentProbeFilter := normalizeSunnyPaymentProbeFilter(q.Get("payment_probe_status"))
 		loginSecretFilter := normalizeSunnyLoginSecretFilter(q.Get("login_secret"))
 		rebindEmailFilter := normalizeSunnyRebindEmailFilter(q.Get("rebind_email"))
 		trialCountryFilter := normalizeSunnyTrialCountryFilter(q.Get("trial_countries"))
 		groupFilter := uint(intValue(q.Get("group_id"), 0))
 		sortBy := strings.ToLower(strings.TrimSpace(q.Get("sort_by")))
-		if statusFilter == "" && planFilter == "" && trialFilter == "" && checkoutFilter == "" && len(paymentMethodFilter) == 0 && momoPromoFilter == "" && paymentProbeFilter == "" && loginSecretFilter == "" && rebindEmailFilter == "" && len(trialCountryFilter) == 0 && sortBy != "rebind_email" {
+		if statusFilter == "" && planFilter == "" && trialFilter == "" && checkoutFilter == "" && len(paymentMethodFilter) == 0 && paymentProbeFilter == "" && loginSecretFilter == "" && rebindEmailFilter == "" && len(trialCountryFilter) == 0 && sortBy != "rebind_email" {
 			query := s.db.Model(&SunnySession{})
 			query = sunnyUniqueSessionIdentityScope(query)
 			if kw != "" {
@@ -5174,9 +5173,6 @@ func (s *Server) sunnySessions(w http.ResponseWriter, r *http.Request, parts []s
 				continue
 			}
 			if !sunnyHasAllPaymentMethods(item["payment_methods"], paymentMethodFilter) {
-				continue
-			}
-			if momoPromoFilter != "" && normalizeSunnyMomoPromoStatus(text(item["momo_promo_status"])) != momoPromoFilter {
 				continue
 			}
 			if paymentProbeFilter == "unknown" && strings.TrimSpace(text(item["payment_probed_at"])) != "" {

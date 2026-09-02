@@ -17,15 +17,6 @@ from pydantic import BaseModel
 
 os.environ.setdefault("PYTHONUTF8", "1")
 
-# 顶层加载 CA bundle 修复：把 certifi 镜像到 ASCII 路径并导出
-# SSL_CERT_FILE / CURL_CA_BUNDLE 环境变量，使进程内所有 curl_cffi
-# Session（含上游合并的 pay153_checkout 引擎自带 Session）都使用
-# 可被 Windows libcurl 正确打开的 CA 文件，避免 curl 77。
-try:
-    import sunny_core.ca_bundle  # noqa: F401
-except Exception:  # pragma: no cover - 启动容错
-    traceback.print_exc()
-
 def _secret_value(env_key: str, file_key: str) -> str:
     file_name = os.getenv(file_key, "").strip()
     if file_name:
@@ -156,13 +147,7 @@ class ProbePaymentMethodsRequest(BaseModel):
     proxy_url: str = ""
     country: str = "US"
     currency: str = "USD"
-
-
-class ProbeMomoPromoRequest(BaseModel):
-    access_token: str
-    proxy_url: str = ""
-    country: str = "VN"
-    currency: str = "VND"
+    use_trial_promotion: bool = False
 
 
 class CheckoutRequest(BaseModel):
@@ -187,7 +172,6 @@ class CheckoutRequest(BaseModel):
     ideal_bank: str = ""
     pix_tax_id: str = ""
     pix_auto_kind: str = "cpf"
-    force_momo: bool = False
 
 
 @app.get("/health")
@@ -301,15 +285,7 @@ def probe_payment_methods(req: ProbePaymentMethodsRequest, authorization: str | 
     _check_token(authorization)
     from sunny_core.commerce_probe import probe_payment_methods as run_probe
 
-    return run_probe(req.access_token, req.proxy_url, req.country, req.currency)
-
-
-@app.post("/probe-momo-promo")
-def probe_momo_promo(req: ProbeMomoPromoRequest, authorization: str | None = Header(default=None)) -> dict:
-    _check_token(authorization)
-    from sunny_core.commerce_probe import probe_momo_promo as run_probe
-
-    return run_probe(req.access_token, req.proxy_url, req.country, req.currency)
+    return run_probe(req.access_token, req.proxy_url, req.country, req.currency, req.use_trial_promotion)
 
 
 @app.post("/checkout/jobs")
