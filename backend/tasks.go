@@ -428,14 +428,15 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, rest string
 				cancelMessage = "用户已停止 SunnyRegister 注册任务"
 				requestMessage = "用户已请求停止 SunnyRegister 注册任务，正在关闭任务进程、浏览器与邮箱读取资源"
 			}
-			if task.Status == TaskPending {
-				task.Status = TaskCancelled
-				task.Error = cancelMessage
-				task.FinishedAt = sql.NullTime{Time: time.Now(), Valid: true}
-			} else {
-				task.Status = TaskCancelRequested
+			transitioned, err := s.transitionTaskCancellation(&task, cancelMessage)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "任务取消状态写入失败")
+				return
 			}
-			s.db.Save(&task)
+			if !transitioned && terminalTaskStatuses[task.Status] {
+				writeJSON(w, 200, serializeTask(task))
+				return
+			}
 			s.appendTaskEvent(task.ID, requestMessage, "log", "warning", map[string]any{"cancelled": true})
 			if strings.HasPrefix(task.Type, "sunny_") && !sunnyGoTaskType(task.Type) {
 				if task.Status == TaskCancelled {
@@ -460,6 +461,47 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, rest string
 		}
 	}
 	writeError(w, 404, "not found")
+}
+
+// transitionTaskCancellation updates only an expected active state. The task
+// passed by the handler may already be stale by the time the cancellation is
+// written, so a full Save could overwrite a worker's terminal result.
+func (s *Server) transitionTaskCancellation(task *Task, cancelMessage string) (bool, error) {
+	if task == nil || strings.TrimSpace(task.ID) == "" {
+		return false, fmt.Errorf("task is required")
+	}
+	now := time.Now()
+	pending := s.db.Model(&Task{}).
+		Where("id = ? AND status = ?", task.ID, TaskPending).
+		Updates(map[string]any{
+			"status":      TaskCancelled,
+			"error":       cancelMessage,
+			"finished_at": now,
+			"updated_at":  now,
+		})
+	if pending.Error != nil {
+		return false, pending.Error
+	}
+	transitioned := pending.RowsAffected == 1
+	if transitioned && task.Type == sunnyCheckoutTaskType {
+		s.releaseCheckoutCredential(text(jsonMap(task.PayloadJSON)["credential_id"]))
+	}
+	if !transitioned {
+		active := s.db.Model(&Task{}).
+			Where("id = ? AND status IN ?", task.ID, []string{TaskClaimed, TaskRunning}).
+			Updates(map[string]any{
+				"status":     TaskCancelRequested,
+				"updated_at": now,
+			})
+		if active.Error != nil {
+			return false, active.Error
+		}
+		transitioned = active.RowsAffected == 1
+	}
+	if err := s.db.First(task, "id = ?", task.ID).Error; err != nil {
+		return transitioned, err
+	}
+	return transitioned, nil
 }
 
 func (s *Server) createSimpleTask(w http.ResponseWriter, r *http.Request, typ, platform string) {
@@ -763,14 +805,38 @@ func (s *Server) dispatchPending() {
 		if s.running[task.ID] {
 			continue
 		}
-		task.Status = TaskClaimed
-		s.db.Save(&task)
+		if !s.claimPendingTask(&task) {
+			continue
+		}
 		s.running[task.ID] = true
 		go func(id string) {
 			defer func() { s.runtimeMu.Lock(); delete(s.running, id); s.runtimeMu.Unlock(); s.wakeRuntime() }()
 			s.executeTask(id)
 		}(task.ID)
 	}
+}
+
+// claimPendingTask performs the pending -> claimed transition conditionally.
+// A cancellation request may race with dispatchPending after its pending
+// query has returned; saving the stale task object would otherwise resurrect
+// a cancelled task and start its executor.
+func (s *Server) claimPendingTask(task *Task) bool {
+	if task == nil || strings.TrimSpace(task.ID) == "" {
+		return false
+	}
+	now := time.Now()
+	updated := s.db.Model(&Task{}).
+		Where("id = ? AND status = ?", task.ID, TaskPending).
+		Updates(map[string]any{
+			"status":     TaskClaimed,
+			"updated_at": now,
+		})
+	if updated.Error != nil || updated.RowsAffected != 1 {
+		return false
+	}
+	task.Status = TaskClaimed
+	task.UpdatedAt = now
+	return true
 }
 
 func (s *Server) executeTask(taskID string) {

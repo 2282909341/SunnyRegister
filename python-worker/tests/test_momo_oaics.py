@@ -70,12 +70,31 @@ def test_momo_authorization_url_accepts_expected_stripe_handoff() -> None:
     assert checkout_app.momo_authorization_url({"next_action": {"url": url}}) == url
 
 
+def test_momo_authorization_url_accepts_har_observed_payment_action_nonce() -> None:
+    url = (
+        "https://pm-redirects.stripe.com/authorize/"
+        "acct_1HOrSwC6h1nxGoI3/pa_nonce_VB99UramZf155SBdCjUYH0N18NB1KSw"
+    )
+    confirm_payload = {
+        "status": "success",
+        "setup_intent": {
+            "next_action": {"redirect_to_url": {"url": url}},
+        },
+    }
+
+    assert checkout_app.is_valid_momo_authorization_url(url)
+    assert checkout_app.momo_authorization_url(confirm_payload) == url
+
+
 def test_momo_authorization_url_rejects_checkout_and_other_provider_urls() -> None:
     assert not checkout_app.is_valid_momo_authorization_url(
         "https://chatgpt.com/checkout/openai_ie/oaics_example"
     )
     assert not checkout_app.is_valid_momo_authorization_url(
         "https://pm-redirects.stripe.com/authorize/acct_test/not_a_nonce"
+    )
+    assert not checkout_app.is_valid_momo_authorization_url(
+        "https://pm-redirects.stripe.com/authorize/acct_test/xa_nonce_unexpected"
     )
 
 
@@ -120,7 +139,7 @@ def test_momo_attempts_request_custom_oaics_and_keep_cs_live_fallback() -> None:
     ]
 
 
-def test_momo_rebuilds_ten_new_oaics_inside_one_account_attempt() -> None:
+def test_momo_rebuilds_up_to_configured_oaics_budget_inside_one_account_attempt() -> None:
     store = object.__new__(checkout_app.JobStore)
     state = {"status": "running", "error": "", "result": None}
     attempts: list[dict] = []
@@ -154,10 +173,10 @@ def test_momo_rebuilds_ten_new_oaics_inside_one_account_attempt() -> None:
 
     assert len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS
     assert len({id(options) for options in attempts}) == len(attempts)
-    assert [options["promo_on_create"] for options in attempts] == [True, False] * 5
+    assert [options["promo_on_create"] for options in attempts] == [True, False, True]
     assert [options["local_method_strategy"] for options in attempts] == [
-        "standalone", "late_promo",
-    ] * 5
+        "standalone", "late_promo", "standalone",
+    ]
     assert state["status"] == "done"
     assert state["result"]["attempt"] == 1
 
@@ -201,10 +220,11 @@ def test_momo_exhausts_inner_budget_before_rotating_outer_proxy() -> None:
         })
 
     assert len(attempts) == checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS + 1
-    assert len({attempt[:2] for attempt in attempts[:10]}) == 1
-    assert attempts[10][:2] != attempts[0][:2]
+    inner_budget = checkout_app.MOMO_CHECKOUT_REBUILD_ATTEMPTS
+    assert len({attempt[:2] for attempt in attempts[:inner_budget]}) == 1
+    assert attempts[inner_budget][:2] != attempts[0][:2]
     assert attempts[0][2:] == (True, "standalone")
-    assert attempts[10][2:] == (False, "late_promo")
+    assert attempts[inner_budget][2:] == (False, "late_promo")
     assert state["status"] == "done"
     assert state["result"]["attempt"] == 2
 

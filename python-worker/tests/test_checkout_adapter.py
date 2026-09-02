@@ -137,6 +137,21 @@ class CheckoutAdapterTests(unittest.TestCase):
         self.assertEqual(options["entry_proxy_country"], "VN")
         self.assertEqual(options["exit_proxy_country"], "VN")
 
+    def test_start_checkout_no_promo_reuses_checkout_pool_for_promotion(self) -> None:
+        with patch.object(sunny_adapter.STORE, "create", create=True, return_value="job-momo-no-promo") as create:
+            sunny_adapter.start_checkout({
+                "token": "token",
+                "link_type": "momo",
+                "use_promo": False,
+                "checkout_proxies": ["vn-checkout-proxy"],
+                "promotion_proxies": [],
+            })
+
+        options = create.call_args.args[0]
+        self.assertEqual(options["entry_proxies"], ["vn-checkout-proxy"])
+        self.assertEqual(options["exit_proxies"], ["vn-checkout-proxy"])
+        self.assertFalse(options["use_promo"])
+
     def test_start_checkout_defaults_blik_to_poland_and_honors_proxy_countries(self) -> None:
         with patch.object(sunny_adapter.STORE, "create", create=True, return_value="job-blik") as create:
             sunny_adapter.start_checkout({

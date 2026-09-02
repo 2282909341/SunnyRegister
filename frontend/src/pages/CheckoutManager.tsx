@@ -817,11 +817,17 @@ export default function CheckoutManager() {
     }
   }
   async function precheck() {
-    const effectivePromotionProxies = linkType === "gcash" ? checkoutProxies : promotionProxies;
-    if (!splitLines(checkoutProxies).length || !splitLines(effectivePromotionProxies).length || !selected.length) { setNotice(linkType === "gcash" ? "请先填写 PH Checkout 代理池并勾选账户" : "请先填写两个代理池并勾选账户"); return; }
+    const promoRequested = plan === "plus" && usePromo;
+    const promotionRequired = promoRequested && linkType !== "gcash";
+    const effectivePromotionProxies = linkType === "gcash" || !promoRequested ? checkoutProxies : promotionProxies;
+    if (!splitLines(checkoutProxies).length || (promotionRequired && !splitLines(effectivePromotionProxies).length) || !selected.length) {
+      setNotice(linkType === "gcash" ? "请先填写 PH Checkout 代理池并勾选账户" : promotionRequired ? "请先填写两个代理池并勾选账户" : "请先填写 Checkout 代理池并勾选账户");
+      return;
+    }
+    if (!promoRequested) { setNotice("当前未开启 Plus 优惠，无需进行试用资格检测"); return; }
     setPrecheckBusy(true);
     try {
-      const data = await apiFetch("/sunny/checkout/precheck", { method: "POST", body: JSON.stringify({ system_at: systemAT, session_ids: systemAT ? selected : [], external_ats: systemAT ? [] : selectedExternalRows.map((x) => x.token), checkout_proxies: checkoutProxies, promotion_proxies: effectivePromotionProxies }) });
+      const data = await apiFetch("/sunny/checkout/precheck", { method: "POST", body: JSON.stringify({ system_at: systemAT, session_ids: systemAT ? selected : [], external_ats: systemAT ? [] : selectedExternalRows.map((x) => x.token), checkout_proxies: checkoutProxies, promotion_proxies: effectivePromotionProxies, use_promo: promoRequested, country, currency }) });
       const byEmail = new Map((data.items || []).map((item: AnyRow) => [item.email, item]));
       const apply = (old: AnyRow[]) => old.map((row) => {
         const found = byEmail.get(row.email) as AnyRow | undefined;
@@ -852,8 +858,13 @@ export default function CheckoutManager() {
     } catch (error: any) { setNotice(error.message || String(error)); } finally { setCancelBusy(false); }
   }
   async function start() {
-    const effectivePromotionProxies = linkType === "gcash" ? checkoutProxies : promotionProxies;
-    if (!splitLines(checkoutProxies).length || !splitLines(effectivePromotionProxies).length) { setNotice(linkType === "gcash" ? "GCash 必须填写 PH Checkout 代理池" : "Checkout 代理池和 Promotion 代理池都必须填写"); return; }
+    const promoRequested = plan === "plus" && usePromo;
+    const promotionRequired = promoRequested && linkType !== "gcash";
+    const effectivePromotionProxies = linkType === "gcash" || !promoRequested ? checkoutProxies : promotionProxies;
+    if (!splitLines(checkoutProxies).length || (promotionRequired && !splitLines(effectivePromotionProxies).length)) {
+      setNotice(linkType === "gcash" ? "GCash 必须填写 PH Checkout 代理池" : promotionRequired ? "Checkout 代理池和 Promotion 代理池都必须填写" : "请先填写 Checkout 代理池");
+      return;
+    }
     if (!selected.length) { setNotice("请先勾选需要提链的账户"); return; }
     setCheckoutBusy(true); setTask(null); setTaskLogs([]); setCheckoutSuccesses([]); setSuccessListExpanded(false); setDetailKey(""); setLogOpen(true);
     setCheckoutLive((old) => {
@@ -863,7 +874,7 @@ export default function CheckoutManager() {
       return Object.fromEntries(Object.entries(old).filter(([key]) => !currentBatchKeys.has(key)));
     });
     try {
-      const response = await apiFetch("/sunny/checkout", { method: "POST", body: JSON.stringify({ system_at: systemAT, session_ids: systemAT ? selected : [], external_ats: systemAT ? [] : selectedExternalRows.map((x) => x.token), checkout_kinds: systemAT ? [] : selectedExternalRows.map((x) => normalized(x.checkout_kind) || "unknown"), checkout_proxies: checkoutProxies, promotion_proxies: effectivePromotionProxies, plan, link_type: linkType, country, currency, retry_count: retryCount, concurrency, use_promo: usePromo, promo_campaign: promoCampaign, promo_country: linkType === "gcash" ? "PH" : promoCountry, promo_code: promoCode, force_momo: forceMomo, ideal_bank: idealBank, workspace_name: workspaceName, workspace_id: workspaceId, seat_quantity: seatQuantity, price_interval: priceInterval, credit_quantity: creditQuantity, pix_tax_id: pixTaxID, pix_auto_kind: pixAutoKind }) });
+      const response = await apiFetch("/sunny/checkout", { method: "POST", body: JSON.stringify({ system_at: systemAT, session_ids: systemAT ? selected : [], external_ats: systemAT ? [] : selectedExternalRows.map((x) => x.token), checkout_kinds: systemAT ? [] : selectedExternalRows.map((x) => normalized(x.checkout_kind) || "unknown"), checkout_proxies: checkoutProxies, promotion_proxies: effectivePromotionProxies, plan, link_type: linkType, country, currency, retry_count: retryCount, concurrency, use_promo: promoRequested, promo_campaign: promoRequested ? promoCampaign : "", promo_country: linkType === "gcash" ? "PH" : promoCountry, promo_code: promoCode, force_momo: forceMomo, ideal_bank: idealBank, workspace_name: workspaceName, workspace_id: workspaceId, seat_quantity: seatQuantity, price_interval: priceInterval, credit_quantity: creditQuantity, pix_tax_id: pixTaxID, pix_auto_kind: pixAutoKind }) });
       const taskID = String(response.id || response.task_id);
       setTask(response);
       setActiveTaskID(taskID);

@@ -91,7 +91,7 @@ DYNAMIC_PROXY_API_MIN_INTERVAL = max(
     0.1, float(os.getenv("PAY153_DYNAMIC_PROXY_MIN_INTERVAL") or 0.35)
 )
 GOPAY_BLOCKED_REBUILD_ATTEMPTS = 10
-MOMO_CHECKOUT_REBUILD_ATTEMPTS = 10
+MOMO_CHECKOUT_REBUILD_ATTEMPTS = 3
 GOPAY_CHECKOUT_CREATION_LIMIT = 100
 GOPAY_CHECKOUT_CREATION_DEADLINE_SECONDS = 600.0
 
@@ -3145,7 +3145,7 @@ def require_gopay_midtrans_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 _MOMO_AUTHORIZE_PATH_RE = re.compile(
-    r"^/authorize/acct_[A-Za-z0-9]+/sa_nonce_[A-Za-z0-9]+/?$",
+    r"^/authorize/acct_[A-Za-z0-9]+/(?:pa|sa)_nonce_[A-Za-z0-9]+/?$",
     re.IGNORECASE,
 )
 
@@ -4653,8 +4653,8 @@ class JobStore:
                 if momo_rebuild and momo_chain_attempt >= MOMO_CHECKOUT_REBUILD_ATTEMPTS:
                     self.log(
                         job_id,
-                        "MoMo 本轮顺序创建的 10 个 OAICS 均未形成兼容优惠链路；"
-                        "本次账户完整任务尝试结束",
+                        f"MoMo 本轮顺序创建的 {MOMO_CHECKOUT_REBUILD_ATTEMPTS} 个 OAICS "
+                        "均未形成兼容优惠链路；本次账户完整任务尝试结束",
                     )
                     break
                 if gopay_blocked:
@@ -4665,10 +4665,14 @@ class JobStore:
                     next_text = f"正在重建 GoPay CS Live {gopay_chain_attempt + 1}/10"
                 else:
                     rebuild_text = (
-                        f"MoMo 本轮 OAICS {momo_chain_attempt}/10 未兼容；"
-                        f"丢弃当前 Session 并重建完整链路 {momo_chain_attempt + 1}/10"
+                        f"MoMo 本轮 OAICS {momo_chain_attempt}/"
+                        f"{MOMO_CHECKOUT_REBUILD_ATTEMPTS} 未兼容；丢弃当前 Session 并重建完整链路 "
+                        f"{momo_chain_attempt + 1}/{MOMO_CHECKOUT_REBUILD_ATTEMPTS}"
                     )
-                    next_text = f"正在重建 MoMo OAICS {momo_chain_attempt + 1}/10"
+                    next_text = (
+                        f"正在重建 MoMo OAICS {momo_chain_attempt + 1}/"
+                        f"{MOMO_CHECKOUT_REBUILD_ATTEMPTS}"
+                    )
                 self.log(job_id, rebuild_text)
                 self.update(
                     job_id,
@@ -5305,10 +5309,6 @@ class JobStore:
                 self.ensure_not_cancelled(job_id)
 
             promo_requested = options["plan"] == "plus" and options.get("use_promo", False)
-            if provider == "ideal" and (options["plan"] != "plus" or not promo_requested):
-                raise RuntimeError("IDEAL_ZERO_DUE_REQUIRED: iDEAL 提链仅允许已开启并验证通过的 Plus 0 元试用")
-            if provider == "gcash" and not promo_requested:
-                raise RuntimeError("GCASH_ZERO_DUE_REQUIRED: GCash 提链仅允许已开启优惠的 Plus 0 元试用")
             if provider == "gcash":
                 gcash_checkout_proxy = exit_proxy if options.get("named_proxy_pools") else entry_proxy
                 checkout_country_hint = options.get("exit_proxy_country") if options.get("named_proxy_pools") else options.get("entry_proxy_country")
@@ -5746,7 +5746,11 @@ class JobStore:
                 "proxy_mode": ("named_checkout_promotion" if options.get("named_proxy_pools") else ("us_checkout_promo_update" if provider == "gcash" else ("single_chain" if provider in {"pix", "momo"} else ("entry_only" if provider == "hosted" else "dual_chain")))),
                 "promo_requested": promo_requested,
                 "promo_applied": None,
-                "promo_campaign_used": options.get("promo_campaign") or "plus-1-month-free",
+                "promo_campaign_used": (
+                    options.get("promo_campaign") or "plus-1-month-free"
+                    if promo_requested
+                    else ""
+                ),
                 "entry_trial_eligible": preflight.get("one_click_trial_eligible"),
                 "checkout_trial_eligible": checkout_data.get("one_click_trial_eligible"),
                 "entry_one_click_marker": preflight.get("one_click_trial_eligible"),
@@ -7193,7 +7197,9 @@ class JobStore:
                     provider_amount_zero = provider_amount is not None and float(provider_amount) == 0
                 except (TypeError, ValueError):
                     provider_amount_zero = False
-                if provider_result.get("promo_applied") is not True or not provider_amount_zero:
+                if promo_requested and (
+                    provider_result.get("promo_applied") is not True or not provider_amount_zero
+                ):
                     raise RuntimeError(
                         "IDEAL_ZERO_DUE_VERIFICATION_FAILED: iDEAL 结果未通过金额为 0 且优惠已应用的校验"
                     )
@@ -7300,8 +7306,8 @@ class JobStore:
         watcher = None
         callback_token = None
         try:
-            if str(options.get("plan") or "plus").lower() != "plus" or not options.get("use_promo", True):
-                raise RuntimeError("KAKAO_ZERO_DUE_REQUIRED: Kakao Pay 提链仅支持已开启优惠的 Plus 0 元试用")
+            if str(options.get("plan") or "plus").lower() != "plus":
+                raise RuntimeError("Kakao Pay 提链仅支持 Plus 计划")
             raw_token = str(options.get("token_raw") or "")
             token, meta = extract_access_token(raw_token)
             entry_pool = list(options.get("entry_proxies") or [])
@@ -7374,12 +7380,27 @@ class JobStore:
             watcher.start()
             callback_token = kakao.set_log_callback(lambda message: self.log(job_id, message))
             self.update(job_id, status="running", percent=12, text="执行 Kakao/Nicepay 专用提链流程", error="")
+            promo_requested = str(options.get("plan") or "plus").lower() == "plus" and bool(options.get("use_promo"))
+            if promo_requested:
+                self.update(job_id, percent=9, text="通过 Promotion 代理读取 Kakao 试用资格")
+                preflight = preflight_trial_eligibility(
+                    token,
+                    meta.get("account_id") or "",
+                    promotion_proxy,
+                    str(uuid.uuid4()),
+                    str(uuid.uuid4()),
+                    lambda message: self.log(job_id, message),
+                )
+                detected_campaign = promo_campaign_from_payload(preflight)
+                if detected_campaign:
+                    self.log(job_id, f"Kakao 优惠预检已匹配账号活动：{detected_campaign}")
             extracted = kakao.kakao_link(
                 token,
                 checkout_proxy,
                 promotion_proxy,
                 provider_proxy,
                 stop_event=stop_event,
+                apply_promo=promo_requested,
             )
             final_url = str(extracted.get("provider_redirect_url") or "")
             host = urlsplit(final_url).netloc.lower()
@@ -7404,8 +7425,8 @@ class JobStore:
                 "proxy_mode": f"{checkout_country.lower()}_checkout_{promotion_country.lower()}_promotion_{provider_country.lower()}_provider",
                 "entry_proxy_pool_size": len(entry_pool),
                 "exit_proxy_pool_size": len(exit_pool),
-                "promo_requested": bool(options.get("use_promo")),
-                "promo_applied": True,
+                "promo_requested": promo_requested,
+                "promo_applied": True if promo_requested else None,
                 "extractor": "pidan_kakao_nicepay",
             }
             self.update(job_id, status="done", percent=100, text="Kakao/Nicepay 提取完成", error="", result=result)

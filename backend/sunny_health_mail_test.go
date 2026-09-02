@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestFetchOutlookMailSubjectsUsesGraphSubjectOnly(t *testing.T) {
+func TestFetchOutlookMailSubjectsUsesGraphSubjectAndPreview(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/token":
@@ -19,11 +19,11 @@ func TestFetchOutlookMailSubjectsUsesGraphSubjectOnly(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "Bearer graph-token" {
 				t.Fatalf("unexpected authorization header: %s", got)
 			}
-			if got := r.URL.Query().Get("$select"); got != "subject" {
-				t.Fatalf("health query must request subject only, got %q", got)
+			if got := r.URL.Query().Get("$select"); got != "subject,bodyPreview" {
+				t.Fatalf("health query must request subject and body preview, got %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"value":[{"subject":"Welcome"},{"subject":"Access deactivated [C-ABC123]"}]}`)
+			fmt.Fprint(w, `{"value":[{"subject":"Welcome","bodyPreview":"Weekly update"},{"subject":"Account notice [C-ABC123]","bodyPreview":"Access deactivated"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -46,7 +46,7 @@ func TestFetchOutlookMailSubjectsUsesGraphSubjectOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Graph subject query failed: %v", err)
 	}
-	if got := strings.Join(subjects, "|"); got != "Welcome|Access deactivated [C-ABC123]" {
+	if got := strings.Join(subjects, "|"); got != "Welcome\nWeekly update|Account notice [C-ABC123]\nAccess deactivated" {
 		t.Fatalf("unexpected subjects: %s", got)
 	}
 }

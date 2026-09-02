@@ -37,7 +37,9 @@ def start_checkout(payload: dict[str, Any]) -> str:
     retry_count = 3 if raw_retry_count is None or str(raw_retry_count).strip() == "" else int(raw_retry_count)
     checkout_proxies = list(payload.get("checkout_proxies") or [])
     promotion_proxies = list(payload.get("promotion_proxies") or [])
-    if link_type == "gcash":
+    # Keep legacy callers (which omit use_promo) on their explicitly supplied
+    # dual pools; only an explicit false toggle means Promotion is not used.
+    if link_type == "gcash" or payload.get("use_promo") is False:
         promotion_proxies = list(checkout_proxies)
     default_country, default_currency = {
         "gcash": ("PH", "PHP"),

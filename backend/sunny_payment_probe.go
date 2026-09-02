@@ -171,6 +171,15 @@ func normalizeSunnyMomoPromoStatus(value string) string {
 	}
 }
 
+func normalizeSunnyPaymentProbeFilter(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "unknown", "unchecked", "not_checked", "未检测":
+		return "unknown"
+	default:
+		return ""
+	}
+}
+
 func normalizeSunnyLoginSecretFilter(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "present", "has", "1", "true", "有", "有ls":

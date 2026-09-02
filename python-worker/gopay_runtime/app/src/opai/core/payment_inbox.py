@@ -885,6 +885,11 @@ class InboxStore:
         if not token:
             return None
         renewed_at = _now_iso()
+        if renewed_at == token:
+            renewed_at = (
+                datetime.fromisoformat(renewed_at.replace("Z", "+00:00"))
+                + timedelta(microseconds=1)
+            ).isoformat()
         row = self._conn().execute(
             """
             UPDATE jobs SET claimed_at=?

@@ -117,6 +117,14 @@ func fetchXbovoLatestMail(email, accessKey string, limit int, proxyURL string) (
 }
 
 func fetchXbovoMailSubjects(email, accessKey string, limit int, proxyURL string) ([]string, error) {
+	return fetchXbovoMailSummaries(email, accessKey, limit, proxyURL, false)
+}
+
+func fetchXbovoHealthMailEvidence(email, accessKey string, limit int, proxyURL string) ([]string, error) {
+	return fetchXbovoMailSummaries(email, accessKey, limit, proxyURL, true)
+}
+
+func fetchXbovoMailSummaries(email, accessKey string, limit int, proxyURL string, includePreview bool) ([]string, error) {
 	email = strings.TrimSpace(email)
 	accessKey = strings.TrimSpace(accessKey)
 	if email == "" || !strings.Contains(email, "@") || accessKey == "" {
@@ -136,8 +144,13 @@ func fetchXbovoMailSubjects(email, accessKey string, limit int, proxyURL string)
 	subjects := make([]string, 0, len(rawItems))
 	for _, raw := range rawItems {
 		item, _ := raw.(map[string]any)
-		if subject := strings.TrimSpace(text(item["subject"])); subject != "" {
-			subjects = append(subjects, subject)
+		subject := strings.TrimSpace(text(item["subject"]))
+		body := ""
+		if includePreview {
+			body = strings.TrimSpace(firstText(item["text"], item["body"], item["body_preview"], item["preview"]))
+		}
+		if evidence := strings.TrimSpace(subject + "\n" + body); evidence != "" {
+			subjects = append(subjects, evidence)
 		}
 	}
 	return subjects, nil
