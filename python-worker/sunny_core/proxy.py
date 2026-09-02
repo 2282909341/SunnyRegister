@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import dataclasses
 import base64
+import dataclasses
+import hashlib
 import ipaddress
+import os
 import socket
 import ssl
 import time
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlunsplit
 
 import requests
 
@@ -116,6 +118,47 @@ def redact_proxy_url(proxy_url: str) -> str:
     if parsed.port:
         netloc += f":{parsed.port}"
     return f"{parsed.scheme}://{unquote(parsed.username)}:***@{netloc}"
+
+
+def proxy_sticky_enabled() -> bool:
+    """Whether per-account session-suffix pinning is enabled (default on)."""
+    value = str(os.environ.get("SUNNY_PROXY_STICKY", "1")).strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def sticky_proxy_url(proxy_url: str, key: str) -> str:
+    """Pin one rotating-residential exit per account by session suffix.
+
+    Rotating residential egress (the whole pool shares a handful of credential
+    strings) hands the account a *different* exit IP on every new connection,
+    which reads as scripted traffic and lets OpenAI cluster the pool. Providers
+    in the rrp/bestgo family honor a ``-session-<id>`` suffix in the username:
+    the provider then keeps one sticky exit for that session id, so the same
+    account key keeps a stable exit IP while different accounts stay spread.
+
+    The suffix is derived from sha256(key)[:8] (never the raw email), is
+    idempotent, and is skipped for proxies without a username or when
+    SUNNY_PROXY_STICKY=0. Callers that already carry a session suffix are left
+    untouched.
+    """
+    proxy_url = normalize_proxy_url(proxy_url)
+    key = str(key or "").strip()
+    if not proxy_url or not key or not proxy_sticky_enabled():
+        return proxy_url
+    parsed = urlparse(proxy_url)
+    username = unquote(parsed.username or "")
+    if not username or "-session-" in username:
+        return proxy_url
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    new_username = f"{username}-session-{digest}"
+    password = unquote(parsed.password or "")
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{quote(new_username, safe='')}:{quote(password, safe='')}@{host}"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def proxy_target_tls_check(proxy_url: str, target_host: str = "chatgpt.com", target_port: int = 443, timeout: float = 10) -> dict[str, Any]:

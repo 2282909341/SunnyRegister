@@ -45,9 +45,10 @@ def generate_datadog_trace_headers() -> dict[str, str]:
 
 
 class SentinelTokenGenerator:
-    def __init__(self, device_id: str, user_agent: str):
+    def __init__(self, device_id: str, user_agent: str, *, persona: Any | None = None):
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent
+        self.persona = persona
         self.sid = str(uuid.uuid4())
 
     @staticmethod
@@ -70,8 +71,12 @@ class SentinelTokenGenerator:
 
     def _config(self) -> list[Any]:
         perf_now = 1000 + random.random() * 49000
+        persona = self.persona
+        screen = str(getattr(persona, "screen", "") or "1920x1080")
+        locale = str(getattr(persona, "locale", "") or "ja-JP")
+        languages = str(getattr(persona, "sentinel_languages", "") or "ja-JP,ja")
         return [
-            "1920x1080",
+            screen,
             time.strftime("%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
             4294705152,
             random.random(),
@@ -79,8 +84,8 @@ class SentinelTokenGenerator:
             SENTINEL_SDK_URL,
             None,
             None,
-            "ja-JP",
-            "ja-JP,ja",
+            locale,
+            languages,
             random.random(),
             "webkitTemporaryStorage√undefined",
             "location",
@@ -124,9 +129,11 @@ class SentinelBrowserRuntime:
         proxy_url: str = "",
         log: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        persona: Any | None = None,
     ) -> None:
         self.log = log or (lambda _message: None)
         self.should_cancel = should_cancel or (lambda: False)
+        self.persona = persona
         self._manager: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -140,9 +147,10 @@ class SentinelBrowserRuntime:
             ) from exc
 
         self._check_cancelled()
+        locale = str(getattr(persona, "locale", "") or "ja-JP")
         launch_options: dict[str, Any] = {
             "headless": "virtual" if os.getenv("SUNNY_CONTAINERIZED", "").lower() in {"1", "true", "yes"} else True,
-            "locale": "ja-JP",
+            "locale": locale,
             "block_webrtc": True,
         }
         proxy = playwright_proxy(proxy_url)
@@ -156,7 +164,7 @@ class SentinelBrowserRuntime:
                 # Camoufox's patched Firefox protocol does not accept Playwright's
                 # isMobile viewport field. Disabling the default viewport prevents
                 # Browser.setDefaultViewport from emitting that incompatible field.
-                self._context = self._browser.new_context(no_viewport=True, locale="ja-JP")
+                self._context = self._browser.new_context(no_viewport=True, locale=locale)
                 self._owns_context = True
             else:
                 self._context = self._browser
@@ -363,10 +371,12 @@ class SentinelNodeRuntime:
         proxy_url: str = "",
         log: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        persona: Any | None = None,
     ) -> None:
         del session, proxy_url
         self.log = log or (lambda _message: None)
         self.should_cancel = should_cancel or (lambda: False)
+        self.persona = persona
         self._node = os.environ.get("SUNNY_NODE_BINARY") or os.environ.get("NODE_BINARY") or shutil.which("node")
         if not self._node:
             raise RuntimeError("Sentinel Node V8 runtime requires Node.js, but no node executable was found")
@@ -435,11 +445,20 @@ class SentinelNodeRuntime:
                 pass
 
     def requirements_token(self) -> str:
-        result = self._run({"action": "requirements", "userAgent": SENTINEL_USER_AGENT})
+        result = self._run({"action": "requirements", "userAgent": self._persona_user_agent()})
         token = str(result.get("request_p") or "").strip()
         if not token:
             raise RuntimeError("Sentinel Node SDK returned an empty requirements token")
         return token
+
+    def _persona_user_agent(self) -> str:
+        return str(getattr(self.persona, "user_agent", "") or "") or SENTINEL_USER_AGENT
+
+    def _persona_locale(self) -> str:
+        return str(getattr(self.persona, "locale", "") or "") or "ja-JP"
+
+    def _persona_languages(self) -> str:
+        return str(getattr(self.persona, "sentinel_languages", "") or "") or "ja-JP,ja"
 
     def build_headers(
         self,
@@ -453,20 +472,21 @@ class SentinelNodeRuntime:
         del enforcement
         challenge = dict(challenge_payload)
         challenge["_python_proof"] = cached_proof
+        persona = self.persona
         result = self._v8_request(
             {
                 "challenge": challenge,
                 "flow": flow,
                 "device_id": device_id,
-                "user_agent": SENTINEL_USER_AGENT,
+                "user_agent": self._persona_user_agent(),
                 "page_url": "https://auth.openai.com/about-you",
                 "script_src": SENTINEL_SDK_URL,
                 "sdk": self._sdk_path if os.path.isfile(self._sdk_path) else None,
-                "width": 1920,
-                "height": 1080,
-                "cores": 8,
-                "language": "ja-JP",
-                "languages": "ja-JP,ja,en",
+                "width": int(getattr(persona, "screen_width", 0) or 0) or 1920,
+                "height": int(getattr(persona, "screen_height", 0) or 0) or 1080,
+                "cores": int(getattr(persona, "hardware_concurrency", 0) or 0) or 8,
+                "language": self._persona_locale(),
+                "languages": self._persona_languages() + ",en",
                 "no_cookie": True,
             }
         )

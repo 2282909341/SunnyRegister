@@ -6092,6 +6092,7 @@ func (s *Server) sunnyTaskProxySnapshot(payload map[string]any) map[string]any {
 		Order("updated_at desc, id asc").Find(&proxies)
 	proxyPool := make([]string, 0, len(proxies))
 	proxyIDs := make([]uint, 0, len(proxies))
+	proxyCountries := make([]string, 0, len(proxies))
 	for _, p := range proxies {
 		address := normalizeSunnyProxyAddress(p.Address)
 		if address == "" {
@@ -6099,11 +6100,13 @@ func (s *Server) sunnyTaskProxySnapshot(payload map[string]any) map[string]any {
 		}
 		proxyPool = append(proxyPool, address)
 		proxyIDs = append(proxyIDs, p.ID)
+		proxyCountries = append(proxyCountries, strings.ToUpper(strings.TrimSpace(p.Country)))
 	}
 	if len(proxyPool) > 0 {
 		registerProxy = proxyPool[0]
 		next["proxy_pool"] = proxyPool
 		next["proxy_ids"] = proxyIDs
+		next["proxy_countries"] = proxyCountries
 		next["proxy_pool_size"] = len(proxyPool)
 	}
 	next["local_proxy"] = localProxy

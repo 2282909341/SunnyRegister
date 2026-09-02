@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import unquote, urlencode, urlsplit
 
+from .account_persona import AccountPersona, pick_persona
 from .auth_challenges import generate_totp
 from .browser_traffic import ProxyTrafficMeter, _response_body_bytes, suspend_http_traffic_hook
 from .ca_bundle import ca_bundle_path
@@ -246,10 +247,12 @@ class ProtocolRegistrationFlow:
         post_registration_callback: Callable[[Any, dict[str, Any]], dict[str, Any] | None] | None = None,
         keep_session: bool = False,
         skip_mailbox: bool = False,
+        persona: AccountPersona | None = None,
     ):
         self.account = account
         self.proxy_url = normalize_proxy_url(proxy_url)
         self.mailbox_proxy_url = self.proxy_url if mailbox_proxy_url is None else normalize_proxy_url(mailbox_proxy_url)
+        self.persona = persona or pick_persona(str(getattr(account, "email", "") or ""))
         self.log = log or (lambda _message: None)
         self.existing_account = existing_account
         self.should_cancel = should_cancel or (lambda: False)
@@ -308,16 +311,16 @@ class ProtocolRegistrationFlow:
 
         proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
         session = curl_requests.Session(
-            impersonate=pick_impersonate(str(getattr(self.account, "email", "") or self.proxy_url)),
+            impersonate=self.persona.impersonate or pick_impersonate(str(getattr(self.account, "email", "") or self.proxy_url)),
             proxies=proxies,
             timeout=30,
             verify=ca_bundle_path(),
         )
         # The impersonate target supplies its own authentic User-Agent/DNT etc.;
-        # only the locale hints are pinned per-region here.
+        # the locale hints follow the account persona (proxy-country aligned).
         session.headers.update(
             {
-                "accept-language": "ja-JP,ja;q=0.9,en;q=0.7",
+                "accept-language": self.persona.accept_language,
                 "accept-encoding": "gzip, deflate, br",
             }
         )
@@ -467,7 +470,7 @@ class ProtocolRegistrationFlow:
 
     def _sentinel_headers_once(self, flow: str) -> dict[str, str]:
         self._check_cancelled()
-        generator = SentinelTokenGenerator(self.device_id, USER_AGENT)
+        generator = SentinelTokenGenerator(self.device_id, self.persona.user_agent, persona=self.persona)
         requirements_proof = generator.requirements_token()
         runtime: SentinelBrowserRuntime | Any | None = None
         if self.challenge_strategy == "sentinel_protocol":
@@ -479,6 +482,7 @@ class ProtocolRegistrationFlow:
                             proxy_url=self.proxy_url,
                             log=self.log,
                             should_cancel=self.should_cancel,
+                            persona=self.persona,
                         )
                     except Exception as node_exc:
                         self.log(f"[认证] Sentinel Node V8 运行时不可用，回退 Camoufox：{node_exc}")
@@ -487,6 +491,7 @@ class ProtocolRegistrationFlow:
                             proxy_url=self.proxy_url,
                             log=self.log,
                             should_cancel=self.should_cancel,
+                            persona=self.persona,
                         )
                 runtime = self._sentinel_runtime
                 sdk_requirements = getattr(runtime, "requirements_token", None)
@@ -506,6 +511,7 @@ class ProtocolRegistrationFlow:
                             proxy_url=self.proxy_url,
                             log=self.log,
                             should_cancel=self.should_cancel,
+                            persona=self.persona,
                         )
                         self._sentinel_runtime = runtime
                         requirements_proof = str(runtime.requirements_token() or "").strip()
@@ -1373,6 +1379,7 @@ def login_or_register_protocol(
     mailbox_proxy_url: str | None = None,
     traffic_meter: ProxyTrafficMeter | None = None,
     post_registration_callback: Callable[[Any, dict[str, Any]], dict[str, Any] | None] | None = None,
+    persona: AccountPersona | None = None,
 ) -> dict[str, Any]:
     flow_kwargs = {
         "existing_account": existing_account,
@@ -1382,6 +1389,7 @@ def login_or_register_protocol(
         "mailbox_proxy_url": mailbox_proxy_url,
         "traffic_meter": traffic_meter,
         "post_registration_callback": post_registration_callback,
+        "persona": persona,
     }
     try:
         return ProtocolRegistrationFlow(account, proxy_url, log, **flow_kwargs).run()

@@ -58,10 +58,11 @@ func (s *Server) createSunnyRebindTask(body map[string]any) (Task, error) {
 
 // sunnyApplyCountriesToProxyPool pins the task's proxy pool to the requested
 // countries when body["countries"] is present and non-empty. countryPoolFor
-// returns the flattened pool, proxy ids and the normalized country list for the
-// selected countries. The worker rotates through payload["proxy_pool"], so
-// filtering it here makes the task only use proxies of the chosen countries.
-func (s *Server) sunnyApplyCountriesToProxyPool(body map[string]any, countryPoolFor func([]string) ([]string, []uint, []string, error)) (map[string]any, error) {
+// returns the flattened pool, proxy ids, per-proxy countries (index-aligned
+// with the pool) and the normalized country list for the selected countries.
+// The worker rotates through payload["proxy_pool"], so filtering it here makes
+// the task only use proxies of the chosen countries.
+func (s *Server) sunnyApplyCountriesToProxyPool(body map[string]any, countryPoolFor func([]string) ([]string, []uint, []string, []string, error)) (map[string]any, error) {
 	rawCountries, exists := body["countries"]
 	if !exists {
 		return body, nil
@@ -70,13 +71,14 @@ func (s *Server) sunnyApplyCountriesToProxyPool(body map[string]any, countryPool
 	if len(requested) == 0 {
 		return body, nil
 	}
-	pool, ids, countries, err := countryPoolFor(requested)
+	pool, ids, countries, proxyCountries, err := countryPoolFor(requested)
 	if err != nil {
 		return body, err
 	}
 	if len(pool) > 0 {
 		body["proxy_pool"] = pool
 		body["proxy_ids"] = ids
+		body["proxy_countries"] = proxyCountries
 		body["proxy_pool_size"] = len(pool)
 		body["register_proxy"] = pool[0]
 		body["proxy"] = pool[0]
@@ -126,27 +128,29 @@ func sunnyRebindProxyCountryList(groups map[string][]SunnyProxy) []string {
 
 // sunnyPurposeProxyPoolForCountries validates the requested countries against
 // the proxy pool of the given purpose and returns the flattened proxy
-// addresses, proxy ids and the normalized country list to pin a task to.
-func (s *Server) sunnyPurposeProxyPoolForCountries(requested []string, purpose string, purposeLabel string) ([]string, []uint, []string, error) {
+// addresses, proxy ids, per-proxy countries (index-aligned with pool) and the
+// normalized country list to pin a task to.
+func (s *Server) sunnyPurposeProxyPoolForCountries(requested []string, purpose string, purposeLabel string) ([]string, []uint, []string, []string, error) {
 	groups, err := s.sunnyPurposeProxyGroups(purpose, purposeLabel)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	seen := map[string]bool{}
 	selected := make([]string, 0, len(requested))
 	pool := make([]string, 0)
 	ids := make([]uint, 0)
+	countries := make([]string, 0)
 	for _, value := range requested {
 		country, err := normalizeSunnyProxyCountry(value)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if seen[country] {
 			continue
 		}
 		proxies := groups[country]
 		if len(proxies) == 0 {
-			return nil, nil, nil, fmt.Errorf("国家 %s 没有已启用的%s代理", country, purposeLabel)
+			return nil, nil, nil, nil, fmt.Errorf("国家 %s 没有已启用的%s代理", country, purposeLabel)
 		}
 		seen[country] = true
 		selected = append(selected, country)
@@ -155,19 +159,21 @@ func (s *Server) sunnyPurposeProxyPoolForCountries(requested []string, purpose s
 			if address != "" {
 				pool = append(pool, address)
 				ids = append(ids, proxy.ID)
+				countries = append(countries, country)
 			}
 		}
 	}
 	if len(selected) == 0 {
-		return nil, nil, nil, fmt.Errorf("请至少选择一个%s国家", purposeLabel)
+		return nil, nil, nil, nil, fmt.Errorf("请至少选择一个%s国家", purposeLabel)
 	}
-	return pool, ids, selected, nil
+	return pool, ids, selected, countries, nil
 }
 
 // sunnyRebindProxyPoolForCountries validates the requested countries against
 // the register-purpose proxy pool and returns the flattened proxy addresses,
-// proxy ids and the normalized country list to pin this rebind task to.
-func (s *Server) sunnyRebindProxyPoolForCountries(requested []string) ([]string, []uint, []string, error) {
+// proxy ids, per-proxy countries and the normalized country list to pin this
+// rebind task to.
+func (s *Server) sunnyRebindProxyPoolForCountries(requested []string) ([]string, []uint, []string, []string, error) {
 	return s.sunnyPurposeProxyPoolForCountries(requested, sunnyProxyPurposeRegister, "换绑")
 }
 
@@ -189,7 +195,8 @@ func sunnyRegisterProxyCountryList(groups map[string][]SunnyProxy) []string {
 
 // sunnyRegisterProxyPoolForCountries validates the requested countries against
 // the register-purpose proxy pool and returns the flattened proxy addresses,
-// proxy ids and the normalized country list to pin this register task to.
-func (s *Server) sunnyRegisterProxyPoolForCountries(requested []string) ([]string, []uint, []string, error) {
+// proxy ids, per-proxy countries and the normalized country list to pin this
+// register task to.
+func (s *Server) sunnyRegisterProxyPoolForCountries(requested []string) ([]string, []uint, []string, []string, error) {
 	return s.sunnyPurposeProxyPoolForCountries(requested, sunnyProxyPurposeRegister, "注册")
 }

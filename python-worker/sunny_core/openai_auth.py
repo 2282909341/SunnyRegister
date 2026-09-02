@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlencode, unquote, urljoin, urlparse
 
 import requests
 
+from .account_persona import country_locale
 from .auth_challenges import generate_totp
 from .browser_backend import open_registration_browser
 from .browser_traffic import BrowserTrafficConfig, BrowserTrafficOptimizer, ProxyTrafficMeter
@@ -38,7 +39,12 @@ FIRST_NAMES = ["Ethan", "Noah", "Liam", "Mason", "Lucas", "Logan", "Owen", "Ryan
 LAST_NAMES = ["Smith", "Brown", "Taylor", "Walker", "Wilson", "Clark", "Hall", "Young", "Allen", "King", "Scott", "Green", "Baker", "Adams", "Turner"]
 REGISTER_DEVICE_PROFILES = [
     {"locale": "ja-JP", "languages": ["ja-JP", "ja"], "timezone": "Asia/Tokyo"},
+    {"locale": "vi-VN", "languages": ["vi-VN", "vi"], "timezone": "Asia/Ho_Chi_Minh"},
+    {"locale": "en-US", "languages": ["en-US", "en"], "timezone": "America/New_York"},
+    {"locale": "en-SG", "languages": ["en-SG", "en"], "timezone": "Asia/Singapore"},
+    {"locale": "ko-KR", "languages": ["ko-KR", "ko"], "timezone": "Asia/Seoul"},
 ]
+_REGISTER_PROFILE_BY_LOCALE = {profile["locale"]: profile for profile in REGISTER_DEVICE_PROFILES}
 PROFILE_SUBMISSION_TIMEOUT_SECONDS = 300
 PROFILE_TRANSITION_TIMEOUT_MS = 5000
 EMAIL_OTP_INITIAL_WAIT_SECONDS = 120
@@ -235,8 +241,14 @@ class DeviceFingerprint:
         return ",".join([self.languages[0], *[f"{x};q={max(0.1, 1 - i * 0.1):.1f}" for i, x in enumerate(self.languages[1:], start=1)]])
 
 
-def generate_register_fingerprint() -> DeviceFingerprint:
-    profile = random.choice(REGISTER_DEVICE_PROFILES)
+def generate_register_fingerprint(country: str = "") -> DeviceFingerprint:
+    """Random register fingerprint; the locale bundle follows the proxy country.
+
+    An empty or unknown country keeps the historical ja-JP profile that every
+    protocol registration has used so far.
+    """
+    locale, _language, _timezone = country_locale(country)
+    profile = _REGISTER_PROFILE_BY_LOCALE.get(locale) or random.choice(REGISTER_DEVICE_PROFILES)
     viewport = random.choice([(1280, 720, 1280, 720, 1), (1365, 768, 1366, 768, 1), (1440, 900, 1440, 900, 1), (1536, 864, 1536, 864, 1.25), (1600, 900, 1600, 900, 1)])
     major = random.randint(134, 146)
     build = random.randint(6000, 9999)
@@ -258,13 +270,38 @@ def generate_register_fingerprint() -> DeviceFingerprint:
     )
 
 
+def device_fingerprint_from_persona(persona: Any) -> DeviceFingerprint:
+    """Deterministic browser fingerprint aligned with an account persona.
+
+    The Camoufox fallback path must present the SAME user agent / locale /
+    timezone / screen the protocol requests and Sentinel proofs used, otherwise
+    the browser takeover looks like a different device mid-session.
+    """
+    return DeviceFingerprint(
+        user_agent=str(getattr(persona, "user_agent", "") or DEFAULT_USER_AGENT),
+        locale=str(getattr(persona, "locale", "") or "ja-JP"),
+        languages=[str(item) for item in (getattr(persona, "languages", ()) or ("ja-JP", "ja"))],
+        timezone=str(getattr(persona, "timezone", "") or "Asia/Tokyo"),
+        viewport_width=int(getattr(persona, "screen_width", 0) or 1280),
+        viewport_height=int(getattr(persona, "screen_height", 0) or 720),
+        screen_width=int(getattr(persona, "screen_width", 0) or 1280),
+        screen_height=int(getattr(persona, "screen_height", 0) or 720),
+        outer_width=int(getattr(persona, "screen_width", 0) or 1280) + 12,
+        outer_height=int(getattr(persona, "screen_height", 0) or 720) + 84,
+        device_scale_factor=1.0,
+        hardware_concurrency=int(getattr(persona, "hardware_concurrency", 0) or 8),
+        device_memory=int(getattr(persona, "device_memory", 0) or 8),
+        platform=str(getattr(persona, "platform", "") or "Win32"),
+    )
+
+
 def _emit(log: Callable[[str], None] | None, message: str) -> None:
     if log:
         log(message)
 
 
-def openai_browser_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
-    headers = {
+def openai_browser_headers(extra: dict[str, str] | None = None, *, persona: Any | None = None) -> dict[str, str]:
+    headers: dict[str, str] = {
         "user-agent": DEFAULT_USER_AGENT,
         "accept-language": "ja-JP,ja;q=0.9",
         "sec-ch-ua": '\"Google Chrome\";v=\"146\", \"Chromium\";v=\"146\", \"Not.A/Brand\";v=\"24\"',
@@ -273,6 +310,29 @@ def openai_browser_headers(extra: dict[str, str] | None = None) -> dict[str, str
         "sec-ch-ua-platform": '\"Windows\"',
         "sec-ch-ua-platform-version": '\"15.0.0\"',
     }
+    if persona is not None:
+        headers.update(
+            {
+                "user-agent": str(getattr(persona, "user_agent", "") or DEFAULT_USER_AGENT),
+                "accept-language": str(getattr(persona, "accept_language", "") or "ja-JP,ja;q=0.9"),
+                "sec-ch-ua": str(getattr(persona, "sec_ch_ua", "") or ""),
+                "sec-ch-ua-full-version-list": str(getattr(persona, "sec_ch_ua_full_version_list", "") or ""),
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": str(getattr(persona, "sec_ch_ua_platform", "") or '\"Windows\"'),
+                "sec-ch-ua-platform-version": str(getattr(persona, "sec_ch_ua_platform_version", "") or '\"15.0.0\"'),
+            }
+        )
+        # Firefox and Safari never emit Chromium client hints; sending them
+        # with a Firefox UA is an instant fingerprint contradiction.
+        if not getattr(persona, "is_chromium_family", True):
+            for key in (
+                "sec-ch-ua",
+                "sec-ch-ua-full-version-list",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "sec-ch-ua-platform-version",
+            ):
+                headers.pop(key, None)
     if extra:
         headers.update(extra)
     return headers
@@ -508,7 +568,7 @@ def _should_retry_phone_send_without_channel(result: dict[str, Any]) -> bool:
 class OpenAIEmailRegisterFlow:
     """SunnyRegister in-project email register/login flow, following the original register-or-login implementation."""
 
-    def __init__(self, account: MailAccount, proxy_url: str, headless: bool, log: Callable[[str], None] | None, phone_provider=None, existing_account: bool = False, require_refresh_token: bool = True, should_cancel: Callable[[], bool] | None = None, execution_mode: str = "", on_progress: Callable[[str, dict[str, Any]], None] | None = None, mailbox_proxy_url: str | None = None, existing_session: dict[str, Any] | None = None, traffic_meter: ProxyTrafficMeter | None = None, traffic_config: BrowserTrafficConfig | dict[str, Any] | None = None, post_registration_callback: Callable[[Any, Any, dict[str, Any]], dict[str, Any] | None] | None = None, prefer_login_secret: bool = True):
+    def __init__(self, account: MailAccount, proxy_url: str, headless: bool, log: Callable[[str], None] | None, phone_provider=None, existing_account: bool = False, require_refresh_token: bool = True, should_cancel: Callable[[], bool] | None = None, execution_mode: str = "", on_progress: Callable[[str, dict[str, Any]], None] | None = None, mailbox_proxy_url: str | None = None, existing_session: dict[str, Any] | None = None, traffic_meter: ProxyTrafficMeter | None = None, traffic_config: BrowserTrafficConfig | dict[str, Any] | None = None, post_registration_callback: Callable[[Any, Any, dict[str, Any]], dict[str, Any] | None] | None = None, prefer_login_secret: bool = True, persona: Any | None = None):
         self.account = account
         self.proxy_url = proxy_url
         self.mailbox_proxy_url = proxy_url if mailbox_proxy_url is None else mailbox_proxy_url
@@ -520,7 +580,8 @@ class OpenAIEmailRegisterFlow:
         self.phone_provider = phone_provider
         self.otp_reader: Any | None = None
         self.existing_account = existing_account
-        self.fingerprint = generate_register_fingerprint()
+        self.persona = persona
+        self.fingerprint = device_fingerprint_from_persona(persona) if persona is not None else generate_register_fingerprint()
         self.auth_action = "login" if existing_account else "unknown"
         self.require_refresh_token = require_refresh_token
         self.phone_verification_completed = False
@@ -3485,7 +3546,7 @@ class OpenAIEmailRegisterFlow:
             return str(page.url)
 
 
-def login_or_register(account: MailAccount, proxy_url: str = "", headless: bool = True, log: Callable[[str], None] | None = None, phone_provider=None, existing_account: bool = False, require_refresh_token: bool = True, should_cancel: Callable[[], bool] | None = None, execution_mode: str = "", on_progress: Callable[[str, dict[str, Any]], None] | None = None, mailbox_proxy_url: str | None = None, existing_session: dict[str, Any] | None = None, traffic_meter: ProxyTrafficMeter | None = None, traffic_config: BrowserTrafficConfig | dict[str, Any] | None = None, post_registration_callback: Callable[[Any, Any, dict[str, Any]], dict[str, Any] | None] | None = None) -> dict[str, Any]:
+def login_or_register(account: MailAccount, proxy_url: str = "", headless: bool = True, log: Callable[[str], None] | None = None, phone_provider=None, existing_account: bool = False, require_refresh_token: bool = True, should_cancel: Callable[[], bool] | None = None, execution_mode: str = "", on_progress: Callable[[str, dict[str, Any]], None] | None = None, mailbox_proxy_url: str | None = None, existing_session: dict[str, Any] | None = None, traffic_meter: ProxyTrafficMeter | None = None, traffic_config: BrowserTrafficConfig | dict[str, Any] | None = None, post_registration_callback: Callable[[Any, Any, dict[str, Any]], dict[str, Any] | None] | None = None, persona: Any | None = None) -> dict[str, Any]:
     if should_cancel and should_cancel():
         raise TaskCancelledError("Task cancelled by user")
     if account.openai_rt and require_refresh_token:
@@ -3517,6 +3578,7 @@ def login_or_register(account: MailAccount, proxy_url: str = "", headless: bool 
         "traffic_meter": traffic_meter,
         "traffic_config": traffic_config,
         "post_registration_callback": post_registration_callback,
+        "persona": persona,
     }
     try:
         return OpenAIEmailRegisterFlow(
