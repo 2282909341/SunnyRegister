@@ -168,6 +168,15 @@ class OpenAIHeaderPersonaTests(unittest.TestCase):
 
 
 class StickyProxyUrlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Sticky pinning is opt-in (SUNNY_PROXY_STICKY default off); enable it
+        # explicitly for these positive cases.
+        self._sticky_patch = patch.dict(os.environ, {"SUNNY_PROXY_STICKY": "1"})
+        self._sticky_patch.start()
+
+    def tearDown(self) -> None:
+        self._sticky_patch.stop()
+
     def test_appends_session_suffix_for_account_key(self) -> None:
         sticky = sticky_proxy_url(PROXY_WITH_USER, "acct@example.com")
         self.assertNotEqual(sticky, PROXY_WITH_USER)

@@ -121,8 +121,14 @@ def redact_proxy_url(proxy_url: str) -> str:
 
 
 def proxy_sticky_enabled() -> bool:
-    """Whether per-account session-suffix pinning is enabled (default on)."""
-    value = str(os.environ.get("SUNNY_PROXY_STICKY", "1")).strip().lower()
+    """Whether per-account session-suffix pinning is enabled (opt-in, default off).
+
+    Rotating residential exits can pin a bad/overloaded IP and then fail the
+    register request with ``CONNECT tunnel failed, response 502``. Pinning is
+    therefore opt-in: set SUNNY_PROXY_STICKY=1 only when the proxy pool is known
+    healthy enough to keep one exit per account.
+    """
+    value = str(os.environ.get("SUNNY_PROXY_STICKY", "0")).strip().lower()
     return value not in {"0", "false", "off", "no"}
 
 
@@ -137,9 +143,9 @@ def sticky_proxy_url(proxy_url: str, key: str) -> str:
     account key keeps a stable exit IP while different accounts stay spread.
 
     The suffix is derived from sha256(key)[:8] (never the raw email), is
-    idempotent, and is skipped for proxies without a username or when
-    SUNNY_PROXY_STICKY=0. Callers that already carry a session suffix are left
-    untouched.
+    idempotent, and is skipped for proxies without a username or unless
+    SUNNY_PROXY_STICKY=1 (off by default). Callers that already carry a session
+    suffix are left untouched.
     """
     proxy_url = normalize_proxy_url(proxy_url)
     key = str(key or "").strip()
