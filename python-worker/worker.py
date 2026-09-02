@@ -17,6 +17,13 @@ from pydantic import BaseModel
 
 os.environ.setdefault("PYTHONUTF8", "1")
 
+# 必须在任何支付运行时创建 curl_cffi 会话之前导入：ca_bundle 在导入时把
+# ASCII 路径的 CA 证书导出为 CURL_CA_BUNDLE/SSL_CERT_FILE。项目目录名含中文
+# 时，libcurl（ANSI 代码页）打不开 certifi 默认证书，全部 HTTPS 请求报
+# CURLE_SSL_CACERT_BADFILE（curl 77）。pay153/gopay/paypal 各引擎的
+# build_http 均不带 verify，依赖这里导出的环境变量兜底。
+import sunny_core.ca_bundle as _ca_bundle  # noqa: F401  副作用导入
+
 def _secret_value(env_key: str, file_key: str) -> str:
     file_name = os.getenv(file_key, "").strip()
     if file_name:

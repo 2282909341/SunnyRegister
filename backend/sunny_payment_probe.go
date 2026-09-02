@@ -17,6 +17,12 @@ import (
 
 const sunnyPaymentProbeTaskType = "sunny_account_payment_probe"
 
+// 每个账户在每个国家建立 Checkout 会话的代理尝试上限。逐个遍历全部支付代理
+// 会让同一账号短时间内被反复建单数十次，直接触发 OpenAI 账号级
+// checkout_creation_rate_limited 冷却（429）；成功探测一次 HTTP 200 即返回，
+// 少量代理即可覆盖偶发故障，探测期间全程无反馈的问题也随之消失。
+const sunnyPaymentProbeMaxAttempts = 3
+
 type sunnyPaymentPromotionContextKey struct{}
 
 type sunnyPaymentProbeCandidate struct {
@@ -388,21 +394,28 @@ func shuffledSunnyProxies(proxies []SunnyProxy) []SunnyProxy {
 }
 
 func (s *Server) probeSunnyPaymentCountry(candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy) sunnyPaymentCountryProbe {
-	return s.probeSunnyPaymentCountryContext(context.Background(), candidate, country, proxies)
+	return s.probeSunnyPaymentCountryContext(context.Background(), candidate, country, proxies, nil)
 }
 
-func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy) sunnyPaymentCountryProbe {
+func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, country string, proxies []SunnyProxy, onAttempt func(current, total int)) sunnyPaymentCountryProbe {
 	result := sunnyPaymentCountryProbe{Country: country}
 	currency := checkoutCountryCurrency[country]
 	if currency == "" {
 		currency = "USD"
 	}
-	for _, proxy := range shuffledSunnyProxies(proxies) {
+	selected := shuffledSunnyProxies(proxies)
+	if limit := sunnyPaymentProbeMaxAttempts; len(selected) > limit {
+		selected = selected[:limit]
+	}
+	for _, proxy := range selected {
 		if ctx.Err() != nil {
 			result.Error = "任务已取消"
 			return result
 		}
 		result.Attempts++
+		if onAttempt != nil {
+			onAttempt(result.Attempts, len(selected))
+		}
 		probeCtx, cancel := context.WithTimeout(ctx, 105*time.Second)
 		meter := &sunnyTrafficMeter{}
 		probeCtx = withSunnyTrafficMeter(probeCtx, meter)
@@ -417,16 +430,21 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 			result.Methods = normalizeSunnyPaymentMethods(probed.Methods)
 			return result
 		}
+		// 明确的客户端错误（资格不符、参数被拒等）换代理也不会有不同结果，
+		// 立即返回；403 风控、408 超时、429 限流仍允许换代理重试。
+		if probed.HTTP >= 400 && probed.HTTP < 500 && probed.HTTP != http.StatusForbidden && probed.HTTP != http.StatusRequestTimeout && probed.HTTP != http.StatusTooManyRequests {
+			return result
+		}
 	}
 	result.Error = fallback(result.Error, "该国家没有可用的支付探测代理")
 	return result
 }
 
 func (s *Server) probeSunnyPaymentAccount(candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy) sunnyPaymentAccountProbe {
-	return s.probeSunnyPaymentAccountContext(context.Background(), candidate, groups)
+	return s.probeSunnyPaymentAccountContext(context.Background(), candidate, groups, nil)
 }
 
-func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy) sunnyPaymentAccountProbe {
+func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate sunnyPaymentProbeCandidate, groups map[string][]SunnyProxy, onAttempt func(country string, current, total int)) sunnyPaymentAccountProbe {
 	result := sunnyPaymentAccountProbe{Candidate: candidate, Countries: map[string]any{}}
 	if candidate.SkipReason != "" || candidate.Error != "" {
 		return result
@@ -437,7 +455,11 @@ func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate 
 	}
 	sort.Strings(countries)
 	probes := streamSunnyWorkerPoolContext(ctx, countries, s.sunnyPaymentCountryConcurrency(), func(country string) sunnyPaymentCountryProbe {
-		return s.probeSunnyPaymentCountryContext(ctx, candidate, country, groups[country])
+		return s.probeSunnyPaymentCountryContext(ctx, candidate, country, groups[country], func(current, total int) {
+			if onAttempt != nil {
+				onAttempt(country, current, total)
+			}
+		})
 	})
 	allMethods := []string{}
 	for probe := range probes {
@@ -545,7 +567,13 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 	items := make([]any, 0, len(candidates))
 	probeCtx := context.WithValue(ctx, sunnyPaymentPromotionContextKey{}, useTrialPromotion)
 	outcomes := streamSunnyWorkerPoolContext(probeCtx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
-		return s.probeSunnyPaymentAccountContext(probeCtx, candidate, groups)
+		return s.probeSunnyPaymentAccountContext(probeCtx, candidate, groups, func(country string, current, total int) {
+			// 每次代理尝试都实时上报，探测期间前端轮询任务事件即可看到
+			// 1/3、2/3、3/3 的进度，而不是直到账号级结果才出现反馈。
+			s.appendAccountTaskEvent(task.ID, candidate.Email, "payment", "payment_probe.attempt",
+				fmt.Sprintf("[%s] [支付探测] %s 正在尝试代理 %d/%d", candidate.Email, country, current, total), "info",
+				map[string]any{"session_id": candidate.SessionID, "country": country, "current": current, "total": total})
+		})
 	})
 	for outcome := range outcomes {
 		if ctx.Err() != nil {

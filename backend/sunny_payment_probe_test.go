@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -264,6 +265,103 @@ func TestSunnyPaymentProbeTriesNextProxyAfterFailure(t *testing.T) {
 	)
 	if result.Error != "" || result.Attempts != 2 || strings.Join(result.Methods, ",") != "momo" {
 		t.Fatalf("fallback result=%#v calls=%d", result, calls)
+	}
+}
+
+func TestSunnyPaymentProbeLimitsProxyAttempts(t *testing.T) {
+	previousProbe := sunnyProbePaymentMethods
+	calls := 0
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		calls++
+		return sunnyPaymentProbeResponse{Error: "proxy connection failed"}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+	proxies := make([]SunnyProxy, 0, 100)
+	for index := 1; index <= 100; index++ {
+		proxies = append(proxies, SunnyProxy{ID: uint(index), Address: fmt.Sprintf("http://proxy-%d.example:8080", index)})
+	}
+	result := (&Server{}).probeSunnyPaymentCountry(
+		sunnyPaymentProbeCandidate{AccessToken: "token"},
+		"VN",
+		proxies,
+	)
+	if calls != sunnyPaymentProbeMaxAttempts {
+		t.Fatalf("probe calls=%d, want %d", calls, sunnyPaymentProbeMaxAttempts)
+	}
+	if result.Attempts != sunnyPaymentProbeMaxAttempts || result.Error == "" {
+		t.Fatalf("limited result=%#v", result)
+	}
+}
+
+func TestSunnyPaymentProbeDoesNotRetryDefinitiveClientError(t *testing.T) {
+	previousProbe := sunnyProbePaymentMethods
+	calls := 0
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		calls++
+		return sunnyPaymentProbeResponse{HTTP: http.StatusBadRequest, Error: "HTTP 400: checkout rejected"}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+	result := (&Server{}).probeSunnyPaymentCountry(
+		sunnyPaymentProbeCandidate{AccessToken: "token"},
+		"VN",
+		[]SunnyProxy{{ID: 1, Address: "http://first"}, {ID: 2, Address: "http://second"}, {ID: 3, Address: "http://third"}},
+	)
+	if calls != 1 || result.Attempts != 1 {
+		t.Fatalf("definitive client error should stop after the first attempt: calls=%d result=%#v", calls, result)
+	}
+}
+
+func TestSunnyPaymentProbeEmitsAttemptProgress(t *testing.T) {
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Create(&SunnyProxy{Address: "http://jp.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbePaymentMethods
+	attempts := 0
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		attempts++
+		if attempts < 3 {
+			return sunnyPaymentProbeResponse{Error: "proxy connection failed"}
+		}
+		return sunnyPaymentProbeResponse{Methods: []string{"card"}, HTTP: http.StatusOK}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	if err := s.db.Create(&[]SunnyProxy{
+		{Address: "http://jp-1.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true},
+		{Address: "http://jp-2.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true},
+		{Address: "http://jp-3.example:8080", Country: "JP", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []string{"JP"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+	if task.Status != TaskSucceeded {
+		t.Fatalf("task status=%q error=%q", task.Status, task.Error)
+	}
+	var events []TaskEvent
+	if err := s.db.Where("task_id = ? AND action = ?", task.ID, "payment_probe.attempt").Order("id asc").Find(&events).Error; err != nil {
+		t.Fatalf("load attempt events: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("attempt events=%d, want 3", len(events))
+	}
+	for index, event := range events {
+		detail := jsonMap(event.DetailJSON)
+		if intValue(detail["current"], 0) != index+1 || intValue(detail["total"], 0) != 3 {
+			t.Fatalf("attempt event #%d detail=%s", index+1, event.DetailJSON)
+		}
+		if !strings.Contains(event.Message, fmt.Sprintf("%d/%d", index+1, 3)) {
+			t.Fatalf("attempt event #%d message=%q", index+1, event.Message)
+		}
 	}
 }
 

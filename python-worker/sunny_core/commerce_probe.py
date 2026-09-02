@@ -9,6 +9,7 @@ from typing import Any
 from curl_cffi import requests as curl_requests
 
 from .browser_traffic import ProxyTrafficMeter, use_traffic_meter
+from .ca_bundle import ca_bundle_path
 
 try:
     from tools.pay153_checkout.paypal_routing import session_checkout_kind
@@ -90,7 +91,10 @@ def _request_with_retry(request: Any) -> Any:
 
 
 def _session(proxy_url: str) -> Any:
-    session = curl_requests.Session(impersonate="firefox144")
+    # verify 必须指向 ASCII 路径的 CA bundle：本项目目录名含中文，
+    # curl_cffi 默认的 certifi 路径经 libcurl（ANSI 代码页）解析时必然
+    # 报 CURLE_SSL_CACERT_BADFILE（curl 77），所有 HTTPS 探测直接失败。
+    session = curl_requests.Session(impersonate="firefox144", verify=ca_bundle_path())
     try:
         session.trust_env = False
     except Exception:
