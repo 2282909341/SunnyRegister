@@ -6,7 +6,6 @@
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeDir = Join-Path $RepoRoot ".runtime"
-$SelfPath = $PSCommandPath
 
 function Test-Http([string]$Url) {
     try { return (Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 3).StatusCode -eq 200 } catch { return $false }
@@ -50,26 +49,34 @@ function Stop-TrackedTrees {
 function Invoke-ExistingScript([string]$Name) {
     $scriptPath = Join-Path $PSScriptRoot $Name
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '"'
-    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw "$Name 失败，退出码 $($process.ExitCode)" }
+    Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $RepoRoot -WindowStyle Hidden | Out-Null
+}
+
+function Wait-ServiceState([bool]$ShouldRun, [int]$TimeoutSeconds) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Seconds 2
+        $state = Get-ServiceState
+        $allRunning = $state.Backend -and $state.Worker -and $state.Database
+        $allStopped = -not $state.Backend -and -not $state.Worker -and -not $state.Database
+        if (($ShouldRun -and $allRunning) -or (-not $ShouldRun -and $allStopped)) { return $state }
+    } while ((Get-Date) -lt $deadline)
+    throw "等待服务状态超时。`r`n$(Format-ServiceState $state)"
 }
 
 function Invoke-ManagerAction([string]$RequestedAction) {
     switch ($RequestedAction) {
-        "Start" { Invoke-ExistingScript "start-all.ps1" }
-        "Stop" { Stop-TrackedTrees; Invoke-ExistingScript "stop-all.ps1" }
-        "Restart" { Stop-TrackedTrees; Invoke-ExistingScript "stop-all.ps1"; Invoke-ExistingScript "start-all.ps1" }
-        "Status" { }
+        "Start" { Invoke-ExistingScript "start-all.ps1"; return Wait-ServiceState $true 240 }
+        "Stop" { Stop-TrackedTrees; Invoke-ExistingScript "stop-all.ps1"; return Wait-ServiceState $false 90 }
+        "Restart" {
+            Stop-TrackedTrees
+            Invoke-ExistingScript "stop-all.ps1"
+            [void](Wait-ServiceState $false 90)
+            Invoke-ExistingScript "start-all.ps1"
+            return Wait-ServiceState $true 240
+        }
+        "Status" { return Get-ServiceState }
     }
-    Start-Sleep -Seconds 2
-    $state = Get-ServiceState
-    if ($RequestedAction -in @("Start", "Restart") -and (-not $state.Backend -or -not $state.Worker -or -not $state.Database)) {
-        throw "操作完成后服务未全部运行。`r`n$(Format-ServiceState $state)"
-    }
-    if ($RequestedAction -eq "Stop" -and ($state.Backend -or $state.Worker -or $state.Database)) {
-        throw "停止后仍有服务运行。`r`n$(Format-ServiceState $state)"
-    }
-    return $state
 }
 
 if ($Action -ne "Gui") {
@@ -127,13 +134,13 @@ function Refresh-Ui {
 function Invoke-UiAction([string]$RequestedAction) {
     $statusBox.Text = "正在执行，请稍候……"
     $form.Refresh()
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $SelfPath + '" -Action ' + $RequestedAction
-    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru -Wait
-    Refresh-Ui
-    if ($process.ExitCode -eq 0) {
+    try {
+        [void](Invoke-ManagerAction $RequestedAction)
+        Refresh-Ui
         [Windows.Forms.MessageBox]::Show("操作成功。", "SunnyRegister", "OK", "Information") | Out-Null
-    } else {
-        [Windows.Forms.MessageBox]::Show("操作失败，请查看服务日志。", "SunnyRegister", "OK", "Error") | Out-Null
+    } catch {
+        Refresh-Ui
+        [Windows.Forms.MessageBox]::Show("操作失败：`r`n$($_.Exception.Message)", "SunnyRegister", "OK", "Error") | Out-Null
     }
 }
 
