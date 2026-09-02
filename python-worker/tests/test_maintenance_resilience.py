@@ -18,6 +18,10 @@ class AuthResilienceTests(unittest.TestCase):
         self.assertTrue(rate_limit.rotate_proxy)
         stale = classify_auth_failure("invalid_auth_step")
         self.assertTrue(stale.fresh_context)
+        wrong_otp = classify_auth_failure("wrong_email_otp_code: Wrong code. Please check it and try again.")
+        self.assertEqual(wrong_otp.category, "stale_auth_context")
+        self.assertTrue(wrong_otp.retryable)
+        self.assertTrue(wrong_otp.fresh_context)
         self.assertFalse(retry_allowed("invalid_auth_step", 1, operation="protocol_login").retryable)
         self.assertEqual(classify_auth_failure("edge rejected", http_status=403).category, "edge_blocked")
 

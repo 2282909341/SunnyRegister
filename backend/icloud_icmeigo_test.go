@@ -252,6 +252,62 @@ func TestIcMeiGoTaskAutomaticallyRecognizesAllCardsAndQuota(t *testing.T) {
 	}
 }
 
+func TestIcMeiGoCardCanBeRemovedWithoutDeletingHistory(t *testing.T) {
+	releases := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/hme/quota":
+			_, _ = w.Write([]byte(`{"data":{"remaining_quota":8,"total_quota":10,"total_concurrency":2}}`))
+		case "/api/hme/release-all":
+			releases++
+			_, _ = w.Write([]byte(`{"data":{"success":1,"failed":0,"pending":0}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	oldBase := icmeigoAPIBaseURL
+	icmeigoAPIBaseURL = server.URL
+	defer func() { icmeigoAPIBaseURL = oldBase }()
+
+	s := newSunnySessionTestServer(t)
+	for i := 1; i <= 2; i++ {
+		mailbox := SunnyMailbox{Email: fmt.Sprintf("failed%d@icloud.com", i), MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: "api_card_remove", Status: "失败", Enabled: true}
+		if err := s.db.Create(&mailbox).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summaryRecorder := httptest.NewRecorder()
+	s.sunnyIcMeigoSummary(summaryRecorder)
+	var summary map[string]any
+	if err := json.Unmarshal(summaryRecorder.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := summary["card_items"].([]any)
+	if len(items) != 1 || strings.Contains(summaryRecorder.Body.String(), "api_card_remove") {
+		t.Fatalf("card manager summary is invalid or leaked the key: %s", summaryRecorder.Body.String())
+	}
+
+	recorder := httptest.NewRecorder()
+	s.handleSunny(recorder, httptest.NewRequest(http.MethodDelete, "/api/sunny/icmeigo/cards/"+sunnyIcMeigoCardID("api_card_remove"), nil), "icmeigo/cards/"+sunnyIcMeigoCardID("api_card_remove"))
+	if recorder.Code != http.StatusOK || releases != 2 {
+		t.Fatalf("remove card failed: status=%d releases=%d body=%s", recorder.Code, releases, recorder.Body.String())
+	}
+	var rows []SunnyMailbox
+	if err := s.db.Where("mailbox_channel = ?", "icmeigo").Order("id asc").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("history rows=%d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.Enabled || row.Status != "已释放" {
+			t.Fatalf("card row not removed from scheduling: enabled=%v status=%q", row.Enabled, row.Status)
+		}
+	}
+}
+
 func TestIcMeiGoProviderResponses(t *testing.T) {
 	t.Run("pending release is accepted", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

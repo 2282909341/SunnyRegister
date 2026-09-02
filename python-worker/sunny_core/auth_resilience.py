@@ -51,7 +51,8 @@ def classify_auth_failure(error: Any, *, http_status: int = 0) -> AuthFailure:
         return AuthFailure("edge_blocked", retryable=True, rotate_proxy=True, delay_seconds=2)
     if any(marker in text for marker in (
         "invalid_auth_step", "invalid_state", "authorization step", "认证事务状态失效",
-        "email-otp/validate", "emailotpvalidate", "proof_required", "sentinel_required",
+        "email-otp/validate", "emailotpvalidate", "wrong_email_otp_code", "wrong code. please check it",
+        "proof_required", "sentinel_required",
     )):
         return AuthFailure("stale_auth_context", retryable=True, fresh_context=True, delay_seconds=12)
     if any(marker in text for marker in (

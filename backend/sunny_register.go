@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -68,6 +70,10 @@ func (s *Server) handleSunny(w http.ResponseWriter, r *http.Request, rest string
 	case "icmeigo":
 		if len(parts) == 2 && parts[1] == "summary" && r.Method == http.MethodGet {
 			s.sunnyIcMeigoSummary(w)
+			return
+		}
+		if len(parts) == 3 && parts[1] == "cards" && r.Method == http.MethodDelete {
+			s.sunnyRemoveIcMeigoCard(w, parts[2])
 			return
 		}
 	case "domain-mail":
@@ -6028,19 +6034,115 @@ func (s *Server) sunnyIcMeigoSnapshot() ([]SunnyMailbox, map[string]int, error) 
 }
 
 func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
-	rows, remaining, err := s.sunnyIcMeigoSnapshot()
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+	var rows []SunnyMailbox
+	if err := s.db.Where("mailbox_channel = ? AND enabled = ?", "icmeigo", true).Order("id asc").Find(&rows).Error; err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	remaining := map[string]int{}
+	quotaErrors := map[string]bool{}
+	validCards := 0
+	client := icmeigoHTTPClient("")
+	for _, row := range rows {
+		key := strings.TrimSpace(row.AccessKey)
+		if key == "" {
+			continue
+		}
+		if _, seen := remaining[key]; seen {
+			continue
+		}
+		quota, err := icmeigoQuota(client, key)
+		if err != nil {
+			remaining[key] = 0
+			quotaErrors[key] = true
+			continue
+		}
+		remaining[key] = intValue(quota["remaining_quota"], 0)
+		validCards++
 	}
 	total := len(rows)
 	for _, count := range remaining {
 		total += count
 	}
+	type cardSummary struct {
+		ID              string `json:"id"`
+		Label           string `json:"label"`
+		ActiveMailboxes int    `json:"active_mailboxes"`
+		FailedMailboxes int    `json:"failed_mailboxes"`
+		RemainingQuota  int    `json:"remaining_quota"`
+		TotalAccounts   int    `json:"total_accounts"`
+		QuotaError      bool   `json:"quota_error"`
+	}
+	cards := make([]cardSummary, 0, len(remaining))
+	cardIndex := map[string]int{}
+	for _, row := range rows {
+		key := strings.TrimSpace(row.AccessKey)
+		if key == "" {
+			continue
+		}
+		index, exists := cardIndex[key]
+		if !exists {
+			index = len(cards)
+			cardIndex[key] = index
+			cards = append(cards, cardSummary{
+				ID: sunnyIcMeigoCardID(key), Label: fmt.Sprintf("卡密 %d", index+1),
+				RemainingQuota: remaining[key], QuotaError: quotaErrors[key],
+			})
+		}
+		cards[index].ActiveMailboxes++
+		if strings.TrimSpace(row.Status) == "失败" {
+			cards[index].FailedMailboxes++
+		}
+	}
+	for index := range cards {
+		cards[index].TotalAccounts = cards[index].ActiveMailboxes + cards[index].RemainingQuota
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ready": len(rows) > 0, "cards": len(remaining), "active_mailboxes": len(rows),
-		"remaining_quota": total - len(rows), "total_accounts": total,
+		"ready": validCards > 0, "cards": len(remaining), "active_mailboxes": len(rows),
+		"remaining_quota": total - len(rows), "total_accounts": total, "card_items": cards,
 	})
+}
+
+func sunnyIcMeigoCardID(key string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	return hex.EncodeToString(sum[:12])
+}
+
+// sunnyRemoveIcMeigoCard releases the provider mailboxes before removing a card
+// from automatic scheduling. Local rows stay as disabled history so failed or
+// completed account evidence is never destroyed by card management.
+func (s *Server) sunnyRemoveIcMeigoCard(w http.ResponseWriter, cardID string) {
+	var rows []SunnyMailbox
+	if err := s.db.Where("mailbox_channel = ? AND enabled = ?", "icmeigo", true).Order("id asc").Find(&rows).Error; err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	selected := make([]SunnyMailbox, 0)
+	for _, row := range rows {
+		if sunnyIcMeigoCardID(row.AccessKey) == strings.TrimSpace(cardID) {
+			selected = append(selected, row)
+		}
+	}
+	if len(selected) == 0 {
+		writeError(w, http.StatusNotFound, "卡密不存在或已移除")
+		return
+	}
+	client := icmeigoHTTPClient("")
+	released := 0
+	for _, row := range selected {
+		if err := icmeigoReleaseMailbox(client, row.AccessKey, row.Email); err != nil {
+			writeError(w, http.StatusBadGateway, fmt.Sprintf("已释放 %d/%d 个邮箱，剩余邮箱释放失败，请重试移除卡密", released, len(selected)))
+			return
+		}
+		if err := s.db.Model(&SunnyMailbox{}).Where("id = ?", row.ID).Updates(map[string]any{
+			"enabled": false, "status": "已释放", "last_error": "",
+		}).Error; err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		released++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "released": released, "removed": true})
 }
 
 func (s *Server) sunnyPrepareIcMeigoTask(body map[string]any) error {

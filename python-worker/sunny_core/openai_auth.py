@@ -110,6 +110,7 @@ _NAVIGATION_ABORT_MARKERS = (
     "ns_binding_aborted",
     "ns_error_abort",
     "net::err_aborted",
+    "interrupted by another navigation",
 )
 
 _TRANSIENT_BROWSER_NETWORK_MARKERS = (

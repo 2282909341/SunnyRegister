@@ -2089,6 +2089,8 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
   const [mailboxCfg,setMailboxCfg]=useCachedState<AnyObj>("mailbox.config",{pool_enabled:true});
   const [remailCfg,setRemailCfg]=useCachedState<AnyObj>("mailbox.remail.config",{enabled:false,base_url:"https://remail.aishop6.com",project_id:0,service_mode:"purchase",supply:"private_first"});
   const [domainCfg,setDomainCfg]=useCachedState<AnyObj>("mailbox.domain.config",{enabled:true,enabled_for_registration:false,enabled_for_rebinding:false,random_local_length:12,auto_add_user:true});
+  const [icmeigoSummary,setIcmeigoSummary]=useState<AnyObj>({card_items:[]});
+  const [removingIcmeigoCard,setRemovingIcmeigoCard]=useState("");
   const [fieldLoading,setFieldLoading]=useState<Record<string,boolean>>({});
   const [credentialVisible,setCredentialVisible]=useState<Record<string,boolean>>({});
   const [credentialValues,setCredentialValues]=useState<Record<string,string>>({});
@@ -2135,6 +2137,8 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
   useEffect(()=>{apiFetch("/sunny/mailboxes/config").then((cfg)=>setMailboxCfg(cfg || {pool_enabled:true})).catch(()=>{})},[]);
   useEffect(()=>{apiFetch("/sunny/remail/config").then((cfg)=>setRemailCfg(cfg || {})).catch(()=>{})},[]);
   useEffect(()=>{apiFetch("/sunny/domain-mail/config").then((cfg)=>setDomainCfg(cfg || {enabled:true})).catch(()=>{})},[]);
+  const loadIcmeigoSummary=()=>apiFetch("/sunny/icmeigo/summary").then((summary)=>{setIcmeigoSummary(summary || {card_items:[]});return summary});
+  useEffect(()=>{void loadIcmeigoSummary().catch(()=>{})},[]);
   useEffect(()=>{setPage(1)},[query, groupFilter, statusFilter, planFilter, rebindEmailFilter, passwordFilter, twoFactorFilter, sortBy, timeSort, pageSize]);
   useEffect(()=>{const pages=pageCount(total,pageSize); if(page>pages) setPage(pages);},[total,pageSize,page]);
   async function run(label:string, fn:()=>Promise<any>){try{await fn();notify("ok",label);void load();void loadGroups().catch(()=>{})}catch(e:any){notify("fail",e.message||String(e))}}
@@ -2198,6 +2202,18 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
     if (!selected.length) return;
     await run(t.done, async()=>{ await Promise.all(selected.map((id)=>apiFetch(`/sunny/mailboxes/${id}`,{method:"DELETE"}))); setSelected([]); });
   }
+  async function removeIcmeigoCard(card: AnyObj) {
+    const cardID=String(card.id || "");
+    if(!cardID || removingIcmeigoCard) return;
+    setRemovingIcmeigoCard(cardID);
+    try {
+      const result=await apiFetch(`/sunny/icmeigo/cards/${encodeURIComponent(cardID)}`,{method:"DELETE"});
+      notify("ok",`已移除卡密并释放 ${Number(result.released || 0)} 个邮箱，历史记录已保留`);
+      await Promise.all([load(),loadIcmeigoSummary()]);
+      setSelected([]);
+    } catch(e:any) { notify("fail",e.message||String(e)); }
+    finally { setRemovingIcmeigoCard(""); }
+  }
   async function toggleMailboxPoolEnabled() {
     const next = !(mailboxCfg.pool_enabled !== false);
     try {
@@ -2223,7 +2239,17 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
     { status:"登录刷新", label:t.mailboxOverviewRefreshing, count:Number(statusCounts["登录刷新"] || 0), tone:"refreshing" },
     { status:"失败", label:t.mailboxOverviewFailed, count:Number(statusCounts["失败"] || 0), tone:"failed" },
   ];
+  const icmeigoCards=Array.isArray(icmeigoSummary.card_items) ? icmeigoSummary.card_items : [];
   return <div className="space-y-4">
+    {icmeigoCards.length > 0 && <Card className="rounded-[24px] p-5">
+      <div><h2 className="text-lg font-bold">ic.meigo 卡密管理</h2><p className="mt-1 text-sm text-slate-500">可随时移除卡密；系统会先释放当前邮箱，再停止该卡的自动注册，不删除历史记录。</p></div>
+      <div className="mt-4 grid gap-3 md:grid-cols-2">
+        {icmeigoCards.map((card:AnyObj)=><div key={card.id} className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 px-4 py-3 dark:border-slate-700">
+          <div><div className="font-bold">{card.label}</div><div className="mt-1 text-xs text-slate-500">{card.quota_error ? `额度读取失败 · 当前邮箱 ${Number(card.active_mailboxes||0)}` : `当前邮箱 ${Number(card.active_mailboxes||0)} · 失败 ${Number(card.failed_mailboxes||0)} · 剩余额度 ${Number(card.remaining_quota||0)}`}</div></div>
+          <ConfirmBubble message="确认移除这张卡密？" detail="当前邮箱会被释放，之后不再自动注册。" onConfirm={()=>removeIcmeigoCard(card)}><Button variant="outline" disabled={!!removingIcmeigoCard} className="rounded-xl border-red-200 text-red-500">{removingIcmeigoCard===card.id?<Loader2 className="h-4 w-4 animate-spin"/>:"移除卡密"}</Button></ConfirmBubble>
+        </div>)}
+      </div>
+    </Card>}
     <RemailProviderConfig t={t} config={remailCfg} setConfig={setRemailCfg} notify={notify}/>
     <DomainMailboxProviderConfig t={t} config={domainCfg} setConfig={setDomainCfg} notify={notify}/>
     <Card className="sr-sms-provider-card sr-mailbox-provider-card rounded-[24px] p-5">
@@ -2277,7 +2303,7 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
         </div>
       </div>}
     </Card>
-    {importOpen && <MailboxImportModal t={t} groups={groups} onGroupsChanged={setGroups} onClose={()=>setImportOpen(false)} onImported={()=>{setImportOpen(false); notify("ok",t.done); void load(); void loadGroups().catch(()=>{});}} notify={notify}/>}
+    {importOpen && <MailboxImportModal t={t} groups={groups} onGroupsChanged={setGroups} onClose={()=>setImportOpen(false)} onImported={()=>{setImportOpen(false); notify("ok",t.done); void load(); void loadGroups().catch(()=>{}); void loadIcmeigoSummary().catch(()=>{});}} notify={notify}/>}
     {editing && <MailboxEditModal t={t} mailbox={editing} groups={groups} onClose={()=>setEditing(null)} onSaved={()=>{setEditing(null); notify("ok",t.done); void load();}} notify={notify}/>}
     {batchEditing && <MailboxBatchEditModal t={t} selected={selected} groups={groups} onClose={()=>setBatchEditing(false)} onSaved={()=>{setBatchEditing(false); setSelected([]); notify("ok",t.done); void load();}} notify={notify}/>}
     {mailboxForMail && <MailboxMailModal t={t} mailbox={mailboxForMail} onClose={()=>setMailboxForMail(null)} notify={notify}/>}
