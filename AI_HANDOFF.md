@@ -1,7 +1,7 @@
 # SunnyRegister AI 接手文档（唯一权威版）
 
 > 更新日期：2026-09-03
-> 当前 HEAD：`fc86e8d`（已推送 `origin/main`）
+> 当前 HEAD：`8bf3a6e`（已推送 `origin/main`）
 > 面向：后续接手本项目的 AI/开发者
 > 原则：不记录卡密、密码、Token、代理凭证或数据库密码。
 > 说明：本文件是**唯一**交接文档。历史上遗留的 `_HANDOFF*.md` / `_momo_probe_report.md` 均为 ic.meigo 时代的过期草稿，已归档到 `_delivery/_archive_handoffs/`，勿再当作现行事实。
@@ -26,7 +26,7 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 - 开发分支：`main`，直接 push 不做 PR
 - 用户远程（origin）：`https://github.com/2282909341/SunnyRegister.git`（fork）
 - 作者上游（upstream）：`https://github.com/pxygit/SunnyRegister.git`（原项目，无 ic.meigo 代码）
-- 上游状态：`merge-base == upstream/main == 37ec239`，即上游自分叉后**未再更新**；`main` 领先上游 46+ 个提交，无同步负担。
+- 上游状态：`merge-base == upstream/main == 37ec239`，即上游自分叉后**未再更新**；`main` 领先上游 50 个提交，无同步负担。
 - 提交规则见根目录 `AGENTS.md`。修改前必须 `git pull --ff-only`，修改后审查 diff → 测试/构建 → 提交 → 推送 `origin/main`。
 - 工作树长期存在大量历史 `_*.sql` / `_*.txt` / `_probe_*` / `_delivery` 未跟踪文件，**禁止 `git add .`**（只暂存本次明确修改的文件）。
 
@@ -46,10 +46,14 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 
 ## 4. 当前 git 状态与最近提交链
 
-HEAD=`fc86e8d`，与 `origin/main` 同步。最近（ic.meigo 移除后仍有效）提交：
+HEAD=`8bf3a6e`，与 `origin/main` 同步。最近提交（倒序，ic.meigo 移除后仍有效的核心项）：
 
 | 提交 | 内容 |
 |---|---|
+| `8bf3a6e` | 前端：移除 Hero 光球常驻动画 + `will-change` 收敛 + 大阴影收窄（优化工作台滚动掉帧） |
+| `096f0e7` | 前端：移除吸顶栏与卡片 `backdrop-filter` 背景模糊（优化滚动掉帧） |
+| `f04823e` | 前端：`useCachedState` 去双写 + 任务持久化 250ms 防抖 + 表格紧凑化 |
+| `74b0ba0` | AI 交接文档唯一权威化整合 + 历史草稿归档 |
 | `fc86e8d` | 代理会话粘性**默认关闭**，回退轮换出口，修复坏出口 502 卡住 |
 | `f889f4e` | 账号级设备画像（persona）+ 代理会话粘性（`-session-<hash>`） |
 | `9ece5ae` | 移除 ic.meigo 全渠道 + 间隔改为 3-8 秒轻量抖动 |
@@ -91,7 +95,7 @@ HEAD=`fc86e8d`，与 `origin/main` 同步。最近（ic.meigo 移除后仍有效
 - 根因（已修）：① 全库只有 `chrome136`+`firefox144` 两种 TLS 指纹；② 轮换住宅每连接换 IP（机械脚本特征）；③ 账号间无间隔。
 - 残余风险（未完全解决）：101 个 JP + 101 个 VN 账号**共用 2 组代理凭证串**=同一代理商同一 IP 池/ASN。粘性本可固定出口，但实测坏出口 502 导致卡死，故已默认关闭。若后续仍成波封号，升级路径=加第二家住宅代理商 + 少量静态独享 IP。
 
-## 7. 已实现可靠性修复汇总
+## 7. 已实现修复汇总（可靠性 + 前端性能/紧凑化）
 
 - 可恢复认证问题用全新认证上下文自动重试一次。
 - `wrong_email_otp_code` / `otp input was not found` 归类为可恢复旧认证上下文。
@@ -100,6 +104,16 @@ HEAD=`fc86e8d`，与 `origin/main` 同步。最近（ic.meigo 移除后仍有效
 - 任务成功/失败以密码、2FA、Session 实际落库为准，不以页面跳转为唯一成功信号。
 - 失败邮箱保留、允许直接重试，不自动释放或销毁。
 - CA 证书中文路径 curl 77 根治（`ca_bundle.py` 全局加载 + 各 session 补 `verify=ca_bundle_path()`）。
+
+### 前端性能与紧凑化（2026-09-03 本轮）
+
+- `useCachedState` 去除重复 `useEffect` 双写 `localStorage`（每次状态更新少一次阻塞主线程的同步写盘）。
+- `publishSessionTasks` 改为 250ms 防抖持久化：内存快照仍同步更新（UI 即时），高频 SSE/轮询不再每 tick 全量 `JSON.stringify` 写盘。
+- 账户/邮箱/接码/代理/会话表统一紧凑化：行高 42→34px、字号 13→12px、内边距 8→6px。
+- 移除吸顶导航栏 `backdrop-blur-2xl` 与所有卡片的 `backdrop-filter: blur(22px)`（滚动掉帧主因之一）。
+- 移除 Hero 光球 `float-orb 8s infinite` 常驻动画；`will-change` 从大卡片收敛到 `.sr-modal/.sr-toast`；`--surface-glow` 阴影 80px→32px。
+- 涉及文件：`frontend/src/pages/SunnyRegister.tsx`、`frontend/src/App.tsx`、`frontend/src/index.css`。
+- 若滚动仍掉帧，下一步候选（未做）：表格卡片 `content-visibility: auto`（配合 `contain-intrinsic-size`）、账户/邮箱大表行虚拟化。
 
 ## 8. 重要文件定位
 
@@ -115,6 +129,8 @@ HEAD=`fc86e8d`，与 `origin/main` 同步。最近（ic.meigo 移除后仍有效
 | Worker 主流程与并发/间隔 | `python-worker/sunny_core/worker.py` |
 | Worker 数据库写回 | `python-worker/sunny_core/db.py` |
 | 前端工作台 | `frontend/src/pages/SunnyRegister.tsx` |
+| 前端全局样式/主题令牌 | `frontend/src/index.css` |
+| 前端壳与吸顶导航 | `frontend/src/App.tsx` |
 
 ## 9. 测试与构建
 
@@ -135,7 +151,7 @@ cd python-worker
 .\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-`python-worker/sunny_core/worker.py`（含 FastAPI 入口 `python-worker/worker.py`）与 `openai_auth.py` 的 Git 版本首字节为 UTF-8 BOM（EF BB BF）；用编辑工具改动后必须恢复 BOM，否则与 HEAD 整体对比会误判改动。
+`python-worker/sunny_core/worker.py`（含 FastAPI 入口 `python-worker/worker.py`）与 `openai_auth.py` 的 Git 版本首字节为 UTF-8 BOM（EF BB BF）；前端 `frontend/src/index.css` 与 `frontend/src/App.tsx` 同样带 UTF-8 BOM。用编辑工具改动后必须恢复 BOM（PowerShell 读字节，若缺少 EF BB BF 则前缀补回），否则与 HEAD 整体对比会误判改动。
 
 ### 前端
 
