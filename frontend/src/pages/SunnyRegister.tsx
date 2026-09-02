@@ -1978,7 +1978,10 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
   const mailboxHint = identity === "system" ? t.linkedMailboxConfig + " · " + (mailboxPoolReady ? t.resourceReady : t.resourceMissing) : identity === "domain" ? t.domainMailboxIdentityDesc : identity === "icmeigo" ? `已识别 ${Number(icmeigoSummary.cards || 0)} 张卡，预计 ${Number(icmeigoSummary.total_accounts || 0)} 个账号` : template(t.remailOrderHint, {count: safeRegisterCount});
   useEffect(() => {
     if (identity === "system" && selectedEmails.length > 0) setRegisterCount(selectedEmails.length);
-    if (identity === "icmeigo" && icmeigoReady) setRegisterCount(Math.max(1, Number(icmeigoSummary.total_accounts || 1)));
+    if (identity === "icmeigo" && icmeigoReady) {
+      setRegisterCount(Math.max(1, Number(icmeigoSummary.total_accounts || 1)));
+      setConcurrency(Math.max(1, Math.min(5, Number(icmeigoSummary.active_mailboxes || 1))));
+    }
     if (identity === "system" && selectedEmails.length === 0 && icmeigoReady) setIdentity("icmeigo");
     if (identity === "system" && selectedEmails.length === 0 && !icmeigoReady && domainReady) setIdentity("domain");
     if (identity === "system" && selectedEmails.length === 0 && !icmeigoReady && !domainReady && remailReady) setIdentity("remail");
