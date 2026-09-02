@@ -147,6 +147,7 @@ class ProbePaymentMethodsRequest(BaseModel):
     proxy_url: str = ""
     country: str = "US"
     currency: str = "USD"
+    use_trial_promotion: bool = False
 
 
 class CheckoutRequest(BaseModel):
@@ -284,7 +285,7 @@ def probe_payment_methods(req: ProbePaymentMethodsRequest, authorization: str | 
     _check_token(authorization)
     from sunny_core.commerce_probe import probe_payment_methods as run_probe
 
-    return run_probe(req.access_token, req.proxy_url, req.country, req.currency)
+    return run_probe(req.access_token, req.proxy_url, req.country, req.currency, req.use_trial_promotion)
 
 
 @app.post("/checkout/jobs")

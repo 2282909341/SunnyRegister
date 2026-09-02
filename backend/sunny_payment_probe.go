@@ -17,6 +17,8 @@ import (
 
 const sunnyPaymentProbeTaskType = "sunny_account_payment_probe"
 
+type sunnyPaymentPromotionContextKey struct{}
+
 type sunnyPaymentProbeCandidate struct {
 	SessionID   uint
 	AccountID   uint
@@ -165,12 +167,13 @@ func sunnyHasAllPaymentMethods(value any, required []string) bool {
 }
 
 func probeSunnyPaymentMethods(ctx context.Context, accessToken, country, currency, proxyURL string) sunnyPaymentProbeResponse {
-	if workerResult, ok := probeSunnyPaymentMethodsViaWorker(ctx, accessToken, country, currency, proxyURL); ok {
+	useTrialPromotion, _ := ctx.Value(sunnyPaymentPromotionContextKey{}).(bool)
+	if workerResult, ok := probeSunnyPaymentMethodsViaWorker(ctx, accessToken, country, currency, proxyURL, useTrialPromotion); ok {
 		return workerResult
 	}
 	meter := sunnyTrafficMeterFromContext(ctx)
 	client := sunnyCommerceHTTPClientWithMeter(meter, proxyURL)
-	kind, methods, invalid, err := probeSunnyCheckoutForCountry(ctx, client, accessToken, country, currency)
+	kind, methods, invalid, err := probeSunnyCheckoutForCountryWithPromotion(ctx, client, accessToken, country, currency, useTrialPromotion)
 	result := sunnyPaymentProbeResponse{Kind: normalizeSunnyCheckoutKind(kind), Methods: normalizeSunnyPaymentMethods(methods), HTTP: http.StatusOK, InvalidToken: invalid}
 	if err != nil {
 		result.HTTP = 0
@@ -179,13 +182,13 @@ func probeSunnyPaymentMethods(ctx context.Context, accessToken, country, currenc
 	return result
 }
 
-func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country, currency, proxyURL string) (sunnyPaymentProbeResponse, bool) {
+func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country, currency, proxyURL string, useTrialPromotion bool) (sunnyPaymentProbeResponse, bool) {
 	result := sunnyPaymentProbeResponse{}
 	workerURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PYTHON_WORKER_URL")), "/")
 	if workerURL == "" {
 		workerURL = "http://127.0.0.1:8765"
 	}
-	body, _ := json.Marshal(map[string]string{"access_token": accessToken, "proxy_url": proxyURL, "country": country, "currency": currency})
+	body, _ := json.Marshal(map[string]any{"access_token": accessToken, "proxy_url": proxyURL, "country": country, "currency": currency, "use_trial_promotion": useTrialPromotion})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, workerURL+"/probe-payment-methods", bytes.NewReader(body))
 	if err != nil {
 		return result, false
@@ -374,7 +377,7 @@ func (s *Server) createSunnyPaymentProbeTask(body map[string]any) (Task, error) 
 			skipped = append(skipped, candidate.SessionID)
 		}
 	}
-	payload := map[string]any{"session_ids": ids, "skip_session_ids": skipped, "countries": countries}
+	payload := map[string]any{"session_ids": ids, "skip_session_ids": skipped, "countries": countries, "use_trial_promotion": boolValue(body["use_trial_promotion"], false)}
 	return s.createTask(sunnyPaymentProbeTaskType, "sunny", payload, len(candidates)), nil
 }
 
@@ -518,11 +521,16 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		return
 	}
 	selectedCountries := sunnyPaymentProbeCountryList(groups)
+	useTrialPromotion := boolValue(payload["use_trial_promotion"], false)
+	promotionLabel := "不使用0元优惠"
+	if useTrialPromotion {
+		promotionLabel = "使用0元优惠"
+	}
 	s.appendTaskEvent(task.ID,
-		fmt.Sprintf("账户支付方式探测开始：账户 %d 个，国家 %d 个（%s）", len(candidates), len(selectedCountries), strings.Join(selectedCountries, ", ")),
+		fmt.Sprintf("账户支付方式探测开始：账户 %d 个，国家 %d 个（%s），%s", len(candidates), len(selectedCountries), strings.Join(selectedCountries, ", "), promotionLabel),
 		"log", "info", map[string]any{
 			"scope": "global", "progress_type": "payment_probe", "current": 0, "total": len(candidates),
-			"countries": selectedCountries,
+			"countries": selectedCountries, "use_trial_promotion": useTrialPromotion,
 		})
 	skipped := map[uint]bool{}
 	for _, id := range uintSlice(payload["skip_session_ids"]) {
@@ -533,10 +541,11 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			candidates[index].SkipReason = "已有支付方式探测任务正在执行，已跳过"
 		}
 	}
-	result := map[string]any{"requested": len(candidates), "detected": 0, "partial": 0, "skipped": 0, "failed": 0, "items": []any{}}
+	result := map[string]any{"requested": len(candidates), "detected": 0, "partial": 0, "skipped": 0, "failed": 0, "items": []any{}, "use_trial_promotion": useTrialPromotion}
 	items := make([]any, 0, len(candidates))
-	outcomes := streamSunnyWorkerPoolContext(ctx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
-		return s.probeSunnyPaymentAccountContext(ctx, candidate, groups)
+	probeCtx := context.WithValue(ctx, sunnyPaymentPromotionContextKey{}, useTrialPromotion)
+	outcomes := streamSunnyWorkerPoolContext(probeCtx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
+		return s.probeSunnyPaymentAccountContext(probeCtx, candidate, groups)
 	})
 	for outcome := range outcomes {
 		if ctx.Err() != nil {

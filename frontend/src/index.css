@@ -1540,6 +1540,12 @@ button:not(:disabled):active { transform: translateY(0) scale(.985); }
 .sr-payment-country-toolbar button { border-radius:7px; padding:5px 9px; color:#0f766e; font-size:13px; font-weight:700; }
 .sr-payment-country-toolbar button:hover:not(:disabled) { background:#f0fdfa; }
 .sr-payment-country-toolbar button:disabled { cursor:not-allowed; opacity:.4; }
+.sr-payment-country-toolbar .sr-payment-promo-toggle { display:inline-flex; align-items:center; gap:7px; margin-right:5px; color:#475569; font-size:13px; font-weight:700; white-space:nowrap; }
+.sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only { width:38px; height:22px; padding:2px; }
+.sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only span { width:16px; height:16px; }
+.sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only.on span { transform:translateX(16px); }
+.sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only:hover:not(:disabled) { background:#cbd5e1; }
+.sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only.on:hover:not(:disabled) { background:linear-gradient(135deg,#10b981,#14b8a6); }
 .sr-payment-country-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; min-height:72px; }
 .sr-payment-country-option { position:relative; display:flex; min-height:54px; cursor:pointer; align-items:center; justify-content:center; border:1px solid #dbe3ea; border-radius:8px; background:#fff; color:#334155; font-weight:800; transition:border-color .15s ease,background .15s ease,color .15s ease,box-shadow .15s ease; }
 .sr-payment-country-option:hover { border-color:#5eead4; background:#f8fffe; }
@@ -1552,6 +1558,9 @@ button:not(:disabled):active { transform: translateY(0) scale(.985); }
 .dark .sr-payment-country-toolbar p { color:#94a3b8; }
 .dark .sr-payment-country-toolbar button { color:#5eead4; }
 .dark .sr-payment-country-toolbar button:hover:not(:disabled) { background:rgba(20,184,166,.12); }
+.dark .sr-payment-country-toolbar .sr-payment-promo-toggle { color:#cbd5e1; }
+.dark .sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only:hover:not(:disabled) { background:#64748b; }
+.dark .sr-payment-country-toolbar .sr-payment-promo-toggle .sr-switch-only.on:hover:not(:disabled) { background:linear-gradient(135deg,#10b981,#14b8a6); }
 .dark .sr-payment-country-option { border-color:rgba(148,163,184,.24); background:#111c30; color:#cbd5e1; }
 .dark .sr-payment-country-option:hover { border-color:rgba(45,212,191,.55); background:#11242c; }
 .dark .sr-payment-country-option.is-selected { border-color:#2dd4bf; background:rgba(13,148,136,.16); color:#99f6e4; }

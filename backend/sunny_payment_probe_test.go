@@ -1,14 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+type sunnyPaymentRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn sunnyPaymentRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func TestSunnyPaymentProbeStopsAfterCancellation(t *testing.T) {
 	s := newSunnySessionTestServer(t)
@@ -109,6 +117,54 @@ func TestSunnyPaymentProbeUsesPolishZloty(t *testing.T) {
 	)
 	if result.Error != "" || probedCountry != "PL" || probedCurrency != "PLN" {
 		t.Fatalf("PL probe country=%q currency=%q result=%#v", probedCountry, probedCurrency, result)
+	}
+}
+
+func TestSunnyPaymentProbeWorkerReceivesTrialPromotion(t *testing.T) {
+	receivedPromotion := false
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var requestBody struct {
+			UseTrialPromotion bool `json:"use_trial_promotion"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Fatalf("decode worker request: %v", err)
+		}
+		receivedPromotion = requestBody.UseTrialPromotion
+		writeJSON(w, http.StatusOK, map[string]any{
+			"checkout": map[string]any{"kind": "oaics", "payment_methods": []string{"card"}, "http": 200},
+		})
+	}))
+	defer worker.Close()
+	t.Setenv("PYTHON_WORKER_URL", worker.URL)
+
+	result, ok := probeSunnyPaymentMethodsViaWorker(context.Background(), "token", "JP", "JPY", "http://jp-proxy", true)
+	if !ok || result.Error != "" || !receivedPromotion {
+		t.Fatalf("worker promotion request failed: ok=%v received=%v result=%#v", ok, receivedPromotion, result)
+	}
+}
+
+func TestSunnyPaymentProbeFallbackCheckoutCarriesTrialPromotion(t *testing.T) {
+	receivedPromotion := map[string]any{}
+	client := &http.Client{Transport: sunnyPaymentRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var requestBody map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil {
+			t.Fatalf("decode checkout request: %v", err)
+		}
+		receivedPromotion, _ = requestBody["promo_campaign"].(map[string]any)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewBufferString(`{"checkout_session_id":"oaics_test","payment_method_types":["card"]}`)),
+			Request:    request,
+		}, nil
+	})}
+
+	kind, methods, invalid, err := probeSunnyCheckoutForCountryWithPromotion(context.Background(), client, "token", "JP", "JPY", true)
+	if err != nil || invalid || kind != "oaics" || strings.Join(methods, ",") != "card" {
+		t.Fatalf("unexpected promoted checkout result: kind=%q methods=%v invalid=%v err=%v", kind, methods, invalid, err)
+	}
+	if text(receivedPromotion["promo_campaign_id"]) != "plus-1-month-free" || !boolValue(receivedPromotion["is_coupon_from_query_param"], false) {
+		t.Fatalf("promotion payload=%#v", receivedPromotion)
 	}
 }
 
@@ -267,8 +323,10 @@ func TestSunnyPaymentProbeTaskUsesSelectedCountries(t *testing.T) {
 	}
 	previousProbe := sunnyProbePaymentMethods
 	calledCountries := []string{}
-	sunnyProbePaymentMethods = func(_ context.Context, _, country, _, _ string) sunnyPaymentProbeResponse {
+	calledWithPromotion := false
+	sunnyProbePaymentMethods = func(ctx context.Context, _, country, _, _ string) sunnyPaymentProbeResponse {
 		calledCountries = append(calledCountries, country)
+		calledWithPromotion, _ = ctx.Value(sunnyPaymentPromotionContextKey{}).(bool)
 		return sunnyPaymentProbeResponse{Methods: []string{"gcash"}, HTTP: http.StatusOK}
 	}
 	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
@@ -282,7 +340,7 @@ func TestSunnyPaymentProbeTaskUsesSelectedCountries(t *testing.T) {
 	if missingCountryTask.Status != TaskFailed || len(calledCountries) != 0 {
 		t.Fatalf("payment executor accepted a task without selected countries: status=%q countries=%v", missingCountryTask.Status, calledCountries)
 	}
-	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []any{"PH", "PH"}})
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []any{"PH", "PH"}, "use_trial_promotion": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,9 +348,15 @@ func TestSunnyPaymentProbeTaskUsesSelectedCountries(t *testing.T) {
 	if got := strings.Join(stringSlice(payload["countries"]), ","); got != "PH" {
 		t.Fatalf("countries payload=%q", got)
 	}
+	if !boolValue(payload["use_trial_promotion"], false) {
+		t.Fatalf("trial promotion was not persisted in task payload: %#v", payload)
+	}
 	s.executeSunnyPaymentProbeTask(&task, payload)
 	if got := strings.Join(calledCountries, ","); got != "PH" {
 		t.Fatalf("probed countries=%q", got)
+	}
+	if !calledWithPromotion {
+		t.Fatal("trial promotion was not propagated to the country probe")
 	}
 	var account SunnyAccount
 	if err := s.db.Where("email = ?", session.Email).First(&account).Error; err != nil {

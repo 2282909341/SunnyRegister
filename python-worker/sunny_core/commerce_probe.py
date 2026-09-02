@@ -100,7 +100,7 @@ def _session(proxy_url: str) -> Any:
     return session
 
 
-def _checkout_probe_options(country: str, currency: str) -> dict[str, Any]:
+def _checkout_probe_options(country: str, currency: str, use_trial_promotion: bool = False) -> dict[str, Any]:
     indonesia_gopay_probe = country.upper() == "ID" and currency.upper() == "IDR"
     hosted_payment_probe = country.upper() in STRIPE_HOSTED_PAYMENT_COUNTRIES
     return {
@@ -111,8 +111,10 @@ def _checkout_probe_options(country: str, currency: str) -> dict[str, Any]:
         "checkout_currency": currency,
         "link_type": "gopay" if indonesia_gopay_probe else "paypal",
         "checkout_ui_mode": "redirect" if indonesia_gopay_probe or hosted_payment_probe else "custom",
-        "use_promo": False,
-        "promo_campaign": "",
+        "use_promo": bool(use_trial_promotion),
+        "promo_campaign": "plus-1-month-free" if use_trial_promotion else "",
+        "promo_on_create": bool(use_trial_promotion),
+        "promo_from_query_param": bool(use_trial_promotion),
     }
 
 
@@ -121,6 +123,7 @@ def _task_style_checkout_probe(
     country: str,
     currency: str,
     checkout_proxy_url: str,
+    use_trial_promotion: bool = False,
 ) -> dict[str, Any]:
     """Run the same Checkout creation path used by PayPal extraction tasks."""
     engine_dir = Path(__file__).resolve().parents[1] / "tools" / "pay153_checkout"
@@ -132,7 +135,7 @@ def _task_style_checkout_probe(
         fetch_custom_checkout_session_with_retry,
     )
 
-    options = _checkout_probe_options(country, currency)
+    options = _checkout_probe_options(country, currency, use_trial_promotion)
     payload = checkout_payload(options, {})
     device_id = str(uuid.uuid4())
     did = str(uuid.uuid4())
@@ -237,6 +240,7 @@ def probe_payment_methods(
     proxy_url: str = "",
     country: str = "US",
     currency: str = "USD",
+    use_trial_promotion: bool = False,
 ) -> dict[str, Any]:
     token = str(access_token or "").strip()
     if not token:
@@ -263,6 +267,7 @@ def probe_payment_methods(
                 billing_country,
                 billing_currency,
                 selected_proxy,
+                use_trial_promotion,
             )
     except Exception as exc:
         message = f"{type(exc).__name__}: {str(exc)[:240]}"

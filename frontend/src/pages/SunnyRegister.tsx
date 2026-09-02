@@ -918,6 +918,7 @@ Object.assign(zh, {
   paymentProbe: "支付探测", paymentProbing: "探测中...", paymentProbeNoSelection: "请选择需要探测支付方式的账户",
   paymentProbeCountryTitle: "选择探测国家", paymentProbeCountryHint: "请选择本次支付方式探测使用的国家代理", paymentProbeCountryAll: "全选", paymentProbeCountryClear: "清除",
   paymentProbeCountryEmpty: "暂无可用的支付探测国家代理", paymentProbeCountryRequired: "请至少选择一个探测国家", paymentProbeStart: "开始探测",
+  paymentProbeUseTrialPromotion: "使用0元优惠", paymentProbeUseTrialPromotionTip: "启用后，Checkout 请求将携带 0 元试用优惠条件",
   paymentProbeUnavailable: "该账户没有可用 Access Token", paymentProbeDone: "账户 {email}：探测到 {count} 种支付方式",
   paymentProbeSummary: "支付探测完成：检测成功 {detected} 个，部分完成 {partial} 个，跳过 {skipped} 个，失败 {failed} 个",
   checkoutProbe: "Checkout探测", checkoutProbing: "探测中...", checkoutProbeNoSelection: "请选择需要探测 Checkout 类型的账户",
@@ -971,6 +972,7 @@ Object.assign(en, {
   paymentProbe: "Payment Probe", paymentProbing: "Probing...", paymentProbeNoSelection: "Select accounts to probe payment methods",
   paymentProbeCountryTitle: "Select Probe Countries", paymentProbeCountryHint: "Choose the country proxies to use for this payment-method probe", paymentProbeCountryAll: "Select All", paymentProbeCountryClear: "Clear",
   paymentProbeCountryEmpty: "No enabled payment-probe country proxies are available", paymentProbeCountryRequired: "Select at least one probe country", paymentProbeStart: "Start Probe",
+  paymentProbeUseTrialPromotion: "Use Free Trial", paymentProbeUseTrialPromotionTip: "Include the free-trial promotion condition in Checkout requests",
   paymentProbeUnavailable: "This account has no usable Access Token", paymentProbeDone: "Account {email}: detected {count} payment methods",
   paymentProbeSummary: "Payment probe complete: {detected} succeeded, {partial} partial, {skipped} skipped, {failed} failed",
   checkoutProbe: "Checkout Probe", checkoutProbing: "Probing...", checkoutProbeNoSelection: "Select accounts to probe Checkout types",
@@ -3931,6 +3933,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
   const [paymentProbeDialog,setPaymentProbeDialog]=useState<{ids:number[];row?:AnyObj}|null>(null);
   const [paymentProbeCountries,setPaymentProbeCountries]=useState<string[]>([]);
   const [paymentProbeCountrySelection,setPaymentProbeCountrySelection]=useState<string[]>([]);
+  const [paymentProbeUseTrialPromotion,setPaymentProbeUseTrialPromotion]=useState(false);
   const [paymentProbeCountriesLoading,setPaymentProbeCountriesLoading]=useState(false);
   const persistentTasks = usePersistentSessionTasks();
   const accountLogs = useAccountLogs();
@@ -4205,6 +4208,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     setPaymentProbeDialog({ids:targetIds,row});
     setPaymentProbeCountries([]);
     setPaymentProbeCountrySelection([]);
+    setPaymentProbeUseTrialPromotion(false);
     setPaymentProbeCountriesLoading(true);
     try {
       const response=await apiFetch("/sunny/sessions/payment-probe/countries");
@@ -4224,13 +4228,14 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     const countries=paymentProbeCountries.filter((country)=>paymentProbeCountrySelection.includes(country));
     if (!countries.length) { notify("fail",t.paymentProbeCountryRequired); return; }
     const target=paymentProbeDialog;
+    const useTrialPromotion=paymentProbeUseTrialPromotion;
     setPaymentProbeCountryPreference(countries);
     setPaymentProbeDialog(null);
-    void runPaymentProbe(target.ids,countries,target.row);
+    void runPaymentProbe(target.ids,countries,useTrialPromotion,target.row);
   }
-  async function runPaymentProbe(ids: number[], countries: string[], row?: AnyObj) {
+  async function runPaymentProbe(ids: number[], countries: string[], useTrialPromotion: boolean, row?: AnyObj) {
     try {
-      const task=await runPersistentSessionTask("payment-probe", ids, row?.email, () => apiFetch("/sunny/sessions/payment-probe",{method:"POST",body:JSON.stringify({session_ids:ids,countries})}));
+      const task=await runPersistentSessionTask("payment-probe", ids, row?.email, () => apiFetch("/sunny/sessions/payment-probe",{method:"POST",body:JSON.stringify({session_ids:ids,countries,use_trial_promotion:useTrialPromotion})}));
       const result=task.result||{};
       if (row) {
         const item=(result.items||[]).find((entry:AnyObj)=>Number(entry.session_id)===Number(row.id));
@@ -4489,17 +4494,19 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     {maintenanceOpen && <MaintenanceSettingsModal t={t} notify={notify} onClose={()=>setMaintenanceOpen(false)}/>}
     {failureDetail && <FailureDetailModal t={t} value={failureDetail} onClose={()=>setFailureDetail(null)}/>}
     {trialCountryDialog && <CountryProbeModal title={t.trialCountryTitle} hint={t.trialCountryHint} empty={t.trialCountryEmpty} start={t.trialStart} t={t} countries={trialCountries} selected={trialCountrySelection} loading={trialCountriesLoading} onToggle={(country)=>setTrialCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setTrialCountrySelection(trialCountries)} onClear={()=>setTrialCountrySelection([])} onClose={()=>setTrialCountryDialog(null)} onConfirm={confirmTrialCountries}/>}
-    {paymentProbeDialog && <PaymentProbeCountryModal t={t} countries={paymentProbeCountries} selected={paymentProbeCountrySelection} loading={paymentProbeCountriesLoading} onToggle={(country)=>setPaymentProbeCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setPaymentProbeCountrySelection(paymentProbeCountries)} onClear={()=>setPaymentProbeCountrySelection([])} onClose={()=>setPaymentProbeDialog(null)} onConfirm={confirmPaymentProbeCountries}/>}
+    {paymentProbeDialog && <PaymentProbeCountryModal t={t} countries={paymentProbeCountries} selected={paymentProbeCountrySelection} useTrialPromotion={paymentProbeUseTrialPromotion} loading={paymentProbeCountriesLoading} onToggle={(country)=>setPaymentProbeCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onToggleTrialPromotion={()=>setPaymentProbeUseTrialPromotion((value)=>!value)} onSelectAll={()=>setPaymentProbeCountrySelection(paymentProbeCountries)} onClear={()=>setPaymentProbeCountrySelection([])} onClose={()=>setPaymentProbeDialog(null)} onConfirm={confirmPaymentProbeCountries}/>}
     <AccountLogFloat t={t} open={accountLogOpen} kind={accountLogKind} logs={accountLogs[accountLogKind] || []} canCancel={cancellableAccountLogTasks.length > 0} cancelling={terminatingAccountLog} onCancel={()=>void terminateAccountLogTasks()} onToggle={()=>setAccountLogOpen((value)=>!value)} onKindChange={setAccountLogKind} onClear={()=>publishAccountLogs({ ...accountLogSnapshot, [accountLogKind]: [] })} />
   </Card>;
 }
 
-function PaymentProbeCountryModal({t,countries,selected,loading,onToggle,onSelectAll,onClear,onClose,onConfirm}:{
+function PaymentProbeCountryModal({t,countries,selected,useTrialPromotion,loading,onToggle,onToggleTrialPromotion,onSelectAll,onClear,onClose,onConfirm}:{
   t:typeof zh;
   countries:string[];
   selected:string[];
+  useTrialPromotion:boolean;
   loading:boolean;
   onToggle:(country:string)=>void;
+  onToggleTrialPromotion:()=>void;
   onSelectAll:()=>void;
   onClear:()=>void;
   onClose:()=>void;
@@ -4508,7 +4515,7 @@ function PaymentProbeCountryModal({t,countries,selected,loading,onToggle,onSelec
   return <PagePortal><div className="sr-modal-mask"><div className="sr-modal sr-payment-country-modal" role="dialog" aria-modal="true" aria-labelledby="payment-probe-country-title">
     <div className="sr-modal-head"><h3 id="payment-probe-country-title">{t.paymentProbeCountryTitle}</h3><button title={t.close} onClick={onClose}><X className="h-5 w-5"/></button></div>
     <div className="sr-modal-body">
-      <div className="sr-payment-country-toolbar"><p>{t.paymentProbeCountryHint}</p><div><button disabled={loading||countries.length===0} onClick={onSelectAll}>{t.paymentProbeCountryAll}</button><button disabled={loading||selected.length===0} onClick={onClear}>{t.paymentProbeCountryClear}</button></div></div>
+      <div className="sr-payment-country-toolbar"><p>{t.paymentProbeCountryHint}</p><div><div className="sr-payment-promo-toggle" title={t.paymentProbeUseTrialPromotionTip}><span>{t.paymentProbeUseTrialPromotion}</span><button type="button" role="switch" aria-checked={useTrialPromotion} aria-label={t.paymentProbeUseTrialPromotion} className={cn("sr-switch-only",useTrialPromotion&&"on")} onClick={onToggleTrialPromotion}><span/></button></div><button disabled={loading||countries.length===0} onClick={onSelectAll}>{t.paymentProbeCountryAll}</button><button disabled={loading||selected.length===0} onClick={onClear}>{t.paymentProbeCountryClear}</button></div></div>
       {loading ? <div className="sr-payment-country-state"><Loader2 className="h-5 w-5 animate-spin"/><span>{t.loadingData}</span></div> : countries.length ? <div className="sr-payment-country-grid">{countries.map((country)=>{
         const checked=selected.includes(country);
         return <label key={country} className={cn("sr-payment-country-option",checked&&"is-selected")}><input type="checkbox" checked={checked} onChange={()=>onToggle(country)}/><span>{country}</span></label>;

@@ -161,7 +161,7 @@ def test_probe_payment_methods_only_runs_checkout_for_requested_country() -> Non
     ):
         result = probe_payment_methods("token", "http://vn-proxy", "VN", "VND")
 
-    checkout_probe.assert_called_once_with("token", "VN", "VND", "http://vn-proxy")
+    checkout_probe.assert_called_once_with("token", "VN", "VND", "http://vn-proxy", False)
     assert result["checkout"]["payment_methods"] == ["card", "momo"]
     assert result["traffic"] == {"requests": 2, "total_bytes": 240}
 
@@ -181,6 +181,14 @@ def test_indonesia_payment_probe_matches_gopay_cs_live_mode() -> None:
     assert options["link_type"] == "gopay"
     assert options["checkout_ui_mode"] == "redirect"
     assert options["use_promo"] is False
+
+
+def test_payment_probe_can_include_free_trial_promotion() -> None:
+    options = _checkout_probe_options("JP", "JPY", True)
+    assert options["use_promo"] is True
+    assert options["promo_campaign"] == "plus-1-month-free"
+    assert options["promo_on_create"] is True
+    assert options["promo_from_query_param"] is True
 
 
 def test_local_stripe_payment_countries_use_hosted_checkout_mode() -> None:
@@ -218,11 +226,16 @@ def test_task_style_probe_reads_stripe_init_and_elements_payment_methods() -> No
     })
 
     with patch.dict("sys.modules", {"app": app, "stripe_checkout": stripe}):
-        result = _task_style_checkout_probe("token", "PL", "PLN", "http://pl-proxy")
+        result = _task_style_checkout_probe("token", "PL", "PLN", "http://pl-proxy", True)
 
     assert result["kind"] == "cs_live"
     assert result["payment_methods"] == ["card", "blik", "p24"]
     app.checkout_payload.assert_called_once()
+    probe_options = app.checkout_payload.call_args.args[0]
+    assert probe_options["use_promo"] is True
+    assert probe_options["promo_campaign"] == "plus-1-month-free"
+    assert probe_options["promo_on_create"] is True
+    assert probe_options["promo_from_query_param"] is True
     stripe.init_checkout.assert_called_once()
     stripe.fetch_elements_session.assert_called_once()
     http.close.assert_called_once()
