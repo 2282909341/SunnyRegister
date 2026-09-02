@@ -33,7 +33,6 @@ IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
 XBOVO_API_BASE_URL = os.getenv("XBOVO_ICLOUD_API_BASE_URL", "https://icloud.xbovo.online").rstrip("/")
-ICMEIGO_API_BASE_URL = os.getenv("ICMEIGO_ICLOUD_API_BASE_URL", "https://ic.meiguo.lol").rstrip("/")
 
 
 def _int_env(name: str, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -56,13 +55,8 @@ URL_API_MAX_RESPONSE_BYTES = 1 << 20
 URL_API_MAX_CONCURRENT_REQUESTS = _int_env("URL_API_ICLOUD_MAX_CONCURRENCY", 3, 1, 20)
 URL_API_QUEUE_TIMEOUT = _int_env("URL_API_ICLOUD_QUEUE_TIMEOUT", 30, 5, 300)
 URL_API_POLL_JITTER_SECONDS = 1.5
-ICMEIGO_REQUEST_TIMEOUT = max(30, int(os.getenv("ICMEIGO_ICLOUD_REQUEST_TIMEOUT", "35") or 35))
-ICMEIGO_POLL_INTERVAL_SECONDS = max(3, int(os.getenv("ICMEIGO_ICLOUD_POLL_INTERVAL", "4") or 4))
-ICMEIGO_MAX_CONCURRENT_REQUESTS = _int_env("ICMEIGO_ICLOUD_MAX_CONCURRENCY", 3, 1, 20)
-ICMEIGO_QUEUE_TIMEOUT = _int_env("ICMEIGO_ICLOUD_QUEUE_TIMEOUT", 30, 5, 300)
 _XBOVO_REQUEST_GATE = threading.BoundedSemaphore(XBOVO_MAX_CONCURRENT_REQUESTS)
 _URL_API_REQUEST_GATE = threading.BoundedSemaphore(URL_API_MAX_CONCURRENT_REQUESTS)
-_ICMEIGO_REQUEST_GATE = threading.BoundedSemaphore(ICMEIGO_MAX_CONCURRENT_REQUESTS)
 
 
 class MailboxAccessError(RuntimeError):
@@ -1233,218 +1227,6 @@ class XbovoICloudReader:
         raise TimeoutError("Timed out waiting for OpenAI email OTP")
 
 
-class IcMeiGoICloudReader:
-    """ic.meigo.lol iCloud hidden-mailbox adapter implementing the mailbox reader contract.
-
-    Every API key owns one generated hidden email (``xxx@icloud.com``). The reader asks
-    ``POST /api/hme/mail {email, format:text}`` with ``Authorization: Bearer <key>`` for the
-    newest message body, then extracts the 6-digit OpenAI OTP. A 404 while no mail has arrived is
-    treated as "keep waiting"; 401/403 means the API key is invalid.
-    """
-
-    def __init__(self, account: MailAccount, log: Callable[[str], None] | None, proxy_url: str = ""):
-        self.account = account
-        self.log = log or (lambda _m: None)
-        self.proxy_url = proxy_url
-        self.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        self.seen_codes: set[str] = set()
-
-    def _request_mail(self, timeout: int = ICMEIGO_REQUEST_TIMEOUT) -> dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {self.account.access_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        body = json.dumps({"email": self.account.email, "format": "text"}, ensure_ascii=False)
-        acquired = _ICMEIGO_REQUEST_GATE.acquire(timeout=ICMEIGO_QUEUE_TIMEOUT)
-        if not acquired:
-            raise MailboxAccessError(
-                "mailbox_provider_busy",
-                "iCloud 邮箱渠道当前请求较多，请稍后重试",
-                f"local concurrency queue timed out after {ICMEIGO_QUEUE_TIMEOUT}s",
-            )
-        response = None
-        try:
-            for attempt in range(3):
-                try:
-                    response = requests.post(
-                        f"{ICMEIGO_API_BASE_URL}/api/hme/mail",
-                        headers=headers,
-                        data=body,
-                        timeout=timeout,
-                        proxies=self.proxies,
-                    )
-                    break
-                except requests.RequestException as exc:
-                    response = None
-                    if attempt >= 2:
-                        raise MailboxAccessError(
-                            "mailbox_network_error",
-                            "iCloud 邮箱渠道连接超时或网络不可达，请检查服务器出网与代理配置",
-                            str(exc),
-                        ) from exc
-                    time.sleep(0.4 * (attempt + 1) + random.uniform(0, 0.4))
-            status = int(getattr(response, "status_code", 0) or 0)
-            if status == 404:
-                # No mail has arrived for this hidden mailbox yet.
-                return {"empty": True}
-            if status in {401, 403}:
-                body_code = ""
-                try:
-                    body_payload = response.json() if getattr(response, "text", "") else {}
-                    if isinstance(body_payload, dict):
-                        body_code = str(body_payload.get("code") or "")
-                except (ValueError, json.JSONDecodeError):
-                    body_code = ""
-                if body_code == "HISTORY_ACCESS_DISABLED":
-                    # 该邮箱已被释放：ic.meigo 关闭了已释放邮箱的查询能力，邮箱无法
-                    # 再收信。这不代表卡密 Key 无效，不能据此停用邮箱行（账号可能
-                    # 已设置密码+2FA，登录不再依赖邮箱）。
-                    raise MailboxAccessError(
-                        "mailbox_history_disabled",
-                        "ic.meigo 邮箱已释放，无法再收取新邮件（已释放邮箱的查询被服务端关闭）",
-                        f"HTTP {status}",
-                    )
-                raise MailboxAccessError(
-                    "mailbox_credential_invalid",
-                    "iCloud 邮箱查询 Key 无效，请检查 ic.meigo.lol 卡密",
-                    f"HTTP {status}",
-                    terminal=True,
-                )
-            if status in {429, 503}:
-                raise MailboxAccessError(
-                    "mailbox_provider_busy",
-                    "iCloud 邮箱渠道当前请求较多，请稍后重试",
-                    f"HTTP {status}",
-                )
-            if not (getattr(response, "ok", False) or status == 200):
-                raise MailboxAccessError(
-                    "mailbox_provider_failed",
-                    "iCloud 邮箱渠道请求失败，请稍后重试",
-                    f"HTTP {status}",
-                )
-            try:
-                payload = response.json() if getattr(response, "text", "") else {}
-            except (ValueError, json.JSONDecodeError) as exc:
-                raise MailboxAccessError(
-                    "mailbox_service_response_invalid",
-                    "iCloud 邮箱渠道返回了无法解析的响应，请稍后重试",
-                    str(exc),
-                ) from exc
-            return payload if isinstance(payload, dict) else {}
-        finally:
-            if response is not None:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-            _ICMEIGO_REQUEST_GATE.release()
-
-    def connect(self, access_token: str | None = None) -> None:
-        if self.account.mailbox_channel != "icmeigo":
-            raise MailboxAccessError("mailbox_channel_unsupported", "暂不支持该 iCloud 邮箱渠道", self.account.mailbox_channel, terminal=True)
-        self.log(f"[{self.account.email}] Connecting ic.meigo.lol iCloud mailbox API for OTP")
-        try:
-            self._request_mail(timeout=10)
-        except MailboxAccessError as exc:
-            if exc.terminal:
-                raise
-            self.log(
-                f"[{self.account.email}] ic.meigo.lol 启动连通检查暂时失败，将在验证码阶段继续重试：{str(exc)[:180]}"
-            )
-            return
-        self.log(f"[{self.account.email}] ic.meigo.lol iCloud mailbox API connected")
-
-    def close(self) -> None:
-        return None
-
-    def latest_message(self) -> dict[str, Any]:
-        payload = self._request_mail()
-        if payload.get("empty"):
-            return {"email": self.account.email, "empty": True, "source": "icmeigo"}
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        content = str(data.get("content") or data.get("html_content") or "").strip()
-        plain = _html_to_text(content)
-        candidates = extract_otp_candidates(content)
-        candidate = candidates[0] if candidates else None
-        otp = str(candidate.get("code") or "") if candidate else ""
-        subject = str(data.get("subject") or "").strip()
-        relevant = bool(re.search(r"openai|chatgpt", subject + "\n" + plain, flags=re.I))
-        return {
-            "id": str(data.get("id") or ""),
-            "email": self.account.email,
-            "folder": "iCloud",
-            "subject": subject or ("ChatGPT" if relevant else "Latest iCloud mail"),
-            "from": str(data.get("from") or ""),
-            "to": str(data.get("to") or self.account.email),
-            "date": str(data.get("received_at") or ""),
-            "body": plain,
-            "body_preview": plain[:500],
-            "raw_html": content,
-            "otp": otp,
-            "otp_key": str(candidate.get("key") or "") if candidate else "",
-            "otp_candidates": candidates,
-            "source": "icmeigo",
-        }
-
-    @staticmethod
-    def _code_email_is_fresh(message: dict[str, Any], min_timestamp: float) -> bool:
-        """邮件必须在本次发码之后到达才可接受。
-
-        复用上一次尝试的旧验证码会被 OpenAI 以 Wrong code(HTTP 401) 拒绝，
-        尤其 resume/自动重试场景下，上一次的旧码邮件仍可能是邮箱里最新的一封，
-        新验证码尚未到达前必须继续等待而不是直接取旧码。
-        """
-        try:
-            received = datetime.fromisoformat(str(message.get("date") or "").replace("Z", "+00:00")).timestamp()
-        except Exception:
-            received = time.time()
-        return received + 30 >= float(min_timestamp or 0)
-
-    def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
-        started = time.monotonic()
-        last_notice = 0.0
-        last_error_notice = 0.0
-        while time.monotonic() - started < timeout:
-            remaining = max(1, int(timeout - (time.monotonic() - started)))
-            try:
-                message = self.latest_message()
-            except MailboxAccessError as exc:
-                if exc.terminal:
-                    raise
-                if time.monotonic() - last_error_notice >= 15:
-                    self.log(f"[{self.account.email}] ic.meigo.lol iCloud 临时不可用，将继续等待验证码：{str(exc)[:180]}")
-                    last_error_notice = time.monotonic()
-                time.sleep(min(ICMEIGO_POLL_INTERVAL_SECONDS, max(0.0, remaining)))
-                continue
-            if message.get("empty"):
-                if time.monotonic() - last_notice >= 20:
-                    self.log(f"[{self.account.email}] Still waiting for OpenAI email OTP via ic.meigo.lol, about {remaining}s left")
-                    last_notice = time.monotonic()
-                time.sleep(min(ICMEIGO_POLL_INTERVAL_SECONDS, max(0.0, remaining)))
-                continue
-            code = str(message.get("otp") or "").strip()
-            if re.fullmatch(r"\d{6}", code) and code not in self.seen_codes:
-                if not self._code_email_is_fresh(message, min_timestamp):
-                    # 只可能是上一次尝试留下的旧验证码邮件：新邮件尚未到达，继续等
-                    self.seen_codes.add(code)
-                    if time.monotonic() - last_notice >= 20:
-                        self.log(f"[{self.account.email}] 邮箱里只有旧验证码邮件，继续等待本次新验证码，about {remaining}s left")
-                        last_notice = time.monotonic()
-                    time.sleep(min(ICMEIGO_POLL_INTERVAL_SECONDS, max(0.0, remaining)))
-                    continue
-                self.seen_codes.add(code)
-                self.log(f"[{self.account.email}] Received OpenAI OTP from ic.meigo.lol iCloud API ({len(code)} digits, redacted)")
-                return code
-            if code:
-                self.seen_codes.add(code)
-                self.log(f"[{self.account.email}] ic.meigo.lol returned a non-OpenAI code; ignored and continuing to wait")
-            if time.monotonic() - last_notice >= 20:
-                self.log(f"[{self.account.email}] Still waiting for OpenAI email OTP via ic.meigo.lol, about {remaining}s left")
-                last_notice = time.monotonic()
-            time.sleep(min(ICMEIGO_POLL_INTERVAL_SECONDS, max(0.0, remaining)))
-        raise TimeoutError("Timed out waiting for OpenAI email OTP")
-
-
 class RemailReader:
     """Remail order/pickup adapter. Every Remail domain uses this API channel."""
 
@@ -2150,8 +1932,6 @@ def create_mailbox_reader(account: MailAccount, log: Callable[[str], None] | Non
             return XbovoICloudReader(account, log, proxy_url)
         if account.mailbox_channel == "url_api":
             return URLAPIICloudReader(account, log, proxy_url)
-        if account.mailbox_channel == "icmeigo":
-            return IcMeiGoICloudReader(account, log, proxy_url)
         raise MailboxAccessError("mailbox_channel_unsupported", "暂不支持该 iCloud 邮箱渠道", account.mailbox_channel, terminal=True)
     return HotmailReader(account, log, proxy_url)
 

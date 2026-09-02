@@ -137,90 +137,6 @@ class RemailMailboxProvisioner:
         return mailbox
 
 
-class IcMeigoMailboxProvisioner:
-    """Release a completed mailbox and refill the same card slot."""
-
-    def __init__(self, db: SunnyDB, payload: dict[str, Any]):
-        self.db = db
-        self.base_url = str(os.getenv("ICMEIGO_API_BASE_URL") or "https://ic.meiguo.lol").rstrip("/")
-        self.remaining = {str(key): max(0, int(value or 0)) for key, value in (payload.get("icmeigo_remaining_quota") or {}).items()}
-
-    def _post(self, key: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = requests.post(
-                self.base_url + path,
-                headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
-                json=body,
-                timeout=30,
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(f"ic.meigo 请求失败：{exc}") from exc
-        try:
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {}
-            if not response.ok:
-                detail = payload.get("message") or payload.get("error") or payload.get("code") or response.text[:300]
-                raise RuntimeError(f"ic.meigo HTTP {response.status_code}：{detail}")
-            return payload if isinstance(payload, dict) else {}
-        finally:
-            response.close()
-
-    def rotate(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
-        self.db.ensure_not_cancelled()
-        key = str(mailbox.get("access_key") or "").strip()
-        email = str(mailbox.get("email") or "").strip()
-        mailbox_id = int(mailbox.get("id") or 0)
-        if not key or not email or mailbox_id <= 0:
-            raise RuntimeError("ic.meigo 邮箱资料不完整")
-        release_payload = self._post(key, "/api/hme/release-all", {"email": email})
-        release_data = release_payload.get("data") if isinstance(release_payload.get("data"), dict) else {}
-        if int(release_data.get("success") or 0) < 1 and int(release_data.get("pending") or 0) < 1:
-            raise RuntimeError("ic.meigo 未确认邮箱释放成功")
-        self.db.mark_icmeigo_released(mailbox_id)
-        self.db.event(f"[{email}] [邮箱] 密码与2FA已完成，已自动释放 ic.meigo 并发槽", detail={"email": email, "scope": "selected", "mailbox_id": mailbox_id})
-        if self.remaining.get(key, 0) <= 0:
-            return None
-        payload = self._post(key, "/api/hme/generate", {})
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        next_email = str((data or {}).get("email") or "").strip()
-        if not next_email:
-            raise RuntimeError("ic.meigo 生成邮箱的响应中没有 email")
-        self.remaining[key] -= 1
-        created = self.db.create_icmeigo_mailbox(next_email, key, int(mailbox.get("group_id") or 0))
-        self.db.event(f"[{next_email}] [邮箱] 已自动补位生成下一个 ic.meigo 邮箱", detail={"email": next_email, "scope": "selected", "mailbox_id": created.get("id")})
-        return created
-
-    def refill_after_failure(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
-        """注册失败时不释放并发槽，直接从同一卡密额度补位生成一个新邮箱继续任务。
-
-        失败邮箱保留原状态（不释放、不删除），可在后续任务或手动直接重试；其卡密
-        额度已在生成时消耗，本次补位再从剩余额度中消耗一个。避免单次偶发失败（如
-        验证码读取/页面时序）卡死整条流水的未完成数量。
-        """
-        self.db.ensure_not_cancelled()
-        key = str(mailbox.get("access_key") or "").strip()
-        email = str(mailbox.get("email") or "").strip()
-        mailbox_id = int(mailbox.get("id") or 0)
-        group_id = int(mailbox.get("group_id") or 0)
-        if not key or not email:
-            raise RuntimeError("ic.meigo 失败邮箱资料不完整，无法补位")
-        if self.remaining.get(key, 0) <= 0:
-            return None
-        payload = self._post(key, "/api/hme/generate", {})
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        next_email = str((data or {}).get("email") or "").strip()
-        if not next_email:
-            raise RuntimeError("ic.meigo 生成邮箱的响应中没有 email")
-        self.remaining[key] -= 1
-        created = self.db.create_icmeigo_mailbox(next_email, key, group_id)
-        self.db.event(
-            f"[{email}] [邮箱] 注册失败邮箱已保留待重试，已从卡密额度补位生成下一个 ic.meigo 邮箱 {next_email}",
-            detail={"email": email, "scope": "selected", "mailbox_id": mailbox_id, "replacement_email": next_email, "failed_kept": True},
-        )
-        return created
-
 _REGISTRATION_PROGRESS_STEPS = {
     "initializing": 1,
     "proxy_ready": 2,
@@ -2686,7 +2602,8 @@ def _register_pacing_range(payload: dict[str, Any]) -> tuple[float, float]:
     """Random pause range between two registrations (anti batch-correlation).
 
     Honors payload overrides (register_pacing_min_sec/max_sec) before
-    SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC env vars; defaults to 8-25 seconds.
+    SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC env vars; defaults to a light 3-8s jitter
+    that breaks mechanical rhythm without materially slowing a batch.
     Set both to 0 to disable pacing entirely.
     """
 
@@ -2704,8 +2621,8 @@ def _register_pacing_range(payload: dict[str, Any]) -> tuple[float, float]:
         except (TypeError, ValueError):
             return default
 
-    low = _number(payload.get("register_pacing_min_sec"), _env_float("SUNNY_REGISTER_PACING_MIN_SEC", 8.0))
-    high = _number(payload.get("register_pacing_max_sec"), _env_float("SUNNY_REGISTER_PACING_MAX_SEC", 25.0))
+    low = _number(payload.get("register_pacing_min_sec"), _env_float("SUNNY_REGISTER_PACING_MIN_SEC", 3.0))
+    high = _number(payload.get("register_pacing_max_sec"), _env_float("SUNNY_REGISTER_PACING_MAX_SEC", 8.0))
     if high < low:
         high = low
     return low, high
@@ -3910,13 +3827,12 @@ def run_sunny_task(task_id: str) -> None:
 
         identity = str(payload.get("identity") or "").strip().lower()
         is_remail_task = identity == "remail"
-        is_icmeigo_task = identity == "icmeigo" and payload.get("icmeigo_auto") is True
         requested_total = max(1, int(payload.get("count") or 1))
         existing_remail_ids = _ids(payload.get("mailbox_ids")) if is_remail_task else []
         mailboxes = db.fetch_mailboxes(existing_remail_ids) if existing_remail_ids else ([] if is_remail_task else _choose_mailboxes(db, payload))
         if not is_remail_task and not mailboxes:
             raise RuntimeError("邮箱配置不可用：请先导入并启用 Outlook 邮箱池")
-        total = requested_total if is_remail_task or is_icmeigo_task else len(mailboxes)
+        total = requested_total if is_remail_task else len(mailboxes)
         stage = _stage(payload)
         provider_stop_reason = str(payload.get("provider_stop_reason") or "").strip()
         db.update_task(progress_total=total)
@@ -3955,7 +3871,6 @@ def run_sunny_task(task_id: str) -> None:
             db.update_task(progress_current=completed, success_count=success, error_count=len(errors))
 
         provisioner = RemailMailboxProvisioner(db) if is_remail_task and len(mailboxes) < total and not provider_stop_reason else None
-        icmeigo = IcMeigoMailboxProvisioner(db, payload) if is_icmeigo_task else None
 
         def purchase(sequence: int) -> dict[str, Any] | None:
             nonlocal provider_stop_reason
@@ -3971,78 +3886,7 @@ def run_sunny_task(task_id: str) -> None:
                 db.event(f"[Remail] {provider_stop_reason}", "error", detail={"scope": "global", "provider": "remail", "sequence": sequence})
                 return None
 
-        if icmeigo is not None:
-            queue = list(mailboxes)
-            sequence = 0
-
-            def rotate(mailbox: dict[str, Any], ok: bool) -> None:
-                nonlocal provider_stop_reason
-                if provider_stop_reason:
-                    return
-                try:
-                    if ok:
-                        replacement = icmeigo.rotate(mailbox)
-                    else:
-                        # 失败不阻断整条流水线：失败邮箱保留供重试，同时从同一卡密
-                        # 额度补位生成一个新邮箱继续注册未完成的数量。
-                        replacement = icmeigo.refill_after_failure(mailbox)
-                except Exception as exc:
-                    provider_stop_reason = f"ic.meigo 自动补位停止：{exc}"
-                    db.event(f"[系统] {provider_stop_reason}", "error", detail={"scope": "global", "provider": "icmeigo"})
-                    return
-                if replacement is not None:
-                    queue.append(replacement)
-
-            if concurrency <= 1:
-                while queue and completed < total:
-                    db.ensure_not_cancelled()
-                    sequence += 1
-                    if sequence > 1:
-                        _pacing_delay(db, payload)
-                    mailbox = queue.pop(0)
-                    ok, result = _run_one(db, task_type, payload, mailbox, sequence, total, protocol_batch_policy)
-                    db.ensure_not_cancelled()
-                    record_result(ok, result)
-                    rotate(mailbox, ok)
-            else:
-                pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sunny-register")
-                try:
-                    pending: dict[Any, dict[str, Any]] = {}
-
-                    def submit_icmeigo() -> bool:
-                        nonlocal sequence
-                        if not queue or sequence >= total or provider_stop_reason:
-                            return False
-                        sequence += 1
-                        mailbox = queue.pop(0)
-                        future = pool.submit(_run_one_isolated, db.task_id, task_type, payload, mailbox, sequence, total, protocol_batch_policy)
-                        pending[future] = mailbox
-                        return True
-
-                    while len(pending) < concurrency and submit_icmeigo():
-                        pass
-                    while pending:
-                        db.ensure_not_cancelled()
-                        done, _ = wait(set(pending), timeout=0.5, return_when=FIRST_COMPLETED)
-                        if not done:
-                            continue
-                        for future in done:
-                            mailbox = pending.pop(future)
-                            try:
-                                _idx, ok, result = future.result()
-                            except Exception as exc:
-                                ok, result = False, f"parallel worker failed: {exc}"
-                            record_result(ok, result)
-                            rotate(mailbox, ok)
-                            if queue:
-                                _pacing_delay(db, payload)
-                        while len(pending) < concurrency and submit_icmeigo():
-                            pass
-                finally:
-                    pool.shutdown(wait=True, cancel_futures=True)
-            if completed < total and not provider_stop_reason:
-                provider_stop_reason = f"ic.meigo 未完成全部额度：已处理 {completed}/{total}；失败邮箱已保留，可直接重试"
-        elif concurrency <= 1:
+        if concurrency <= 1:
             source = range(1, total + 1) if is_remail_task else enumerate(mailboxes, start=1)
             for entry in source:
                 db.ensure_not_cancelled()
@@ -4118,9 +3962,9 @@ def run_sunny_task(task_id: str) -> None:
         skipped_phone = len([x for x in items if x.get("phone_skipped_reason")])
         imported = len([x for x in items if x.get("sub2api")])
         partial = len([x for x in items if x.get("stage_complete") is False])
-        status = "failed" if provider_stop_reason or not success or (is_icmeigo_task and errors) else "succeeded"
+        status = "failed" if provider_stop_reason or not success else "succeeded"
         summary = {"success": success, "failed": len(errors), "partial": partial, "registered": registered, "logged_in": logged_in, "skipped_phone": skipped_phone, "imported": imported, "stage": stage, "errors": errors, "items": items, "provider_stop_reason": provider_stop_reason}
-        task_error = provider_stop_reason or ("; ".join(errors[:3]) if not success or is_icmeigo_task else "")
+        task_error = provider_stop_reason or ("; ".join(errors[:3]) if not success else "")
         db.update_task(status=status, error=task_error, result_json=json.dumps(summary, ensure_ascii=False), finished_at=now_sql())
         summary_message = f"注册任务总结：成功 {success}，失败 {len(errors)}，阶段未完成 {partial}，新注册 {registered}，登录更新 {logged_in}，跳过接码 {skipped_phone}，导入反代 {imported}"
         if provider_stop_reason:

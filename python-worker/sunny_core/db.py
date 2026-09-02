@@ -749,41 +749,6 @@ class SunnyDB:
         self._hydrate_mailbox_auth(item)
         return item
 
-    def create_icmeigo_mailbox(self, email: str, access_key: str, group_id: int) -> dict[str, Any]:
-        stamp = now_sql()
-        row = self.conn.execute("select id from sunny_mailboxes where lower(email)=lower(?)", (email,)).fetchone()
-        raw = f"{email}----{access_key}"
-        if row:
-            mailbox_id = int(row["id"])
-            self.conn.execute(
-                "update sunny_mailboxes set group_id=?,mailbox_type='apple',mailbox_channel='icmeigo',access_key=?,raw=?,status='未注册',enabled=1,last_error='',updated_at=? where id=?",
-                (group_id, access_key, raw, stamp, mailbox_id),
-            )
-        else:
-            values = (group_id, email, "apple", "icmeigo", access_key, raw, "free", "unknown", "未注册", True, "{}", stamp, stamp)
-            sql = "insert into sunny_mailboxes(group_id,email,mailbox_type,mailbox_channel,access_key,raw,account_type,trial_eligibility,status,enabled,latest_mail_json,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            if self.postgres:
-                mailbox_id = int(self.conn.execute(sql + " returning id", values).fetchone()["id"])
-            else:
-                mailbox_id = int(self.conn.execute(sql, values).lastrowid)
-        task = self.task()
-        payload = json.loads(task.get("payload_json") or "{}")
-        ids = [int(value) for value in payload.get("mailbox_ids") or [] if int(value or 0) > 0]
-        if mailbox_id not in ids:
-            ids.append(mailbox_id)
-            payload["mailbox_ids"] = ids
-            self.conn.execute("update tasks set payload_json=?,updated_at=? where id=?", (json.dumps(payload, ensure_ascii=False), stamp, self.task_id))
-        self.conn.commit()
-        mailbox = self.conn.execute("select * from sunny_mailboxes where id=?", (mailbox_id,)).fetchone()
-        return dict(mailbox)
-
-    def mark_icmeigo_released(self, mailbox_id: int) -> None:
-        self.conn.execute(
-            "update sunny_mailboxes set enabled=0,status='已注册',last_error='',updated_at=? where id=?",
-            (now_sql(), mailbox_id),
-        )
-        self.conn.commit()
-
     def _hydrate_mailbox_auth(self, mailbox: dict[str, Any]) -> None:
         """Fill mailbox OpenAI RT from account/session tables when the mailbox row is stale."""
         original_email = str(mailbox.pop("_original_email_for_auth", "") or "").strip()

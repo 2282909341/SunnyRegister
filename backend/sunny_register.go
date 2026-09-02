@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -67,15 +65,6 @@ func (s *Server) handleSunny(w http.ResponseWriter, r *http.Request, rest string
 	case "remail":
 		s.remailConfigHandler(w, r, parts[1:])
 		return
-	case "icmeigo":
-		if len(parts) == 2 && parts[1] == "summary" && r.Method == http.MethodGet {
-			s.sunnyIcMeigoSummary(w)
-			return
-		}
-		if len(parts) == 3 && parts[1] == "cards" && r.Method == http.MethodDelete {
-			s.sunnyRemoveIcMeigoCard(w, parts[2])
-			return
-		}
 	case "domain-mail":
 		s.domainMailboxConfigHandler(w, r, parts[1:])
 		return
@@ -1234,7 +1223,7 @@ func (s *Server) sunnyMailboxFromBody(body map[string]any) (SunnyMailbox, error)
 		return SunnyMailbox{}, fmt.Errorf("%s", sunnyMailboxFormatHint(mailboxType, mailboxChannel))
 	}
 	if mailboxType == "apple" {
-		if mailboxChannel != "xbovo" && mailboxChannel != "url_api" && mailboxChannel != "icmeigo" {
+		if mailboxChannel != "xbovo" && mailboxChannel != "url_api" {
 			return SunnyMailbox{}, fmt.Errorf("暂不支持该 iCloud 邮箱渠道")
 		}
 		if mailboxChannel == "url_api" && accessKey != "" {
@@ -1287,9 +1276,6 @@ func normalizeSunnyMailboxChannel(mailboxType, value string) string {
 		}
 		if normalized == "url_api" || normalized == "url-api" {
 			return "url_api"
-		}
-		if normalized == "icmeigo" || normalized == "ic.meigo" || normalized == "meiguo" {
-			return "icmeigo"
 		}
 		return normalized
 	}
@@ -1683,7 +1669,7 @@ func parseSunnyMailboxLineForProvider(raw, mailboxType, channel string) (map[str
 		return parseSunnyMailboxLine(raw)
 	}
 	normalizedChannel := normalizeSunnyMailboxChannel(mailboxType, channel)
-	if normalizedChannel != "xbovo" && normalizedChannel != "url_api" && normalizedChannel != "icmeigo" {
+	if normalizedChannel != "xbovo" && normalizedChannel != "url_api" {
 		return nil, fmt.Errorf("暂不支持该苹果邮箱渠道")
 	}
 	if normalizedChannel == "url_api" {
@@ -1712,11 +1698,6 @@ func (s *Server) sunnyImportMailboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	if gid == 0 {
 		gid = s.sunnyEnsureDefaultGroup()
-	}
-	if mailboxType == "apple" && mailboxChannel == "icmeigo" {
-		imported, bad, notes := s.importIcMeiGoCards(text(body["lines"]), gid)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported, "failed": len(bad), "errors": bad, "notes": notes})
-		return
 	}
 	lines := strings.Split(text(body["lines"]), "\n")
 	ok, bad := 0, []string{}
@@ -1775,113 +1756,6 @@ func (s *Server) sunnyImportMailboxes(w http.ResponseWriter, r *http.Request) {
 		ok++
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "imported": ok, "failed": len(bad), "errors": bad})
-}
-
-// importIcMeiGoCards expands ic.meigo.lol redeem codes (one per line) into mailbox rows.
-// For each code it queries the quota, then generates that many hidden mailboxes. A mailbox
-// must stay unreleased while its registration is in progress — released mailboxes can no
-// longer receive mail (HISTORY_ACCESS_DISABLED) — so generation stops when the card's
-// concurrency budget is full. A card's concurrency slot is freed by releasing a mailbox of
-// the same key whose account already has ChatGPT password + TOTP set (login then works
-// without the mailbox), letting multi-quota cards expand one mailbox per completed account.
-func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string, []string) {
-	client := icmeigoHTTPClient("")
-	imported := 0
-	bad := []string{}
-	notes := []string{}
-	seenKey := map[string]bool{}
-	for _, raw := range strings.Split(linesText, "\n") {
-		key := strings.TrimSpace(raw)
-		if key == "" || strings.HasPrefix(key, "===") || strings.HasPrefix(strings.ToLower(key), "http") || strings.Contains(key, "@") || strings.Contains(key, "----") {
-			continue
-		}
-		if seenKey[key] {
-			continue
-		}
-		seenKey[key] = true
-		quota, err := icmeigoQuota(client, key)
-		if err != nil {
-			bad = append(bad, key+" => "+err.Error())
-			continue
-		}
-		total := intValue(quota["remaining_quota"], 0)
-		if total < 1 {
-			bad = append(bad, key+" => 兑换码额度为 0，可能已用尽")
-			continue
-		}
-		generated := 0
-		cardErr := ""
-		releaseTries := 0
-		releaseLimit := intValue(quota["total_concurrency"], 1)
-		if releaseLimit < 1 {
-			releaseLimit = 1
-		}
-		for generated < total {
-			email, genErr := icmeigoGenerate(client, key)
-			if genErr != nil {
-				// 并发已满：先释放该卡名下密码+2FA 已齐全（登录不再依赖邮箱）的
-				// 邮箱腾出并发槽；释放成功则重试生成，否则优雅停止并提示。
-				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" && releaseTries < releaseLimit && s.releaseIcMeiGoCompletedMailbox(client, key) {
-					releaseTries++
-					continue
-				}
-				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" {
-					notes = append(notes, fmt.Sprintf("%s => 已生成 %d 个邮箱；卡密并发已满（每个 Key 同时只能有 1 个邮箱收信）。等当前邮箱完成注册并设置密码+2FA 后，重新导入此卡即可继续生成下一个", key, generated))
-					break
-				}
-				cardErr = genErr.Error()
-				break
-			}
-			if err := s.upsertIcMeiGoMailbox(gid, email, key); err != nil {
-				cardErr = err.Error()
-				break
-			}
-			imported++
-			generated++
-		}
-		if cardErr != "" {
-			bad = append(bad, key+" => 已生成 "+fmt.Sprintf("%d", generated)+" 个邮箱后失败："+cardErr)
-		}
-	}
-	return imported, bad, notes
-}
-
-// releaseIcMeiGoCompletedMailbox frees the concurrency slot of one mailbox on
-// this key whose account already has ChatGPT password + TOTP configured, so
-// future logins no longer depend on mailbox mail. Returns true when a mailbox
-// was released.
-func (s *Server) releaseIcMeiGoCompletedMailbox(client *http.Client, key string) bool {
-	var m SunnyMailbox
-	err := s.db.Where(
-		"mailbox_channel = ? AND access_key = ? AND enabled = ? AND COALESCE(chat_gpt_password,'') <> '' AND COALESCE(totp_secret,'') <> ''",
-		"icmeigo", key, true,
-	).Order("updated_at asc").First(&m).Error
-	if err != nil {
-		return false
-	}
-	if icmeigoReleaseMailbox(client, key, m.Email) != nil {
-		return false
-	}
-	return s.db.Model(&m).Updates(map[string]any{
-		"enabled": false, "status": "已注册", "last_error": "", "updated_at": time.Now(),
-	}).Error == nil
-}
-
-func (s *Server) upsertIcMeiGoMailbox(gid uint, email, accessKey string) error {
-	var old SunnyMailbox
-	if err := s.db.Where("lower(email) = ?", strings.ToLower(email)).First(&old).Error; err == nil {
-		updates := map[string]any{
-			"group_id": gid, "mailbox_type": "apple", "mailbox_channel": "icmeigo",
-			"access_key": accessKey, "raw": email + "----" + accessKey, "enabled": true,
-		}
-		return s.db.Model(&old).Updates(updates).Error
-	}
-	m := SunnyMailbox{
-		GroupID: gid, Email: email, MailboxType: "apple", MailboxChannel: "icmeigo",
-		AccessKey: accessKey, Raw: email + "----" + accessKey, AccountType: "free",
-		Status: "未注册", Enabled: true, LatestMailJSON: "{}",
-	}
-	return s.db.Create(&m).Error
 }
 
 func (s *Server) sunnyReadImportBody(r *http.Request) map[string]any {
@@ -1950,8 +1824,6 @@ func (s *Server) sunnyLatestMail(w http.ResponseWriter, r *http.Request, m *Sunn
 			payload, err = fetchURLAPILatestMail(m.Email, m.AccessKey, limit, proxyURL)
 		case "xbovo":
 			payload, err = fetchXbovoLatestMail(m.Email, m.AccessKey, limit, proxyURL)
-		case "icmeigo":
-			payload, err = fetchIcMeiGoLatestMail(m.Email, m.AccessKey, limit, proxyURL)
 		default:
 			err = &outlookMailError{Code: "mailbox_channel_unsupported", Category: "format", HTTPStatus: http.StatusUnprocessableEntity, UserMessage: "暂不支持该 iCloud 邮箱渠道", Terminal: true}
 		}
@@ -5889,13 +5761,6 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 		return
 	}
 	if typ == "sunny_register" {
-		if strings.EqualFold(strings.TrimSpace(text(body["identity"])), "icmeigo") {
-			if err := s.sunnyPrepareIcMeigoTask(body); err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-		}
-		s.sunnyRequireIcMeigoLoginSecret(body)
 		identity := strings.ToLower(strings.TrimSpace(text(body["identity"])))
 		if identity == "remail" {
 			if err := s.validateRemailRegistration(body); err != nil {
@@ -5976,9 +5841,6 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 		}
 	}
 	total := len(uintSlice(body["mailbox_ids"])) + len(uintSlice(body["account_ids"]))
-	if typ == "sunny_register" && boolValue(body["icmeigo_auto"], false) {
-		total = intValue(body["count"], total)
-	}
 	if typ == "sunny_refresh_session" || typ == "sunny_acquire_rt" || typ == "sunny_add_ls" || typ == "sunny_sub2_import" {
 		total = len(uintSlice(body["account_ids"]))
 	}
@@ -6007,202 +5869,6 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 	task := s.createTask(typ, "sunny", body, total)
 	writeJSON(w, 200, serializeTask(task))
-}
-
-func (s *Server) sunnyIcMeigoSnapshot() ([]SunnyMailbox, map[string]int, error) {
-	var rows []SunnyMailbox
-	if err := s.db.Where("mailbox_channel = ? AND enabled = ?", "icmeigo", true).Order("id asc").Find(&rows).Error; err != nil {
-		return nil, nil, err
-	}
-	remaining := map[string]int{}
-	client := icmeigoHTTPClient("")
-	for _, row := range rows {
-		key := strings.TrimSpace(row.AccessKey)
-		if key == "" {
-			continue
-		}
-		if _, seen := remaining[key]; seen {
-			continue
-		}
-		quota, err := icmeigoQuota(client, key)
-		if err != nil {
-			return nil, nil, fmt.Errorf("ic.meigo 卡密额度识别失败：%w", err)
-		}
-		remaining[key] = intValue(quota["remaining_quota"], 0)
-	}
-	return rows, remaining, nil
-}
-
-func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
-	var rows []SunnyMailbox
-	if err := s.db.Where("mailbox_channel = ? AND enabled = ?", "icmeigo", true).Order("id asc").Find(&rows).Error; err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	remaining := map[string]int{}
-	totalQuotas := map[string]int{}
-	totalConcurrencies := map[string]int{}
-	quotaErrors := map[string]bool{}
-	validCards := 0
-	client := icmeigoHTTPClient("")
-	for _, row := range rows {
-		key := strings.TrimSpace(row.AccessKey)
-		if key == "" {
-			continue
-		}
-		if _, seen := remaining[key]; seen {
-			continue
-		}
-		quota, err := icmeigoQuota(client, key)
-		if err != nil {
-			remaining[key] = 0
-			quotaErrors[key] = true
-			continue
-		}
-		remaining[key] = intValue(quota["remaining_quota"], 0)
-		totalQuotas[key] = intValue(quota["total_quota"], 0)
-		totalConcurrencies[key] = intValue(quota["total_concurrency"], 1)
-		validCards++
-	}
-	total := len(rows)
-	for _, count := range remaining {
-		total += count
-	}
-	type cardSummary struct {
-		ID               string `json:"id"`
-		Label            string `json:"label"`
-		ActiveMailboxes  int    `json:"active_mailboxes"`
-		FailedMailboxes  int    `json:"failed_mailboxes"`
-		RemainingQuota   int    `json:"remaining_quota"`
-		TotalAccounts    int    `json:"total_accounts"`
-		TotalQuota       int    `json:"total_quota"`
-		TotalConcurrency int    `json:"total_concurrency"`
-		QuotaError       bool   `json:"quota_error"`
-		Latest           bool   `json:"latest"`
-		LatestMailboxID  uint   `json:"-"`
-	}
-	cards := make([]cardSummary, 0, len(remaining))
-	cardIndex := map[string]int{}
-	for _, row := range rows {
-		key := strings.TrimSpace(row.AccessKey)
-		if key == "" {
-			continue
-		}
-		index, exists := cardIndex[key]
-		if !exists {
-			index = len(cards)
-			cardIndex[key] = index
-			cards = append(cards, cardSummary{
-				ID: sunnyIcMeigoCardID(key), Label: "卡密 " + sunnyIcMeigoKeyHint(key),
-				RemainingQuota: remaining[key], TotalQuota: totalQuotas[key], TotalConcurrency: totalConcurrencies[key], QuotaError: quotaErrors[key],
-			})
-		}
-		cards[index].ActiveMailboxes++
-		if row.ID > cards[index].LatestMailboxID {
-			cards[index].LatestMailboxID = row.ID
-		}
-		if strings.TrimSpace(row.Status) == "失败" {
-			cards[index].FailedMailboxes++
-		}
-	}
-	for index := range cards {
-		cards[index].TotalAccounts = cards[index].ActiveMailboxes + cards[index].RemainingQuota
-	}
-	sort.SliceStable(cards, func(i, j int) bool { return cards[i].LatestMailboxID > cards[j].LatestMailboxID })
-	if len(cards) > 0 {
-		cards[0].Latest = true
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ready": validCards > 0, "cards": len(remaining), "active_mailboxes": len(rows),
-		"remaining_quota": total - len(rows), "total_accounts": total, "card_items": cards,
-	})
-}
-
-func sunnyIcMeigoCardID(key string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
-	return hex.EncodeToString(sum[:12])
-}
-
-func sunnyIcMeigoKeyHint(key string) string {
-	runes := []rune(strings.TrimSpace(key))
-	visible := 6
-	if len(runes) < visible {
-		visible = len(runes)
-	}
-	return "••••" + string(runes[len(runes)-visible:])
-}
-
-// sunnyRemoveIcMeigoCard releases the provider mailboxes before removing a card
-// from automatic scheduling. Local rows stay as disabled history so failed or
-// completed account evidence is never destroyed by card management.
-func (s *Server) sunnyRemoveIcMeigoCard(w http.ResponseWriter, cardID string) {
-	var rows []SunnyMailbox
-	if err := s.db.Where("mailbox_channel = ? AND enabled = ?", "icmeigo", true).Order("id asc").Find(&rows).Error; err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	selected := make([]SunnyMailbox, 0)
-	for _, row := range rows {
-		if sunnyIcMeigoCardID(row.AccessKey) == strings.TrimSpace(cardID) {
-			selected = append(selected, row)
-		}
-	}
-	if len(selected) == 0 {
-		writeError(w, http.StatusNotFound, "卡密不存在或已移除")
-		return
-	}
-	client := icmeigoHTTPClient("")
-	released := 0
-	for _, row := range selected {
-		if err := icmeigoReleaseMailbox(client, row.AccessKey, row.Email); err != nil {
-			writeError(w, http.StatusBadGateway, fmt.Sprintf("已释放 %d/%d 个邮箱，剩余邮箱释放失败，请重试移除卡密", released, len(selected)))
-			return
-		}
-		if err := s.db.Model(&SunnyMailbox{}).Where("id = ?", row.ID).Updates(map[string]any{
-			"enabled": false, "status": "已释放", "last_error": "",
-		}).Error; err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		released++
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "released": released, "removed": true})
-}
-
-func (s *Server) sunnyPrepareIcMeigoTask(body map[string]any) error {
-	rows, remaining, err := s.sunnyIcMeigoSnapshot()
-	if err != nil {
-		return err
-	}
-	if len(rows) == 0 {
-		return fmt.Errorf("请先在邮箱配置中导入 ic.meigo 卡密")
-	}
-	ids := make([]uint, 0, len(rows))
-	total := len(rows)
-	for _, row := range rows {
-		ids = append(ids, row.ID)
-	}
-	for _, count := range remaining {
-		total += count
-	}
-	body["mailbox_ids"] = ids
-	body["count"] = total
-	body["icmeigo_auto"] = true
-	body["icmeigo_remaining_quota"] = remaining
-	body["setup_login_secret"] = true
-	return nil
-}
-
-func (s *Server) sunnyRequireIcMeigoLoginSecret(body map[string]any) {
-	mailboxIDs := uintSlice(body["mailbox_ids"])
-	if len(mailboxIDs) == 0 {
-		return
-	}
-	var count int64
-	s.db.Model(&SunnyMailbox{}).Where("id IN ? AND mailbox_channel = ?", mailboxIDs, "icmeigo").Count(&count)
-	if count > 0 {
-		body["setup_login_secret"] = true
-	}
 }
 
 func sunnyRegistrationStage(body map[string]any) string {
