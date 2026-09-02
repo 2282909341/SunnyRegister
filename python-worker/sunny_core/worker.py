@@ -2682,6 +2682,48 @@ def _interruptible_delay(db: SunnyDB, seconds: float) -> None:
         remaining -= chunk
 
 
+def _register_pacing_range(payload: dict[str, Any]) -> tuple[float, float]:
+    """Random pause range between two registrations (anti batch-correlation).
+
+    Honors payload overrides (register_pacing_min_sec/max_sec) before
+    SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC env vars; defaults to 8-25 seconds.
+    Set both to 0 to disable pacing entirely.
+    """
+
+    def _number(value: Any, fallback: float) -> float:
+        if value is None:
+            return fallback
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return max(0.0, float(os.getenv(name, str(default))))
+        except (TypeError, ValueError):
+            return default
+
+    low = _number(payload.get("register_pacing_min_sec"), _env_float("SUNNY_REGISTER_PACING_MIN_SEC", 8.0))
+    high = _number(payload.get("register_pacing_max_sec"), _env_float("SUNNY_REGISTER_PACING_MAX_SEC", 25.0))
+    if high < low:
+        high = low
+    return low, high
+
+
+def _pacing_delay(db: SunnyDB, payload: dict[str, Any]) -> None:
+    """Sleep a random per-account interval between batch registrations."""
+    low, high = _register_pacing_range(payload)
+    if high <= 0:
+        return
+    seconds = round(random.uniform(low, high), 2)
+    db.event(
+        f"[系统] 账号间随机冷却 {seconds}s（降低批量关联风险，可用 SUNNY_REGISTER_PACING_MIN_SEC/MAX_SEC 调整）",
+        detail={"scope": "global", "pacing_enabled": True, "pacing_seconds": seconds, "pacing_range_sec": [low, high]},
+    )
+    _interruptible_delay(db, seconds)
+
+
 def _refresh_with_retry(db: SunnyDB, refresh_token: str, proxy_url: str) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(3):
@@ -2697,8 +2739,8 @@ def _refresh_with_retry(db: SunnyDB, refresh_token: str, proxy_url: str) -> dict
     raise RuntimeError(str(last_error or "Refresh Token 续期失败"))
 
 
-def _verify_access_token(access_token: str, proxy_url: str) -> dict[str, Any]:
-    result = probe_access_token(access_token, proxy_url)
+def _verify_access_token(access_token: str, proxy_url: str, seed: str = "") -> dict[str, Any]:
+    result = probe_access_token(access_token, proxy_url, seed=seed)
     if result.get("status") != "valid":
         error = str(result.get("error") or "AT 二次验活未得到有效响应")
         marker = "token_invalid: " if result.get("status") == "invalid" else ""
@@ -2708,7 +2750,7 @@ def _verify_access_token(access_token: str, proxy_url: str) -> dict[str, Any]:
 
 def _verify_persisted_access_token(db: SunnyDB, email: str, access_token: str, proxy_url: str) -> dict[str, Any]:
     try:
-        return _verify_access_token(access_token, proxy_url)
+        return _verify_access_token(access_token, proxy_url, seed=email)
     except Exception as exc:
         discard = getattr(db, "discard_unverified_access_token", None)
         if callable(discard):
@@ -2979,7 +3021,7 @@ def _refresh_sessions(db: SunnyDB, payload: dict[str, Any]) -> tuple[int, list[s
             return {**spec, "probe": {"status": "probe_failed", "error": "代理池脉冲预检未找到可用 ChatGPT HTTPS 出口"}}
         proxy_url = _proxy_snapshot(probe_payloads[account_id], int(spec["index"]))["register"]
         token = str(spec.get("token") or "")
-        result = probe_access_token(token, proxy_url)
+        result = probe_access_token(token, proxy_url, seed=str(account.get("email") or ""))
         return {**spec, "probe": result}
 
     probe_results: list[dict[str, Any]] = []
@@ -3955,6 +3997,8 @@ def run_sunny_task(task_id: str) -> None:
                 while queue and completed < total:
                     db.ensure_not_cancelled()
                     sequence += 1
+                    if sequence > 1:
+                        _pacing_delay(db, payload)
                     mailbox = queue.pop(0)
                     ok, result = _run_one(db, task_type, payload, mailbox, sequence, total, protocol_batch_policy)
                     db.ensure_not_cancelled()
@@ -3990,6 +4034,8 @@ def run_sunny_task(task_id: str) -> None:
                                 ok, result = False, f"parallel worker failed: {exc}"
                             record_result(ok, result)
                             rotate(mailbox, ok)
+                            if queue:
+                                _pacing_delay(db, payload)
                         while len(pending) < concurrency and submit_icmeigo():
                             pass
                 finally:
@@ -4010,6 +4056,8 @@ def run_sunny_task(task_id: str) -> None:
                             break
                 else:
                     idx, mailbox = entry
+                if idx > 1:
+                    _pacing_delay(db, payload)
                 ok, result = _run_one(db, task_type, payload, mailbox, idx, total, protocol_batch_policy)
                 db.ensure_not_cancelled()
                 record_result(ok, result)
@@ -4056,6 +4104,8 @@ def run_sunny_task(task_id: str) -> None:
                             ok, result = False, f"parallel worker failed: {exc}"
                         db.ensure_not_cancelled()
                         record_result(ok, result)
+                        if not provider_stop_reason:
+                            _pacing_delay(db, payload)
                         submit_next()
             finally:
                 # Do not let browser/OTP threads outlive the task. Running flows

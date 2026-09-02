@@ -52,9 +52,11 @@ def _classify(response) -> dict[str, Any]:
     return {"status": "probe_failed", "error": f"AT 检测上游响应异常: {_preview(response)}", "http_status": response.status_code}
 
 
-def _request(access_token: str, proxy_url: str) -> dict[str, Any]:
+def _request(access_token: str, proxy_url: str, seed: str = "") -> dict[str, Any]:
+    from .fingerprint_pool import pick_impersonate
+
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    session = curl_requests.Session(impersonate="chrome136", proxies=proxies, timeout=18, verify=ca_bundle_path())
+    session = curl_requests.Session(impersonate=pick_impersonate(seed or "access-token-probe"), proxies=proxies, timeout=18, verify=ca_bundle_path())
     try:
         response = session.get(
             MODELS_URL,
@@ -74,7 +76,7 @@ def _request(access_token: str, proxy_url: str) -> dict[str, Any]:
         session.close()
 
 
-def probe_access_token(access_token: str, proxy_url: str = "") -> dict[str, Any]:
+def probe_access_token(access_token: str, proxy_url: str = "", *, seed: str = "") -> dict[str, Any]:
     token = str(access_token or "").strip()
     if not token:
         return {"status": "invalid", "error": "账户没有可用的 Access Token"}
@@ -91,7 +93,7 @@ def probe_access_token(access_token: str, proxy_url: str = "") -> dict[str, Any]
     for source, proxy in attempts:
         try:
             with use_traffic_meter(meter):
-                result = _request(token, proxy)
+                result = _request(token, proxy, seed=seed)
         except Exception as exc:
             all_blocked = False
             errors.append(f"{source}={exc}")

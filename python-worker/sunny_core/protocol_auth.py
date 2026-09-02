@@ -304,16 +304,19 @@ class ProtocolRegistrationFlow:
             raise ProtocolRegistrationError(
                 "Protocol mode requires curl_cffi; reinstall python-worker dependencies"
             ) from exc
+        from .fingerprint_pool import pick_impersonate
+
         proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
         session = curl_requests.Session(
-            impersonate="chrome136",
+            impersonate=pick_impersonate(str(getattr(self.account, "email", "") or self.proxy_url)),
             proxies=proxies,
             timeout=30,
             verify=ca_bundle_path(),
         )
+        # The impersonate target supplies its own authentic User-Agent/DNT etc.;
+        # only the locale hints are pinned per-region here.
         session.headers.update(
             {
-                "user-agent": USER_AGENT,
                 "accept-language": "ja-JP,ja;q=0.9,en;q=0.7",
                 "accept-encoding": "gzip, deflate, br",
             }

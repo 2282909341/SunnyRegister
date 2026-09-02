@@ -1,7 +1,17 @@
 import json
 from unittest.mock import Mock, patch
 
+import pytest
+
 from sunny_core import worker
+
+
+@pytest.fixture(autouse=True)
+def _disable_register_pacing(monkeypatch):
+    """The provisioning-loop tests drive up to 100 accounts; keep the new
+    anti-batch pacing (SUNNY_REGISTER_PACING_*) off so they stay fast."""
+    monkeypatch.setenv("SUNNY_REGISTER_PACING_MIN_SEC", "0")
+    monkeypatch.setenv("SUNNY_REGISTER_PACING_MAX_SEC", "0")
 
 
 def test_icmeigo_provisioner_releases_then_generates_replacement():
