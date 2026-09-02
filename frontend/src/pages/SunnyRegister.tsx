@@ -1921,6 +1921,7 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
   const [remailCfg, setRemailCfg] = useState<AnyObj>({ enabled: false });
   const [domainCfg, setDomainCfg] = useState<AnyObj>({ enabled: true, enabled_for_registration: false });
   const [icmeigoSummary, setIcmeigoSummary] = useState<AnyObj>({ ready: false, cards: 0, active_mailboxes: 0, total_accounts: 0 });
+  const [identityTouched, setIdentityTouched] = useState(false);
   useEffect(() => {
     let alive = true;
     Promise.all([
@@ -1982,21 +1983,23 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
       setRegisterCount(Math.max(1, Number(icmeigoSummary.total_accounts || 1)));
       setConcurrency(Math.max(1, Math.min(5, Number(icmeigoSummary.active_mailboxes || 1))));
     }
-    if (identity === "system" && selectedEmails.length === 0 && icmeigoReady) setIdentity("icmeigo");
-    if (identity === "system" && selectedEmails.length === 0 && !icmeigoReady && domainReady) setIdentity("domain");
-    if (identity === "system" && selectedEmails.length === 0 && !icmeigoReady && !domainReady && remailReady) setIdentity("remail");
+    // 有 ic.meigo 卡密时优先走智能流水线：注册数量=卡密总额度，点一次连续跑完整个额度。
+    // 用户本次明确点选了某个身份后（identityTouched）不再自动切换。
+    if (!identityTouched && identity === "system" && icmeigoReady) setIdentity("icmeigo");
+    if (!identityTouched && identity === "system" && !icmeigoReady && domainReady) setIdentity("domain");
+    if (!identityTouched && identity === "system" && !icmeigoReady && !domainReady && remailReady) setIdentity("remail");
     if (identity !== "system" && !((identity === "domain" && domainReady) || (identity === "remail" && remailReady) || (identity === "icmeigo" && icmeigoReady) || (identity === "google" && googleMailboxReady) || (identity === "microsoft" && microsoftMailboxReady))) setIdentity(icmeigoReady ? "icmeigo" : domainReady ? "domain" : remailReady ? "remail" : selectedEmails.length ? "system" : "google");
-  }, [selectedEmails.length, remailReady, domainReady, icmeigoReady, icmeigoSummary.total_accounts]);
+  }, [selectedEmails.length, remailReady, domainReady, icmeigoReady, icmeigoSummary.total_accounts, identity, identityTouched]);
   return <div className="sr-modal-mask"><div className="sr-modal sr-register-modal">
     <div className="sr-modal-head"><h3>{t.autoRegisterTitle}</h3><button onClick={onClose}><X className="h-5 w-5"/></button></div>
     <div className="sr-modal-body">
       <div className="sr-step">{t.step} 1</div>
 		<h4>{t.step1Title}</h4><p>{mailboxVerificationDescription}</p>
       <div className="sr-choice-grid two">
-        <Choice disabled={!mailboxPoolReady} disabledMessage={t.systemMailboxPoolDisabled} active={mailboxPoolReady && identity==="system"} title={t.systemMailbox} desc={t.systemMailboxDesc} onClick={()=>{ setIdentity("system"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
-        <Choice disabled={!domainReady} disabledMessage={t.domainMailboxNotConfigured} active={domainReady && identity==="domain"} title={t.domainMailboxIdentity} desc={t.domainMailboxIdentityDesc} onClick={()=>{ setIdentity("domain"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
-        <Choice disabled={!remailReady} disabledMessage="请先在邮箱配置中启用 Remail" active={remailReady && identity==="remail"} title="Remail" desc="使用 Remail 第三方邮箱供应商下单并通过 API 收取验证码" onClick={()=>{ setIdentity("remail"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
-        <Choice disabled={!icmeigoReady} disabledMessage="请先到邮箱配置粘贴导入 ic.meigo 卡密" active={icmeigoReady && identity==="icmeigo"} title="ic.meigo 智能流水线" desc={icmeigoReady ? `已自动识别 ${Number(icmeigoSummary.cards || 0)} 张卡 / ${Number(icmeigoSummary.total_accounts || 0)} 额度；注册成功后自动释放、补位、继续` : "导入卡密后自动识别额度与并发"} onClick={()=>{ setIdentity("icmeigo"); setStage(REGISTER_ONLY); setSetupLoginSecret(true); }} onDisabledClick={(msg)=>notify("fail", msg)} />
+        <Choice disabled={!mailboxPoolReady} disabledMessage={t.systemMailboxPoolDisabled} active={mailboxPoolReady && identity==="system"} title={t.systemMailbox} desc={t.systemMailboxDesc} onClick={()=>{ setIdentityTouched(true); setIdentity("system"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
+        <Choice disabled={!domainReady} disabledMessage={t.domainMailboxNotConfigured} active={domainReady && identity==="domain"} title={t.domainMailboxIdentity} desc={t.domainMailboxIdentityDesc} onClick={()=>{ setIdentityTouched(true); setIdentity("domain"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
+        <Choice disabled={!remailReady} disabledMessage="请先在邮箱配置中启用 Remail" active={remailReady && identity==="remail"} title="Remail" desc="使用 Remail 第三方邮箱供应商下单并通过 API 收取验证码" onClick={()=>{ setIdentityTouched(true); setIdentity("remail"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
+        <Choice disabled={!icmeigoReady} disabledMessage="请先到邮箱配置粘贴导入 ic.meigo 卡密" active={icmeigoReady && identity==="icmeigo"} title="ic.meigo 智能流水线" desc={icmeigoReady ? `已自动识别 ${Number(icmeigoSummary.cards || 0)} 张卡 / ${Number(icmeigoSummary.total_accounts || 0)} 额度；注册成功后自动释放、补位、继续` : "导入卡密后自动识别额度与并发"} onClick={()=>{ setIdentityTouched(true); setIdentity("icmeigo"); setStage(REGISTER_ONLY); setSetupLoginSecret(true); }} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled disabledMessage={t.googleMailboxDisabled} active={false} title="Google" desc={t.googleDesc} onClick={()=>setIdentity("google")} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled disabledMessage={t.microsoftMailboxDisabled} active={false} title="Microsoft" desc={t.microsoftDesc} onClick={()=>setIdentity("microsoft")} onDisabledClick={(msg)=>notify("fail", msg)} />
       </div>
