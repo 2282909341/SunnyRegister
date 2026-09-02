@@ -924,6 +924,7 @@ Object.assign(zh, {
   checkoutProbeUnavailable: "仅已注册且套餐为 free 的账户支持 Checkout 探测", checkoutProbeDone: "账户 {email}：Checkout 类型为 {kind}",
   checkoutProbeSummary: "Checkout 探测完成：检测成功 {detected} 个，重试 {retried} 个，跳过 {skipped} 个，失败 {failed} 个",
   allPaymentMethods: "全部支付方式", paymentMethodFilter: "支付方式筛选（同时满足）", clearPaymentMethods: "清除支付方式筛选",
+  paymentMethodFilterTitle: "筛选支付方式", paymentMethodFilterAll: "全部", paymentMethodFilterClear: "清除", paymentMethodFilterEmpty: "暂无已探测支付方式", paymentMethodFilterUnknown: "未检测", paymentMethodFilterAndHint: "多选时需同时具有所选支付方式",
   loginSecretFilterTitle: "筛选登录密钥", loginSecretFilterAll: "全部", loginSecretFilterPresent: "有 LS", loginSecretFilterMissing: "无 LS",
   rebindEmailFilterTitle: "筛选换绑邮箱", rebindEmailFilterAll: "全部", rebindEmailFilterPresent: "已换绑", rebindEmailFilterMissing: "未换绑",
   passwordFilterTitle: "筛选密码", passwordFilterAll: "全部", passwordFilterPresent: "有密码", passwordFilterMissing: "无密码", twoFactorFilterTitle: "筛选2FA", twoFactorFilterAll: "全部", twoFactorFilterPresent: "有2FA", twoFactorFilterMissing: "无2FA",
@@ -939,6 +940,7 @@ Object.assign(en, {
   rebindEmailFilterTitle: "Filter Rebound Email", rebindEmailFilterAll: "All", rebindEmailFilterPresent: "Rebound", rebindEmailFilterMissing: "Not Rebound",
   passwordFilterTitle: "Filter Password", passwordFilterAll: "All", passwordFilterPresent: "Has Password", passwordFilterMissing: "No Password", twoFactorFilterTitle: "Filter 2FA", twoFactorFilterAll: "All", twoFactorFilterPresent: "Has 2FA", twoFactorFilterMissing: "No 2FA",
   trialCountryFilterTitle: "Filter Eligible Trial Countries", trialCountryFilterAll: "All", trialCountryFilterClear: "Clear", trialCountryFilterEmpty: "No checked countries", trialCountryFilterAndHint: "Accounts must be eligible in every selected country",
+  paymentMethodFilterTitle: "Filter Payment Methods", paymentMethodFilterAll: "All", paymentMethodFilterClear: "Clear", paymentMethodFilterEmpty: "No detected payment methods", paymentMethodFilterUnknown: "Not Checked", paymentMethodFilterAndHint: "Accounts must have every selected payment method",
   terminateTask: "Terminate", terminatingTask: "Terminating...", terminateTaskRequested: "Termination requested for the selected log task", terminateTaskFailed: "Failed to terminate task",
   rebindEmail: "Rebound Email",
   searchAccount: "Search email or rebound email...",
@@ -3790,30 +3792,41 @@ function PaymentMethodsBadge({ row }: { row: AnyObj }) {
   const title=paymentProbeTitle(row);
   return <div className="flex flex-wrap gap-1" title={title}>{row.payment_methods.map((method:string)=><Badge key={method} variant="secondary" className="whitespace-nowrap">{paymentMethodLabel(method)}</Badge>)}</div>;
 }
-function PaymentMethodFilter({t,value,options,onChange}:{t:AnyObj;value:string[];options:string[];onChange:(value:string[])=>void}) {
-  const toggle=(method:string)=>onChange(value.includes(method)?value.filter((item)=>item!==method):[...value,method]);
-  const allSelected=options.length>0 && value.length===options.length;
-  return <details className="sr-payment-filter">
-    <summary className="sr-payment-filter-trigger">
-      <CreditCard className="sr-payment-filter-icon"/>
-      {value.length===0 ? <span className="sr-payment-filter-placeholder">{t.allPaymentMethods}</span> : <span className="sr-payment-filter-chips">
-        {value.slice(0,2).map((method)=><span className="sr-payment-filter-chip" key={method}>{paymentMethodLabel(method)}</span>)}
-        {value.length>2 && <span className="sr-payment-filter-more">+{value.length-2}</span>}
-      </span>}
-      <ChevronDown className="sr-payment-filter-chevron"/>
-    </summary>
-    <div className="sr-payment-filter-menu">
-      <div className="sr-payment-filter-menu-head">
-        <span>{t.paymentMethodFilter}</span>
-        <div className="sr-payment-filter-menu-actions">
-          <button type="button" className="sr-payment-filter-action" onClick={()=>onChange(allSelected?[]:options)}><ListChecks className="h-3.5 w-3.5"/>{allSelected?t.clearPaymentMethods:t.selectAll}</button>
-        </div>
+type PaymentProbeFilterValue = "" | "unknown";
+function PaymentMethodFilterHeader({t,value,status,options,onChange,onStatusChange}:{t:AnyObj;value:string[];status:PaymentProbeFilterValue;options:string[];onChange:(value:string[])=>void;onStatusChange:(value:PaymentProbeFilterValue)=>void}) {
+  const [open,setOpen]=useState(false);
+  const rootRef=useRef<HTMLDivElement|null>(null);
+  const methods=Array.from(new Set([...options,...value].map((item)=>String(item).trim().toLowerCase()).filter(Boolean))).sort((left,right)=>paymentMethodLabel(left).localeCompare(paymentMethodLabel(right)));
+  const active=status==="unknown"||value.length>0;
+  const label=status==="unknown"?t.paymentMethodFilterUnknown:value.length===0?t.paymentMethodFilterAll:value.length===1?paymentMethodLabel(value[0]):`${value.length}`;
+  useEffect(()=>{
+    if (!open) return;
+    const close=(event:MouseEvent)=>{if(rootRef.current&&!rootRef.current.contains(event.target as Node))setOpen(false)};
+    document.addEventListener("mousedown",close);
+    return ()=>document.removeEventListener("mousedown",close);
+  },[open]);
+  const toggle=(method:string)=>{
+    onStatusChange("");
+    onChange(value.includes(method)?value.filter((item)=>item!==method):[...value,method].sort());
+  };
+  const toggleUnknown=()=>{
+    if(status==="unknown") onStatusChange("");
+    else { onChange([]); onStatusChange("unknown"); }
+  };
+  const clear=()=>{onChange([]);onStatusChange("")};
+  return <div ref={rootRef} className="sr-trial-country-header sr-payment-method-header">
+    <span>{t.paymentMethods}</span>
+    <button type="button" className={cn("sr-login-secret-filter",active&&"active")} onClick={()=>setOpen((current)=>!current)} title={t.paymentMethodFilterTitle} aria-expanded={open} aria-label={`${t.paymentMethodFilterTitle}: ${label}`}><Filter className="h-3.5 w-3.5"/><span>{label}</span></button>
+    {open&&<div className="sr-trial-country-filter-menu sr-payment-method-filter-menu">
+      <div className="sr-trial-country-filter-head"><strong>{t.paymentMethodFilterTitle}</strong>{active&&<button type="button" onClick={clear}>{t.paymentMethodFilterClear}</button>}</div>
+      <div className="sr-trial-country-filter-options sr-payment-method-filter-options">
+        <label className={cn("sr-trial-country-filter-option sr-payment-method-filter-option",status==="unknown"&&"is-selected")}><input type="checkbox" checked={status==="unknown"} onChange={toggleUnknown}/><span>{t.paymentMethodFilterUnknown}</span></label>
+        {methods.map((method)=><label key={method} className={cn("sr-trial-country-filter-option sr-payment-method-filter-option",value.includes(method)&&"is-selected")}><input type="checkbox" checked={value.includes(method)} onChange={()=>toggle(method)}/><span>{paymentMethodLabel(method)}</span></label>)}
+        {!methods.length&&<span className="sr-trial-country-filter-empty">{t.paymentMethodFilterEmpty}</span>}
       </div>
-      <div className="sr-payment-filter-options">
-        {options.map((method)=><label key={method} className={cn("sr-payment-filter-option",value.includes(method)&&"is-selected")}><input type="checkbox" checked={value.includes(method)} onChange={()=>toggle(method)}/><span>{paymentMethodLabel(method)}</span>{value.includes(method)&&<span className="sr-payment-filter-check">✓</span>}</label>)}
-      </div>
-    </div>
-  </details>;
+      <p>{t.paymentMethodFilterAndHint}</p>
+    </div>}
+  </div>;
 }
 void CheckoutBadge;
 void PaymentMethodsBadge;
@@ -3898,6 +3911,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
   const [availableTrialCountries,setAvailableTrialCountries]=useState<string[]>([]);
   const [checkoutKind,setCheckoutKind]=useCachedState("session.checkoutKind","");
   const [paymentMethods,setPaymentMethods]=useCachedState<string[]>("session.paymentMethods",[]);
+  const [paymentProbeFilter,setPaymentProbeFilter]=useCachedState<PaymentProbeFilterValue>("session.paymentProbeFilter","");
   const [availablePaymentMethods,setAvailablePaymentMethods]=useState<string[]>([]);
   const [group,setGroup]=useCachedState("session.group","");
   const [groups,setGroups]=useState<AnyObj[]>([]);
@@ -3998,6 +4012,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     if (rebindEmailFilter) qs.set("rebind_email", rebindEmailFilter);
     if (trialCountryFilters.length) qs.set("trial_countries", trialCountryFilters.join(","));
     if (paymentMethods.length) qs.set("payment_methods", paymentMethods.join(","));
+    if (paymentProbeFilter) qs.set("payment_probe_status", paymentProbeFilter);
     if (group) qs.set("group_id", group);
     const res = await apiFetch(`/sunny/sessions?${qs.toString()}`);
     setItems(res.items||[]);
@@ -4027,6 +4042,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
       if(rebindEmailFilter) qs.set("rebind_email",rebindEmailFilter);
       if(trialCountryFilters.length) qs.set("trial_countries",trialCountryFilters.join(","));
       if(paymentMethods.length) qs.set("payment_methods",paymentMethods.join(","));
+      if(paymentProbeFilter) qs.set("payment_probe_status",paymentProbeFilter);
       if(group) qs.set("group_id",group);
       const result=await apiFetch(`/sunny/sessions?${allSelectionParams(qs).toString()}`);
       const ids=selectionIDs(result);
@@ -4035,8 +4051,8 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     } catch(e:any) { notify("fail",e.message||String(e)); }
     finally { setSelectingAll(false); }
   };
-  useEffect(()=>{void load()},[sortBy, timeSort, page, pageSize, debouncedQuery, status, loginSecretFilter, rebindEmailFilter, plan, trialEligibility, trialCountryFilters, checkoutKind, paymentMethods, group]);
-  useEffect(()=>{setPage(1)},[sortBy, timeSort, pageSize, query, status, loginSecretFilter, rebindEmailFilter, plan, trialEligibility, trialCountryFilters, checkoutKind, paymentMethods, group]);
+  useEffect(()=>{void load()},[sortBy, timeSort, page, pageSize, debouncedQuery, status, loginSecretFilter, rebindEmailFilter, plan, trialEligibility, trialCountryFilters, checkoutKind, paymentMethods, paymentProbeFilter, group]);
+  useEffect(()=>{setPage(1)},[sortBy, timeSort, pageSize, query, status, loginSecretFilter, rebindEmailFilter, plan, trialEligibility, trialCountryFilters, checkoutKind, paymentMethods, paymentProbeFilter, group]);
   useEffect(()=>{if(sortBy==="rebind_email")setSortBy("last_health_checked_at")},[sortBy,setSortBy]);
   useEffect(()=>{apiFetch("/sunny/mailbox-groups").then((res)=>setGroups(sortMailboxGroups(res.items||[]))).catch(()=>setGroups([]));},[]);
   useEffect(()=>{const pages=pageCount(total,pageSize); if(page>pages) setPage(pages);},[total,pageSize,page]);
@@ -4420,7 +4436,6 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
       <SelectBox className="sr-select-like" value={plan} onChange={(v)=>setPlan(String(v))} options={[{value:"",label:t.planType}, ...SESSION_PLAN_OPTIONS.map((p)=>({value:p,label:formatPlanType(p)}))]} />
       <SelectBox className="sr-select-like" value={trialEligibility} onChange={(v)=>setTrialEligibility(String(v))} options={[{value:"",label:t.allTrialEligibility},{value:"eligible",label:t.trialEligible},{value:"ineligible",label:t.trialIneligible},{value:"unknown",label:t.trialUnknown}]} />
       <SelectBox className="sr-select-like" value={checkoutKind} onChange={(v)=>setCheckoutKind(String(v))} options={[{value:"",label:t.allCheckoutKinds},{value:"oaics",label:t.checkoutOAICS},{value:"cs_live",label:t.checkoutCSLive},{value:"cs_test",label:t.checkoutCSTest},{value:"unknown",label:t.checkoutUnknown}]} />
-      <PaymentMethodFilter t={t} value={paymentMethods} options={paymentMethodOptions} onChange={setPaymentMethods}/>
       <SelectionSummary t={t} count={selected.length} total={total} selectingAll={selectingAll} onSelectAll={selectAllFiltered} onClear={()=>setSelected([])}/>
       <div className="sr-batch-progress-slot" aria-live="polite">
         {batchProgressItems.map(([label, value], index)=><BatchTaskProgress key={index} t={t} label={label} value={value}/>)}
@@ -4440,7 +4455,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
       </div>
     </div>
     <div className="sr-table-scroll">
-      <ResizableDataTable tableKey="sessions-v2" columns={DATA_TABLE_COLUMNS.sessions} className="sr-session-table" headers={[<input type="checkbox" checked={allChecked} onChange={(e)=>setSelected(e.target.checked ? Array.from(new Set([...selected, ...items.map((x)=>x.id)])) : selected.filter((id)=>!items.some((x)=>x.id===id)))}/>,t.email,<RebindEmailFilterHeader t={t} value={rebindEmailFilter} onToggle={()=>setRebindEmailFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,t.groupFilter,t.status,t.planType,<LoginSecretFilterHeader t={t} value={loginSecretFilter} onToggle={()=>setLoginSecretFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,"SK","AT","RT",<TrialCountryFilterHeader t={t} value={trialCountryFilters} options={availableTrialCountries} onChange={setTrialCountryFilters}/>,t.checkoutKind,t.paymentMethods,<SortTimeHeader label={t.atExpiresAt} order={sortBy==="access_token_expires_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("access_token_expires_at")}/>,<SortTimeHeader label={t.lastHealthCheckedAt} order={sortBy==="last_health_checked_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("last_health_checked_at")}/>,t.operation]}>
+      <ResizableDataTable tableKey="sessions-v2" columns={DATA_TABLE_COLUMNS.sessions} className="sr-session-table" headers={[<input type="checkbox" checked={allChecked} onChange={(e)=>setSelected(e.target.checked ? Array.from(new Set([...selected, ...items.map((x)=>x.id)])) : selected.filter((id)=>!items.some((x)=>x.id===id)))}/>,t.email,<RebindEmailFilterHeader t={t} value={rebindEmailFilter} onToggle={()=>setRebindEmailFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,t.groupFilter,t.status,t.planType,<LoginSecretFilterHeader t={t} value={loginSecretFilter} onToggle={()=>setLoginSecretFilter((old)=>old===""?"present":old==="present"?"missing":"")}/>,"SK","AT","RT",<TrialCountryFilterHeader t={t} value={trialCountryFilters} options={availableTrialCountries} onChange={setTrialCountryFilters}/>,t.checkoutKind,<PaymentMethodFilterHeader t={t} value={paymentMethods} status={paymentProbeFilter} options={paymentMethodOptions} onChange={setPaymentMethods} onStatusChange={setPaymentProbeFilter}/>,<SortTimeHeader label={t.atExpiresAt} order={sortBy==="access_token_expires_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("access_token_expires_at")}/>,<SortTimeHeader label={t.lastHealthCheckedAt} order={sortBy==="last_health_checked_at"?timeSort:"desc"} onToggle={()=>toggleTimeSort("last_health_checked_at")}/>,t.operation]}>
         <tbody>{items.length ? items.map((s)=>{
           const refreshing=refreshingSessionIds.includes(s.id);
           const checkingAT=atCheckingSessionIds.includes(s.id);

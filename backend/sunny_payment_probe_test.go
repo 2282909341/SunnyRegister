@@ -388,3 +388,43 @@ func TestSunnySessionPaymentMethodFilterUsesANDSemantics(t *testing.T) {
 		t.Fatalf("dynamic payment method options=%v", payload.PaymentMethodOptions)
 	}
 }
+
+func TestSunnySessionPaymentProbeUnknownFilterUsesDedicatedProbeTimestamp(t *testing.T) {
+	s := newSunnySessionTestServer(t)
+	now := time.Now()
+	if err := s.db.Model(&SunnyAccount{}).Where("email = ?", "session@example.com").Updates(map[string]any{
+		"payment_methods_json":       `[]`,
+		"payment_probe_methods_json": `[]`,
+		"payment_probed_at":          now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	mailbox := SunnyMailbox{Email: "unchecked@example.com", Status: "已注册", AccountType: "free", Enabled: true}
+	if err := s.db.Create(&mailbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	account := SunnyAccount{MailboxID: mailbox.ID, Email: mailbox.Email, Status: "registered", AccountType: "free", AccessToken: "token"}
+	if err := s.db.Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Create(&SunnySession{AccountID: account.ID, Email: account.Email, AccessToken: account.AccessToken}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/sunny/sessions?payment_probe_status=unknown", nil)
+	s.sunnySessions(recorder, request, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Items []map[string]any `json:"items"`
+		Total int              `json:"total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Total != 1 || len(payload.Items) != 1 || payload.Items[0]["email"] != "unchecked@example.com" {
+		t.Fatalf("unexpected unknown probe filter result: %#v", payload)
+	}
+}
