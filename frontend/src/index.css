@@ -482,12 +482,12 @@ button:not(:disabled):active { transform: translateY(0) scale(.985); }
 .sr-batch-task-progress { display:inline-flex; align-items:center; min-height:28px; padding:0 8px; border:1px solid rgba(20,184,166,.22); border-radius:8px; background:rgba(240,253,250,.92); color:#0f766e; font-size:11px; font-weight:750; line-height:1; white-space:nowrap; }
 .dark .sr-batch-task-progress { border-color:rgba(45,212,191,.24); background:rgba(20,184,166,.12); color:#99f6e4; }
 .dark .sr-text-btn:disabled { border-color:#475569; background:#334155; color:#94a3b8; }
-.sr-account-table { width:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; font-size:13px; }
+.sr-account-table { width:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; font-size:12px; }
 .sr-account-table th {
-  height:40px; background:#fafafa; color:#475569; font-size:12px; font-weight:700; text-align:center; padding:0 8px;
+  height:34px; background:#fafafa; color:#475569; font-size:11px; font-weight:700; text-align:center; padding:0 6px;
   border-bottom:1px solid #f0f0f0;
 }
-.sr-account-table td { height:42px; padding:0 8px; border-bottom:1px solid #f0f0f0; color:#334155; text-align:center; vertical-align:middle; }
+.sr-account-table td { height:34px; padding:0 6px; border-bottom:1px solid #f0f0f0; color:#334155; text-align:center; vertical-align:middle; }
 .sr-account-table td > * { margin-left:auto; margin-right:auto; }
 .sr-account-table tbody tr { transition:background-color .15s ease; }
 .sr-account-table tbody tr:not(.sr-renewal-progress-row):hover > td { background:#fafafa; }

@@ -252,12 +252,6 @@ function useCachedState<T>(key: string, initial: T | (() => T)): [T, Dispatch<Se
     }
     setValue(resolved);
   };
-  useEffect(() => {
-    sunnyStateCache.set(key, value);
-    if (persistedWorkbenchKeys.has(key)) {
-      try { window.localStorage.setItem(persistedStateKey(key), JSON.stringify(value)); } catch { /* in-memory cache still works */ }
-    }
-  }, [key, value]);
   return [value, setCachedValue];
 }
 
@@ -398,6 +392,7 @@ type PersistentSessionTaskSnapshot = { tasks: PersistentSessionTask[] };
 
 const SESSION_TASK_STORAGE_KEY = "sunnyregister.active-session-tasks";
 const SESSION_TASK_POLL_INTERVAL_MS = 1200;
+const SESSION_TASK_PERSIST_DELAY = 250;
 const SESSION_TASK_RETRY_MAX_MS = 15000;
 const SESSION_TASK_STREAM_RECONNECT_MS = 2500;
 const sessionTaskListeners = new Set<() => void>();
@@ -427,14 +422,22 @@ function readPersistentSessionTasks(): PersistentSessionTask[] {
 
 let sessionTaskSnapshot: PersistentSessionTaskSnapshot = { tasks: readPersistentSessionTasks() };
 
-function publishSessionTasks(tasks: PersistentSessionTask[]) {
-  sessionTaskSnapshot = { tasks };
+let sessionTaskPersistTimer: number | null = null;
+function persistSessionTasks() {
+  sessionTaskPersistTimer = null;
+  if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(SESSION_TASK_STORAGE_KEY, JSON.stringify(tasks
+    window.localStorage.setItem(SESSION_TASK_STORAGE_KEY, JSON.stringify(sessionTaskSnapshot.tasks
       .filter((task) => task.taskId && task.state === "running" && !task.localOnly)
       .map((task) => ({ ...task, dismissedEmails: [] }))));
   } catch { /* in-memory state remains available */ }
+}
+function publishSessionTasks(tasks: PersistentSessionTask[]) {
+  sessionTaskSnapshot = { tasks };
   sessionTaskListeners.forEach((listener) => listener());
+  if (typeof window !== "undefined" && sessionTaskPersistTimer === null) {
+    sessionTaskPersistTimer = window.setTimeout(persistSessionTasks, SESSION_TASK_PERSIST_DELAY);
+  }
 }
 
 function upsertSessionTask(task: PersistentSessionTask) {
