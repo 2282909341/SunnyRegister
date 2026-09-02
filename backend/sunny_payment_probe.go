@@ -430,9 +430,11 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 			result.Methods = normalizeSunnyPaymentMethods(probed.Methods)
 			return result
 		}
-		// 明确的客户端错误（资格不符、参数被拒等）换代理也不会有不同结果，
-		// 立即返回；403 风控、408 超时、429 限流仍允许换代理重试。
-		if probed.HTTP >= 400 && probed.HTTP < 500 && probed.HTTP != http.StatusForbidden && probed.HTTP != http.StatusRequestTimeout && probed.HTTP != http.StatusTooManyRequests {
+		// 明确的客户端错误（资格不符、参数被拒、账号级限流等）换代理也不会有
+		// 不同结果，立即返回；403 风控、408 超时仍允许换代理重试。429 的
+		// checkout_creation_rate_limited 是账号级限流，换代理无效且会延长
+		// 冷却时间，因此也立即返回不再重试。
+		if probed.HTTP >= 400 && probed.HTTP < 500 && probed.HTTP != http.StatusForbidden && probed.HTTP != http.StatusRequestTimeout {
 			return result
 		}
 	}

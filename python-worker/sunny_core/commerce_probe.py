@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 import uuid
 import sys
@@ -275,7 +276,12 @@ def probe_payment_methods(
             )
     except Exception as exc:
         message = f"{type(exc).__name__}: {str(exc)[:240]}"
-        status = 401 if "HTTP 401" in message else 403 if "HTTP 403" in message else 0
+        # 从错误信息中提取真实 HTTP 状态码（400/401/403/408/429/5xx 等），
+        # 避免把 400/429 等非 401/403 的失败映射成 http=0，导致后端判定为
+        # “网络类失败”而对已限流账号反复换代理重试、延长冷却时间。
+        status = 0
+        if http_match := re.search(r"HTTP\s+(\d{3})", message):
+            status = int(http_match.group(1))
         result["checkout"]["http"] = status
         result["checkout"]["error"] = message
     result["traffic"] = meter.snapshot()
