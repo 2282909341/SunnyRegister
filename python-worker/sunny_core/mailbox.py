@@ -1289,6 +1289,22 @@ class IcMeiGoICloudReader:
                 # No mail has arrived for this hidden mailbox yet.
                 return {"empty": True}
             if status in {401, 403}:
+                body_code = ""
+                try:
+                    body_payload = response.json() if getattr(response, "text", "") else {}
+                    if isinstance(body_payload, dict):
+                        body_code = str(body_payload.get("code") or "")
+                except (ValueError, json.JSONDecodeError):
+                    body_code = ""
+                if body_code == "HISTORY_ACCESS_DISABLED":
+                    # 该邮箱已被释放：ic.meigo 关闭了已释放邮箱的查询能力，邮箱无法
+                    # 再收信。这不代表卡密 Key 无效，不能据此停用邮箱行（账号可能
+                    # 已设置密码+2FA，登录不再依赖邮箱）。
+                    raise MailboxAccessError(
+                        "mailbox_history_disabled",
+                        "ic.meigo 邮箱已释放，无法再收取新邮件（已释放邮箱的查询被服务端关闭）",
+                        f"HTTP {status}",
+                    )
                 raise MailboxAccessError(
                     "mailbox_credential_invalid",
                     "iCloud 邮箱查询 Key 无效，请检查 ic.meigo.lol 卡密",

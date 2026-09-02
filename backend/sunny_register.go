@@ -1703,8 +1703,8 @@ func (s *Server) sunnyImportMailboxes(w http.ResponseWriter, r *http.Request) {
 		gid = s.sunnyEnsureDefaultGroup()
 	}
 	if mailboxType == "apple" && mailboxChannel == "icmeigo" {
-		imported, bad := s.importIcMeiGoCards(text(body["lines"]), gid)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported, "failed": len(bad), "errors": bad})
+		imported, bad, notes := s.importIcMeiGoCards(text(body["lines"]), gid)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported, "failed": len(bad), "errors": bad, "notes": notes})
 		return
 	}
 	lines := strings.Split(text(body["lines"]), "\n")
@@ -1767,12 +1767,17 @@ func (s *Server) sunnyImportMailboxes(w http.ResponseWriter, r *http.Request) {
 }
 
 // importIcMeiGoCards expands ic.meigo.lol redeem codes (one per line) into mailbox rows.
-// For each code it queries the quota, then generates that many hidden mailboxes, storing each
-// generated email as its own apple/icmeigo mailbox row sharing the same access key.
-func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string) {
+// For each code it queries the quota, then generates that many hidden mailboxes. A mailbox
+// must stay unreleased while its registration is in progress — released mailboxes can no
+// longer receive mail (HISTORY_ACCESS_DISABLED) — so generation stops when the card's
+// concurrency budget is full. A card's concurrency slot is freed by releasing a mailbox of
+// the same key whose account already has ChatGPT password + TOTP set (login then works
+// without the mailbox), letting multi-quota cards expand one mailbox per completed account.
+func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string, []string) {
 	client := icmeigoHTTPClient("")
 	imported := 0
 	bad := []string{}
+	notes := []string{}
 	seenKey := map[string]bool{}
 	for _, raw := range strings.Split(linesText, "\n") {
 		key := strings.TrimSpace(raw)
@@ -1793,11 +1798,22 @@ func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string) 
 			bad = append(bad, key+" => 兑换码额度为 0，可能已用尽")
 			continue
 		}
-		okForCard := 0
+		generated := 0
 		cardErr := ""
-		for i := 0; i < total; i++ {
+		releaseTries := 0
+		for generated < total {
 			email, genErr := icmeigoGenerate(client, key)
 			if genErr != nil {
+				// 并发已满：先释放该卡名下密码+2FA 已齐全（登录不再依赖邮箱）的
+				// 邮箱腾出并发槽；释放成功则重试生成，否则优雅停止并提示。
+				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" && releaseTries < 3 && s.releaseIcMeiGoCompletedMailbox(client, key) {
+					releaseTries++
+					continue
+				}
+				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" {
+					notes = append(notes, fmt.Sprintf("%s => 已生成 %d 个邮箱；卡密并发已满（每个 Key 同时只能有 1 个邮箱收信）。等当前邮箱完成注册并设置密码+2FA 后，重新导入此卡即可继续生成下一个", key, generated))
+					break
+				}
 				cardErr = genErr.Error()
 				break
 			}
@@ -1806,20 +1822,29 @@ func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string) 
 				break
 			}
 			imported++
-			okForCard++
-			// 立即释放该邮箱占用的并发槽。卡密并发上限通常只有 1，
-			// 不释放的话第二次 generate 就会被 API_CONCURRENCY_LIMIT 拒绝，
-			// 导致 N 额度卡只生成 1 个邮箱。释放不返还额度、不影响收信。
-			if releaseErr := icmeigoReleaseMailbox(client, key, email); releaseErr != nil {
-				cardErr = fmt.Sprintf("邮箱 %s 已入库，但释放并发槽失败（不影响收信，后续注册可正常使用）：%s", email, releaseErr.Error())
-				break
-			}
+			generated++
 		}
 		if cardErr != "" {
-			bad = append(bad, key+" => 已生成 "+fmt.Sprintf("%d", okForCard)+" 个邮箱后失败："+cardErr)
+			bad = append(bad, key+" => 已生成 "+fmt.Sprintf("%d", generated)+" 个邮箱后失败："+cardErr)
 		}
 	}
-	return imported, bad
+	return imported, bad, notes
+}
+
+// releaseIcMeiGoCompletedMailbox frees the concurrency slot of one mailbox on
+// this key whose account already has ChatGPT password + TOTP configured, so
+// future logins no longer depend on mailbox mail. Returns true when a mailbox
+// was released.
+func (s *Server) releaseIcMeiGoCompletedMailbox(client *http.Client, key string) bool {
+	var m SunnyMailbox
+	err := s.db.Where(
+		"mailbox_channel = ? AND access_key = ? AND enabled = ? AND COALESCE(chat_gpt_password,'') <> '' AND COALESCE(totp_secret,'') <> ''",
+		"icmeigo", key, true,
+	).Order("updated_at asc").First(&m).Error
+	if err != nil {
+		return false
+	}
+	return icmeigoReleaseMailbox(client, key, m.Email) == nil
 }
 
 func (s *Server) upsertIcMeiGoMailbox(gid uint, email, accessKey string) error {

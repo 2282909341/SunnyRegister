@@ -98,9 +98,15 @@ func icmeigoGenerate(client *http.Client, accessKey string) (string, error) {
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return "", &outlookMailError{Code: "mailbox_credential_invalid", Category: "credential", HTTPStatus: http.StatusUnprocessableEntity, UserMessage: "iCloud 邮箱查询 Key 无效，请检查 ic.meigo.lol 卡密", Detail: detail, Terminal: true}
 	}
-	if status == http.StatusTooManyRequests || strings.Contains(strings.ToLower(detail), "quota") || strings.Contains(strings.ToLower(detail), "concurrency") {
-		// Quota or concurrency exhausted for this code; stop generating further mailboxes.
-		return "", &outlookMailError{Code: "mailbox_provider_busy", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "该兑换码额度或并发已用完", Detail: detail}
+	upstreamCode := strings.ToUpper(strings.TrimSpace(text(payload["code"])))
+	detailLower := strings.ToLower(detail)
+	if upstreamCode != "" || status == http.StatusTooManyRequests || strings.Contains(detailLower, "quota") || strings.Contains(detailLower, "concurrency") || strings.Contains(detail, "并发") || strings.Contains(detail, "额度") {
+		// 并发已满与额度用完是两种状态：并发满时该卡名下完成密码+2FA 的邮箱
+		// 释放并发槽后还能继续生成；额度用完则只能停止。
+		if upstreamCode == "API_CONCURRENCY_LIMIT" || strings.Contains(detail, "并发") {
+			return "", &outlookMailError{Code: "mailbox_concurrency_limit", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "卡密并发已满，请释放邮箱后再生成", Detail: detail}
+		}
+		return "", &outlookMailError{Code: "mailbox_provider_busy", Category: "service", HTTPStatus: http.StatusServiceUnavailable, UserMessage: "该兑换码额度已用完", Detail: detail}
 	}
 	if status < 200 || status >= 300 {
 		return "", &outlookMailError{Code: "mailbox_provider_failed", Category: "service", HTTPStatus: http.StatusBadGateway, UserMessage: "iCloud 邮箱渠道请求失败，请稍后重试", Detail: fmt.Sprintf("HTTP %d", status)}
@@ -164,11 +170,16 @@ func fetchIcMeiGoJSON(client *http.Client, accessKey, email string) (map[string]
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		detail := firstText(payload["error"], payload["message"], fmt.Sprintf("HTTP %d", resp.StatusCode))
-		code, category, status, message, terminal := "mailbox_provider_failed", "service", http.StatusBadGateway, "iCloud 邮箱渠道请求失败，请稍后重试", false
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || strings.Contains(strings.ToLower(detail), "key") || strings.Contains(detail, "密钥") || strings.Contains(detail, "无效") {
-			code, category, status, message, terminal = "mailbox_credential_invalid", "credential", http.StatusUnprocessableEntity, "iCloud 邮箱查询 Key 无效，请检查 ic.meigo.lol 卡密", true
+		code, category, status2, message, terminal := "mailbox_provider_failed", "service", http.StatusBadGateway, "iCloud 邮箱渠道请求失败，请稍后重试", false
+		upstreamCode := strings.ToUpper(strings.TrimSpace(text(payload["code"])))
+		if resp.StatusCode == http.StatusForbidden && upstreamCode == "HISTORY_ACCESS_DISABLED" {
+			// 邮箱已释放：ic.meigo 关闭了已释放邮箱的查询能力，邮箱无法再收信，
+			// 但卡密 Key 仍然有效，不能按凭证失效处理。
+			code, category, status2, message = "mailbox_history_disabled", "service", http.StatusForbidden, "ic.meigo 邮箱已释放，无法再收取新邮件"
+		} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || strings.Contains(strings.ToLower(detail), "key") || strings.Contains(detail, "密钥") || strings.Contains(detail, "无效") {
+			code, category, status2, message, terminal = "mailbox_credential_invalid", "credential", http.StatusUnprocessableEntity, "iCloud 邮箱查询 Key 无效，请检查 ic.meigo.lol 卡密", true
 		}
-		return nil, &outlookMailError{Code: code, Category: category, HTTPStatus: status, UserMessage: message, Detail: detail, Terminal: terminal}
+		return nil, &outlookMailError{Code: code, Category: category, HTTPStatus: status2, UserMessage: message, Detail: detail, Terminal: terminal}
 	}
 	return payload, nil
 }

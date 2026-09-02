@@ -101,7 +101,9 @@ func TestIcMeiGoParseAndFetchMail(t *testing.T) {
 }
 
 func TestIcMeiGoGenerateAndReleaseFlow(t *testing.T) {
-	generated := 0
+	successes := 0
+	generateAllowed := 1
+	released := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer api_key" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -110,10 +112,15 @@ func TestIcMeiGoGenerateAndReleaseFlow(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/api/hme/quota":
-			_, _ = w.Write([]byte(`{"data":{"remaining_quota":2,"total_quota":2,"occupied_concurrency":0,"total_concurrency":1}}`))
+			_, _ = w.Write([]byte(`{"data":{"remaining_quota":2,"total_quota":2,"occupied_concurrency":1,"total_concurrency":1}}`))
 		case "/api/hme/generate":
-			generated++
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"data":{"email":"box%d@icloud.com"}}`, generated)))
+			if successes >= generateAllowed+released {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"code":"API_CONCURRENCY_LIMIT","message":"当前并发已满，请释放邮箱或等待释放完成后再试","details":{}}`))
+				return
+			}
+			successes++
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"data":{"email":"box%d@icloud.com"}}`, successes)))
 		case "/api/hme/release-all":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -121,6 +128,7 @@ func TestIcMeiGoGenerateAndReleaseFlow(t *testing.T) {
 			if email == "" {
 				t.Errorf("release-all must target one mailbox, got body=%v", body)
 			}
+			released++
 			_, _ = w.Write([]byte(`{"data":{"success":1,"failed":0,"pending":0}}`))
 		default:
 			http.NotFound(w, r)
@@ -131,31 +139,30 @@ func TestIcMeiGoGenerateAndReleaseFlow(t *testing.T) {
 	icmeigoAPIBaseURL = server.URL
 	defer func() { icmeigoAPIBaseURL = oldBase }()
 
-	s := newSunnySessionTestServer(t)
-	client := icmeigoHTTPClient("")
+	t.Run("stops gracefully when concurrency is full and no completed mailbox", func(t *testing.T) {
+		successes, released = 0, 0
+		s := newSunnySessionTestServer(t)
+		imported, bad, notes := s.importIcMeiGoCards("api_key", 0)
+		if imported != 1 || len(bad) != 0 {
+			t.Fatalf("concurrency-full stop should import 1 without errors: imported=%d bad=%v", imported, bad)
+		}
+		if len(notes) != 1 || !strings.Contains(notes[0], "并发已满") {
+			t.Fatalf("expected a concurrency note, got %v", notes)
+		}
+	})
 
-	email, err := icmeigoGenerate(client, "api_key")
-	if err != nil {
-		t.Fatalf("generate: %v", err)
-	}
-	if err := icmeigoReleaseMailbox(client, "api_key", email); err != nil {
-		t.Fatalf("release after generate: %v", err)
-	}
-
-	// The manual generate above consumed 1 call but not the mock quota, so
-	// importIcMeiGoCards still sees remaining_quota=2 and generates twice.
-	imported, bad := s.importIcMeiGoCards("api_key", 0)
-	if imported != 2 || len(bad) != 0 {
-		t.Fatalf("card expansion should import per quota: imported=%d bad=%v", imported, bad)
-	}
-	if generated != 3 { // 1 manual + 2 from the import loop
-		t.Fatalf("generate calls=%d, want 3 (1 manual + 2 per quota)", generated)
-	}
-	var rows []SunnyMailbox
-	if err := s.db.Where("mailbox_channel = ?", "icmeigo").Order("id asc").Find(&rows).Error; err != nil || len(rows) < 2 {
-		t.Fatalf("icmeigo mailbox rows=%v err=%v", rows, err)
-	}
-	if rows[0].AccessKey != "api_key" || !strings.Contains(rows[0].Raw, "----api_key") {
-		t.Fatalf("row not sharing the card key: %#v", rows[0])
-	}
+	t.Run("releases a password+2fa mailbox to free the slot and continues", func(t *testing.T) {
+		successes, released = 0, 0
+		s := newSunnySessionTestServer(t)
+		if err := s.db.Create(&SunnyMailbox{Email: "done@icloud.com", MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: "api_key", ChatGPTPassword: "pw", TOTPSecret: "totp", Status: "已注册", Enabled: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+		imported, bad, notes := s.importIcMeiGoCards("api_key", 0)
+		if imported != 2 || len(bad) != 0 || len(notes) != 0 {
+			t.Fatalf("completed mailbox release should let import continue: imported=%d bad=%v notes=%v", imported, bad, notes)
+		}
+		if released != 1 {
+			t.Fatalf("release calls=%d, want 1", released)
+		}
+	})
 }
