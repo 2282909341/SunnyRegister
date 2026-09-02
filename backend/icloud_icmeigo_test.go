@@ -207,6 +207,51 @@ func TestIcMeiGoRegistrationRequiresLoginSecret(t *testing.T) {
 	}
 }
 
+func TestIcMeiGoTaskAutomaticallyRecognizesAllCardsAndQuota(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/hme/quota" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"remaining_quota":9,"total_quota":10,"total_concurrency":1}}`))
+	}))
+	defer server.Close()
+	oldBase := icmeigoAPIBaseURL
+	icmeigoAPIBaseURL = server.URL
+	defer func() { icmeigoAPIBaseURL = oldBase }()
+
+	s := newSunnySessionTestServer(t)
+	for i, key := range []string{"api_card_a", "api_card_b"} {
+		mailbox := SunnyMailbox{Email: fmt.Sprintf("card%d@icloud.com", i+1), GroupID: 1, MailboxType: "apple", MailboxChannel: "icmeigo", AccessKey: key, Status: "未注册", Enabled: true}
+		if err := s.db.Create(&mailbox).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := map[string]any{"identity": "icmeigo", "setup_login_secret": false}
+	if err := s.sunnyPrepareIcMeigoTask(body); err != nil {
+		t.Fatal(err)
+	}
+	if got := intValue(body["count"], 0); got != 20 {
+		t.Fatalf("auto-recognized account count=%d, want 20", got)
+	}
+	if len(uintSlice(body["mailbox_ids"])) != 2 || !boolValue(body["icmeigo_auto"], false) || !boolValue(body["setup_login_secret"], false) {
+		t.Fatalf("unexpected prepared task: %#v", body)
+	}
+
+	recorder := httptest.NewRecorder()
+	s.sunnyIcMeigoSummary(recorder)
+	var summary map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if intValue(summary["cards"], 0) != 2 || intValue(summary["total_accounts"], 0) != 20 {
+		t.Fatalf("unexpected summary: %#v", summary)
+	}
+	if strings.Contains(recorder.Body.String(), "api_card_") {
+		t.Fatal("summary must not expose card secrets")
+	}
+}
+
 func TestIcMeiGoProviderResponses(t *testing.T) {
 	t.Run("pending release is accepted", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

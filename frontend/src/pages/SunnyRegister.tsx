@@ -1426,7 +1426,7 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
   const [stopRequested, setStopRequested] = useCachedState("workbench.stopRequested", false);
   const [autoOpen, setAutoOpen] = useCachedState("workbench.autoOpen", false);
   const [modalConcurrency, setModalConcurrency] = useCachedState("workbench.concurrency", 1);
-  const [identity, setIdentity] = useCachedState<"system" | "domain" | "remail" | "google" | "microsoft">("workbench.identity", "system");
+  const [identity, setIdentity] = useCachedState<"system" | "domain" | "remail" | "icmeigo" | "google" | "microsoft">("workbench.identity", "system");
   const [modalRegisterCount, setModalRegisterCount] = useCachedState("workbench.registerCount", 1);
   const [mode, setMode] = useCachedState<"protocol" | "background" | "visible">("workbench.mode", "protocol");
   const [protocolChallengeStrategy, setProtocolChallengeStrategy] = useCachedState<ProtocolChallengeStrategy>("workbench.protocolChallengeStrategy", "sentinel_protocol");
@@ -1551,7 +1551,7 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
     stopAfterSubmitRef.current = false;
     setAutoOpen(false);
     const availableRows = [...rows, ...Object.values(selectedRowCache)];
-    const effectiveSetupLoginSecret = setupLoginSecret || ids.some((mailboxId) => String(availableRows.find((row) => Number(row.id) === mailboxId)?.mailbox_channel || "").toLowerCase() === "icmeigo");
+    const effectiveSetupLoginSecret = identity === "icmeigo" || setupLoginSecret || ids.some((mailboxId) => String(availableRows.find((row) => Number(row.id) === mailboxId)?.mailbox_channel || "").toLowerCase() === "icmeigo");
     const taskEmails = ids.map((mailboxId) => String(availableRows.find((row) => Number(row.id) === mailboxId)?.email || "")).filter(Boolean);
     const progressEmails = identity === "system" ? taskEmails : Array.from({length: requestedCount}, (_, index) => `${identity}-${index + 1}`);
     setRegistrationProgress(createRegistrationTaskProgress("", stage, progressEmails, effectiveSetupLoginSecret));
@@ -1911,7 +1911,7 @@ function Workbench({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fail", 
   </div>;
 }
 
-function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurrency, setConcurrency, registerCount, setRegisterCount, identity, setIdentity, mode, setMode, protocolChallengeStrategy, setProtocolChallengeStrategy, stage, setStage, allTrafficProxyPool, setAllTrafficProxyPool, setupLoginSecret, setSetupLoginSecret, registerCountrySelection, registerCountriesLoading, onOpenRegisterCountries, onClose, onStart, notify }: { t: typeof zh; busy: boolean; selectedEmails: string[]; selectedNeedPhone: boolean; concurrency: number; setConcurrency: (v:number)=>void; registerCount: number; setRegisterCount: (v:number)=>void; identity: "system"|"domain"|"remail"|"google"|"microsoft"; setIdentity: (v:"system"|"domain"|"remail"|"google"|"microsoft")=>void; mode: "protocol"|"background"|"visible"; setMode:(v:"protocol"|"background"|"visible")=>void; protocolChallengeStrategy: ProtocolChallengeStrategy; setProtocolChallengeStrategy:(v:ProtocolChallengeStrategy)=>void; stage: RegisterStage; setStage:(v:RegisterStage)=>void; allTrafficProxyPool: boolean; setAllTrafficProxyPool: (v:boolean)=>void; setupLoginSecret: boolean; setSetupLoginSecret: (v:boolean)=>void; registerCountrySelection: string[]; registerCountriesLoading: boolean; onOpenRegisterCountries:()=>void; onClose:()=>void; onStart:()=>void; notify:(type:"ok"|"fail", text:string)=>void }) {
+function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurrency, setConcurrency, registerCount, setRegisterCount, identity, setIdentity, mode, setMode, protocolChallengeStrategy, setProtocolChallengeStrategy, stage, setStage, allTrafficProxyPool, setAllTrafficProxyPool, setupLoginSecret, setSetupLoginSecret, registerCountrySelection, registerCountriesLoading, onOpenRegisterCountries, onClose, onStart, notify }: { t: typeof zh; busy: boolean; selectedEmails: string[]; selectedNeedPhone: boolean; concurrency: number; setConcurrency: (v:number)=>void; registerCount: number; setRegisterCount: (v:number)=>void; identity: "system"|"domain"|"remail"|"icmeigo"|"google"|"microsoft"; setIdentity: (v:"system"|"domain"|"remail"|"icmeigo"|"google"|"microsoft")=>void; mode: "protocol"|"background"|"visible"; setMode:(v:"protocol"|"background"|"visible")=>void; protocolChallengeStrategy: ProtocolChallengeStrategy; setProtocolChallengeStrategy:(v:ProtocolChallengeStrategy)=>void; stage: RegisterStage; setStage:(v:RegisterStage)=>void; allTrafficProxyPool: boolean; setAllTrafficProxyPool: (v:boolean)=>void; setupLoginSecret: boolean; setSetupLoginSecret: (v:boolean)=>void; registerCountrySelection: string[]; registerCountriesLoading: boolean; onOpenRegisterCountries:()=>void; onClose:()=>void; onStart:()=>void; notify:(type:"ok"|"fail", text:string)=>void }) {
 	const mailboxVerificationDescription = t === zh
 		? "系统将按邮箱类型自动选择 OAuth、iCloud 或域名邮箱 API 渠道完成邮箱验证。"
 		: "The system automatically selects the OAuth, iCloud, or domain-mail API channel based on each mailbox type.";
@@ -1920,6 +1920,7 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
   const [mailboxCfg, setMailboxCfg] = useState<AnyObj>({ pool_enabled: true });
   const [remailCfg, setRemailCfg] = useState<AnyObj>({ enabled: false });
   const [domainCfg, setDomainCfg] = useState<AnyObj>({ enabled: true, enabled_for_registration: false });
+  const [icmeigoSummary, setIcmeigoSummary] = useState<AnyObj>({ ready: false, cards: 0, active_mailboxes: 0, total_accounts: 0 });
   useEffect(() => {
     let alive = true;
     Promise.all([
@@ -1928,17 +1929,19 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
       apiFetch("/sunny/mailboxes/config").catch(() => ({})),
       apiFetch("/sunny/remail/config").catch(() => ({})),
       apiFetch("/sunny/domain-mail/config").catch(() => ({})),
-    ]).then(([phone, reverse, mailbox, remail, domain]) => {
+      apiFetch("/sunny/icmeigo/summary").catch(() => ({})),
+    ]).then(([phone, reverse, mailbox, remail, domain, icmeigo]) => {
       if (!alive) return;
       setPhoneCfg(phone || {});
       setReverseCfg(reverse || {});
       setMailboxCfg(mailbox || { pool_enabled: true });
       setRemailCfg(remail || { enabled: false });
       setDomainCfg(domain || { enabled: true, enabled_for_registration: false });
+      setIcmeigoSummary(icmeigo || {});
     });
     return () => { alive = false; };
   }, []);
-  const identityText = identity === "system" ? t.systemMailbox : identity === "domain" ? t.domainMailboxIdentity : identity === "remail" ? "Remail" : identity === "google" ? "Google" : "Microsoft";
+  const identityText = identity === "system" ? t.systemMailbox : identity === "domain" ? t.domainMailboxIdentity : identity === "remail" ? "Remail" : identity === "icmeigo" ? "ic.meigo 智能流水线" : identity === "google" ? "Google" : "Microsoft";
   const protocolCopy = t === en ? PROTOCOL_MODE_COPY.en : PROTOCOL_MODE_COPY.zh;
   const modeText = mode === "protocol" ? t.protocolMode : mode === "background" ? t.backgroundMode : t.visibleMode;
   const stageText = stage === CODEX_PHONE_BIND ? t.codexPhoneBind : stage === IMPORT_REVERSE_PROXY ? t.importReverseProxy : stage === AGENT_IDENTITY_REVERSE_PROXY ? t.agentIdentityReverseProxy : t.registerOnly;
@@ -1956,9 +1959,10 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
   const mailboxPoolReady = mailboxCfg.pool_enabled !== false && selectedEmails.length > 0;
   const remailReady = remailCfg.enabled === true && (remailCfg.api_key_configured === true || !!String(remailCfg.api_key || "").trim()) && Number(remailCfg.project_id || 0) > 0;
   const domainReady = domainCfg.enabled !== false && domainCfg.enabled_for_registration === true && !!String(domainCfg.base_url || "").trim() && (domainCfg.auth_token_configured === true || !!String(domainCfg.auth_token || "").trim()) && (domainCfg.site_password_configured === true || !!String(domainCfg.site_password || "").trim()) && !!String(domainCfg.domain || "").trim();
+  const icmeigoReady = icmeigoSummary.ready === true && Number(icmeigoSummary.active_mailboxes || 0) > 0;
   const googleMailboxReady = false;
   const microsoftMailboxReady = false;
-  const identityValid = (identity === "system" && mailboxPoolReady) || (identity === "domain" && domainReady) || (identity === "remail" && remailReady) || (identity === "google" && googleMailboxReady) || (identity === "microsoft" && microsoftMailboxReady);
+  const identityValid = (identity === "system" && mailboxPoolReady) || (identity === "domain" && domainReady) || (identity === "remail" && remailReady) || (identity === "icmeigo" && icmeigoReady) || (identity === "google" && googleMailboxReady) || (identity === "microsoft" && microsoftMailboxReady);
   const modeValid = mode === "visible" || mode === "background" || mode === "protocol";
   const registerOnlyDisabled = !identityValid;
   const stageValid = identityValid && (stage !== CODEX_PHONE_BIND || phoneResourceReady);
@@ -1968,16 +1972,18 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
   const codexDisabled = !identityValid || !phoneResourceReady;
   const importDisabled = !identityValid;
   const agentIdentityDisabled = !identityValid;
-  const maxRegisterCount = identity === "system" ? Math.max(1, selectedEmails.length) : 200;
+  const maxRegisterCount = identity === "system" ? Math.max(1, selectedEmails.length) : identity === "icmeigo" ? Math.max(1, Number(icmeigoSummary.total_accounts || 1)) : 200;
   const safeRegisterCount = Math.max(1, Math.min(Number(registerCount) || 1, maxRegisterCount));
   const safeConcurrency = Math.max(1, Math.min(Number(concurrency) || 1, safeRegisterCount));
-  const mailboxHint = identity === "system" ? t.linkedMailboxConfig + " · " + (mailboxPoolReady ? t.resourceReady : t.resourceMissing) : identity === "domain" ? t.domainMailboxIdentityDesc : template(t.remailOrderHint, {count: safeRegisterCount});
+  const mailboxHint = identity === "system" ? t.linkedMailboxConfig + " · " + (mailboxPoolReady ? t.resourceReady : t.resourceMissing) : identity === "domain" ? t.domainMailboxIdentityDesc : identity === "icmeigo" ? `已识别 ${Number(icmeigoSummary.cards || 0)} 张卡，预计 ${Number(icmeigoSummary.total_accounts || 0)} 个账号` : template(t.remailOrderHint, {count: safeRegisterCount});
   useEffect(() => {
     if (identity === "system" && selectedEmails.length > 0) setRegisterCount(selectedEmails.length);
-    if (identity === "system" && selectedEmails.length === 0 && domainReady) setIdentity("domain");
-    if (identity === "system" && selectedEmails.length === 0 && !domainReady && remailReady) setIdentity("remail");
-    if (identity !== "system" && !((identity === "domain" && domainReady) || (identity === "remail" && remailReady) || (identity === "google" && googleMailboxReady) || (identity === "microsoft" && microsoftMailboxReady))) setIdentity(domainReady ? "domain" : remailReady ? "remail" : selectedEmails.length ? "system" : "google");
-  }, [selectedEmails.length, remailReady, domainReady]);
+    if (identity === "icmeigo" && icmeigoReady) setRegisterCount(Math.max(1, Number(icmeigoSummary.total_accounts || 1)));
+    if (identity === "system" && selectedEmails.length === 0 && icmeigoReady) setIdentity("icmeigo");
+    if (identity === "system" && selectedEmails.length === 0 && !icmeigoReady && domainReady) setIdentity("domain");
+    if (identity === "system" && selectedEmails.length === 0 && !icmeigoReady && !domainReady && remailReady) setIdentity("remail");
+    if (identity !== "system" && !((identity === "domain" && domainReady) || (identity === "remail" && remailReady) || (identity === "icmeigo" && icmeigoReady) || (identity === "google" && googleMailboxReady) || (identity === "microsoft" && microsoftMailboxReady))) setIdentity(icmeigoReady ? "icmeigo" : domainReady ? "domain" : remailReady ? "remail" : selectedEmails.length ? "system" : "google");
+  }, [selectedEmails.length, remailReady, domainReady, icmeigoReady, icmeigoSummary.total_accounts]);
   return <div className="sr-modal-mask"><div className="sr-modal sr-register-modal">
     <div className="sr-modal-head"><h3>{t.autoRegisterTitle}</h3><button onClick={onClose}><X className="h-5 w-5"/></button></div>
     <div className="sr-modal-body">
@@ -1987,6 +1993,7 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
         <Choice disabled={!mailboxPoolReady} disabledMessage={t.systemMailboxPoolDisabled} active={mailboxPoolReady && identity==="system"} title={t.systemMailbox} desc={t.systemMailboxDesc} onClick={()=>{ setIdentity("system"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled={!domainReady} disabledMessage={t.domainMailboxNotConfigured} active={domainReady && identity==="domain"} title={t.domainMailboxIdentity} desc={t.domainMailboxIdentityDesc} onClick={()=>{ setIdentity("domain"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled={!remailReady} disabledMessage="请先在邮箱配置中启用 Remail" active={remailReady && identity==="remail"} title="Remail" desc="使用 Remail 第三方邮箱供应商下单并通过 API 收取验证码" onClick={()=>{ setIdentity("remail"); setStage(REGISTER_ONLY); }} onDisabledClick={(msg)=>notify("fail", msg)} />
+        <Choice disabled={!icmeigoReady} disabledMessage="请先到邮箱配置粘贴导入 ic.meigo 卡密" active={icmeigoReady && identity==="icmeigo"} title="ic.meigo 智能流水线" desc={icmeigoReady ? `已自动识别 ${Number(icmeigoSummary.cards || 0)} 张卡 / ${Number(icmeigoSummary.total_accounts || 0)} 额度；注册成功后自动释放、补位、继续` : "导入卡密后自动识别额度与并发"} onClick={()=>{ setIdentity("icmeigo"); setStage(REGISTER_ONLY); setSetupLoginSecret(true); }} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled disabledMessage={t.googleMailboxDisabled} active={false} title="Google" desc={t.googleDesc} onClick={()=>setIdentity("google")} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled disabledMessage={t.microsoftMailboxDisabled} active={false} title="Microsoft" desc={t.microsoftDesc} onClick={()=>setIdentity("microsoft")} onDisabledClick={(msg)=>notify("fail", msg)} />
       </div>
@@ -2010,8 +2017,8 @@ function AutoRegisterModal({ t, busy, selectedEmails, selectedNeedPhone, concurr
         <Choice disabled={importDisabled} disabledMessage={t.registerStageUnavailable} active={!importDisabled && stage===IMPORT_REVERSE_PROXY} title={t.importReverseProxy} desc={t.importReverseProxyDesc + "\n" + phoneHint + "\n" + reverseHint + (importDisabled ? " · " + t.stageDisabledTip : "")} onClick={()=>setStage(IMPORT_REVERSE_PROXY)} onDisabledClick={(msg)=>notify("fail", msg)} />
         <Choice disabled={agentIdentityDisabled} disabledMessage={t.registerStageUnavailable} active={!agentIdentityDisabled && stage===AGENT_IDENTITY_REVERSE_PROXY} title={t.agentIdentityReverseProxy} desc={t.agentIdentityReverseProxyDesc + "\n" + reverseHint + (agentIdentityDisabled ? " · " + t.stageDisabledTip : "")} onClick={()=>setStage(AGENT_IDENTITY_REVERSE_PROXY)} onDisabledClick={(msg)=>notify("fail", msg)} />
       </div>
-      <div className="sr-summary sr-register-summary"><div><b>{t.identityLabel}</b><span>{identityText}</span></div><div><b>{t.modeLabel}</b><span>{modeText}</span></div><div><b>{t.stageLabel}</b><span>{stageText}</span></div><div><b>{t.registerCountryLabel}</b><button type="button" className="sr-link inline-flex items-center gap-1" onClick={onOpenRegisterCountries} title={t.registerCountryHint}>{registerCountriesLoading ? <Loader2 className="h-4 w-4 animate-spin"/> : <Globe2 className="h-4 w-4"/>}{registerCountrySelection.length ? registerCountrySelection.join(" / ") : t.registerCountryNone}</button></div><div><b>{identity === "remail" || identity === "domain" ? t.remailMailboxCount : t.registerAccounts}</b><input className="sr-concurrency-input" type="number" min={1} max={maxRegisterCount} disabled={identity === "system"} value={safeRegisterCount} onChange={(e)=>setRegisterCount(Math.max(1, Math.min(Number(e.target.value || 1), maxRegisterCount)))}/></div><div><b>{t.concurrency}</b><input className="sr-concurrency-input" type="number" min={1} max={safeRegisterCount} value={safeConcurrency} onChange={(e)=>setConcurrency(Math.max(1, Math.min(Number(e.target.value || 1), safeRegisterCount)))}/></div><div className="sr-register-account-list">{identity === "system" ? selectedEmails.map((email)=><div key={email}>{email}</div>) : <div>{identity === "domain" ? `${t.domainMailboxIdentity} · ${safeRegisterCount}` : template(t.remailOrderHint, {count:safeRegisterCount})}</div>}</div></div>
-      <div className="sr-register-actions"><label className="mr-3 flex min-h-12 items-center gap-2 whitespace-nowrap text-sm text-slate-600" title={t.allTrafficProxyPoolTip}><input type="checkbox" checked={allTrafficProxyPool} onChange={(e)=>setAllTrafficProxyPool(e.target.checked)} disabled={busy}/><span>{t.allTrafficProxyPool}</span></label><label className="mr-3 flex min-h-12 items-center gap-2 whitespace-nowrap text-sm text-slate-600"><input type="checkbox" checked={setupLoginSecret} onChange={(e)=>setSetupLoginSecret(e.target.checked)} disabled={busy}/><span>{t.addPassword2FA}</span></label><Button className="h-12 flex-1 rounded-xl bg-blue-600 text-lg text-white hover:bg-blue-700" disabled={startDisabled} onClick={onStart}>{busy ? <Loader2 className="mr-2 h-5 w-5 animate-spin"/> : null}{t.startAutoRegister}</Button><button className="sr-register-cancel" onClick={onClose}>{t.cancel}</button></div>
+      <div className="sr-summary sr-register-summary"><div><b>{t.identityLabel}</b><span>{identityText}</span></div><div><b>{t.modeLabel}</b><span>{modeText}</span></div><div><b>{t.stageLabel}</b><span>{stageText}</span></div><div><b>{t.registerCountryLabel}</b><button type="button" className="sr-link inline-flex items-center gap-1" onClick={onOpenRegisterCountries} title={t.registerCountryHint}>{registerCountriesLoading ? <Loader2 className="h-4 w-4 animate-spin"/> : <Globe2 className="h-4 w-4"/>}{registerCountrySelection.length ? registerCountrySelection.join(" / ") : t.registerCountryNone}</button></div><div><b>{identity === "remail" || identity === "domain" ? t.remailMailboxCount : t.registerAccounts}</b><input className="sr-concurrency-input" type="number" min={1} max={maxRegisterCount} disabled={identity === "system" || identity === "icmeigo"} value={safeRegisterCount} onChange={(e)=>setRegisterCount(Math.max(1, Math.min(Number(e.target.value || 1), maxRegisterCount)))}/></div><div><b>{t.concurrency}</b><input className="sr-concurrency-input" type="number" min={1} max={safeRegisterCount} value={safeConcurrency} onChange={(e)=>setConcurrency(Math.max(1, Math.min(Number(e.target.value || 1), safeRegisterCount)))}/></div><div className="sr-register-account-list">{identity === "system" ? selectedEmails.map((email)=><div key={email}>{email}</div>) : <div>{identity === "domain" ? `${t.domainMailboxIdentity} · ${safeRegisterCount}` : identity === "icmeigo" ? mailboxHint : template(t.remailOrderHint, {count:safeRegisterCount})}</div>}</div></div>
+      <div className="sr-register-actions"><label className="mr-3 flex min-h-12 items-center gap-2 whitespace-nowrap text-sm text-slate-600" title={t.allTrafficProxyPoolTip}><input type="checkbox" checked={allTrafficProxyPool} onChange={(e)=>setAllTrafficProxyPool(e.target.checked)} disabled={busy}/><span>{t.allTrafficProxyPool}</span></label><label className="mr-3 flex min-h-12 items-center gap-2 whitespace-nowrap text-sm text-slate-600"><input type="checkbox" checked={identity === "icmeigo" || setupLoginSecret} onChange={(e)=>setSetupLoginSecret(e.target.checked)} disabled={busy || identity === "icmeigo"}/><span>{t.addPassword2FA}</span></label><Button className="h-12 flex-1 rounded-xl bg-blue-600 text-lg text-white hover:bg-blue-700" disabled={startDisabled} onClick={onStart}>{busy ? <Loader2 className="mr-2 h-5 w-5 animate-spin"/> : null}{t.startAutoRegister}</Button><button className="sr-register-cancel" onClick={onClose}>{t.cancel}</button></div>
     </div>
   </div></div>;
 }

@@ -65,6 +65,11 @@ func (s *Server) handleSunny(w http.ResponseWriter, r *http.Request, rest string
 	case "remail":
 		s.remailConfigHandler(w, r, parts[1:])
 		return
+	case "icmeigo":
+		if len(parts) == 2 && parts[1] == "summary" && r.Method == http.MethodGet {
+			s.sunnyIcMeigoSummary(w)
+			return
+		}
 	case "domain-mail":
 		s.domainMailboxConfigHandler(w, r, parts[1:])
 		return
@@ -5878,6 +5883,12 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 		return
 	}
 	if typ == "sunny_register" {
+		if strings.EqualFold(strings.TrimSpace(text(body["identity"])), "icmeigo") {
+			if err := s.sunnyPrepareIcMeigoTask(body); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		s.sunnyRequireIcMeigoLoginSecret(body)
 		identity := strings.ToLower(strings.TrimSpace(text(body["identity"])))
 		if identity == "remail" {
@@ -5959,6 +5970,9 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 		}
 	}
 	total := len(uintSlice(body["mailbox_ids"])) + len(uintSlice(body["account_ids"]))
+	if typ == "sunny_register" && boolValue(body["icmeigo_auto"], false) {
+		total = intValue(body["count"], total)
+	}
 	if typ == "sunny_refresh_session" || typ == "sunny_acquire_rt" || typ == "sunny_add_ls" || typ == "sunny_sub2_import" {
 		total = len(uintSlice(body["account_ids"]))
 	}
@@ -5987,6 +6001,70 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 	task := s.createTask(typ, "sunny", body, total)
 	writeJSON(w, 200, serializeTask(task))
+}
+
+func (s *Server) sunnyIcMeigoSnapshot() ([]SunnyMailbox, map[string]int, error) {
+	var rows []SunnyMailbox
+	if err := s.db.Where("mailbox_channel = ? AND enabled = ?", "icmeigo", true).Order("id asc").Find(&rows).Error; err != nil {
+		return nil, nil, err
+	}
+	remaining := map[string]int{}
+	client := icmeigoHTTPClient("")
+	for _, row := range rows {
+		key := strings.TrimSpace(row.AccessKey)
+		if key == "" {
+			continue
+		}
+		if _, seen := remaining[key]; seen {
+			continue
+		}
+		quota, err := icmeigoQuota(client, key)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ic.meigo 卡密额度识别失败：%w", err)
+		}
+		remaining[key] = intValue(quota["remaining_quota"], 0)
+	}
+	return rows, remaining, nil
+}
+
+func (s *Server) sunnyIcMeigoSummary(w http.ResponseWriter) {
+	rows, remaining, err := s.sunnyIcMeigoSnapshot()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	total := len(rows)
+	for _, count := range remaining {
+		total += count
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready": len(rows) > 0, "cards": len(remaining), "active_mailboxes": len(rows),
+		"remaining_quota": total - len(rows), "total_accounts": total,
+	})
+}
+
+func (s *Server) sunnyPrepareIcMeigoTask(body map[string]any) error {
+	rows, remaining, err := s.sunnyIcMeigoSnapshot()
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("请先在邮箱配置中导入 ic.meigo 卡密")
+	}
+	ids := make([]uint, 0, len(rows))
+	total := len(rows)
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	for _, count := range remaining {
+		total += count
+	}
+	body["mailbox_ids"] = ids
+	body["count"] = total
+	body["icmeigo_auto"] = true
+	body["icmeigo_remaining_quota"] = remaining
+	body["setup_login_secret"] = true
+	return nil
 }
 
 func (s *Server) sunnyRequireIcMeigoLoginSecret(body map[string]any) {
