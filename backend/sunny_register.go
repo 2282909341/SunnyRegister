@@ -1801,17 +1801,21 @@ func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string, 
 		generated := 0
 		cardErr := ""
 		releaseTries := 0
+		releaseLimit := intValue(quota["total_concurrency"], 1)
+		if releaseLimit < 1 {
+			releaseLimit = 1
+		}
 		for generated < total {
 			email, genErr := icmeigoGenerate(client, key)
 			if genErr != nil {
-				// 并发已满：释放该卡名下密码+2FA 已齐全（登录不再依赖邮箱）
-				// 或注册失败且无凭据的邮箱；释放成功则重试生成。
-				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" && releaseTries < 3 && s.releaseIcMeiGoSafeMailbox(client, key) {
+				// 并发已满：先释放该卡名下密码+2FA 已齐全（登录不再依赖邮箱）的
+				// 邮箱腾出并发槽；释放成功则重试生成，否则优雅停止并提示。
+				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" && releaseTries < releaseLimit && s.releaseIcMeiGoCompletedMailbox(client, key) {
 					releaseTries++
 					continue
 				}
 				if mailErr, ok := genErr.(*outlookMailError); ok && mailErr.Code == "mailbox_concurrency_limit" {
-					notes = append(notes, fmt.Sprintf("%s => 已生成 %d 个邮箱；卡密并发已满（每个 Key 同时只能有 1 个邮箱收信）。等当前邮箱完成注册并设置密码+2FA，或注册失败后，重新导入此卡即可继续生成下一个", key, generated))
+					notes = append(notes, fmt.Sprintf("%s => 已生成 %d 个邮箱；卡密并发已满（每个 Key 同时只能有 1 个邮箱收信）。等当前邮箱完成注册并设置密码+2FA 后，重新导入此卡即可继续生成下一个", key, generated))
 					break
 				}
 				cardErr = genErr.Error()
@@ -1831,19 +1835,16 @@ func (s *Server) importIcMeiGoCards(linesText string, gid uint) (int, []string, 
 	return imported, bad, notes
 }
 
-// releaseIcMeiGoSafeMailbox frees one safe-to-discard concurrency slot:
-// either a completed mailbox whose future login no longer needs email, or a
-// failed mailbox without credentials. Released rows are marked so they cannot
-// shadow later candidates.
-func (s *Server) releaseIcMeiGoSafeMailbox(client *http.Client, key string) bool {
+// releaseIcMeiGoCompletedMailbox frees the concurrency slot of one mailbox on
+// this key whose account already has ChatGPT password + TOTP configured, so
+// future logins no longer depend on mailbox mail. Returns true when a mailbox
+// was released.
+func (s *Server) releaseIcMeiGoCompletedMailbox(client *http.Client, key string) bool {
 	var m SunnyMailbox
 	err := s.db.Where(
-		`mailbox_channel = ? AND access_key = ? AND status <> ? AND (
-			(enabled = ? AND COALESCE(chat_gpt_password,'') <> '' AND COALESCE(totp_secret,'') <> '') OR
-			(status = ? AND COALESCE(chat_gpt_password,'') = '' AND COALESCE(totp_secret,'') = '')
-		)`,
-		"icmeigo", key, "已释放", true, "失败",
-	).Order("CASE WHEN COALESCE(chat_gpt_password,'') <> '' AND COALESCE(totp_secret,'') <> '' THEN 0 ELSE 1 END, updated_at asc").First(&m).Error
+		"mailbox_channel = ? AND access_key = ? AND enabled = ? AND COALESCE(chat_gpt_password,'') <> '' AND COALESCE(totp_secret,'') <> ''",
+		"icmeigo", key, true,
+	).Order("updated_at asc").First(&m).Error
 	if err != nil {
 		return false
 	}
@@ -1851,7 +1852,7 @@ func (s *Server) releaseIcMeiGoSafeMailbox(client *http.Client, key string) bool
 		return false
 	}
 	return s.db.Model(&m).Updates(map[string]any{
-		"enabled": false, "status": "已释放", "last_error": "已释放腾槽（登录已不依赖邮箱或注册已失败）", "updated_at": time.Now(),
+		"enabled": false, "status": "已释放", "last_error": "已释放腾槽（登录已不依赖邮箱）", "updated_at": time.Now(),
 	}).Error == nil
 }
 
@@ -1861,7 +1862,6 @@ func (s *Server) upsertIcMeiGoMailbox(gid uint, email, accessKey string) error {
 		updates := map[string]any{
 			"group_id": gid, "mailbox_type": "apple", "mailbox_channel": "icmeigo",
 			"access_key": accessKey, "raw": email + "----" + accessKey, "enabled": true,
-			"status": "未注册", "last_error": "", "status_changed_at": time.Now(),
 		}
 		return s.db.Model(&old).Updates(updates).Error
 	}
@@ -5878,6 +5878,7 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 		return
 	}
 	if typ == "sunny_register" {
+		s.sunnyRequireIcMeigoLoginSecret(body)
 		identity := strings.ToLower(strings.TrimSpace(text(body["identity"])))
 		if identity == "remail" {
 			if err := s.validateRemailRegistration(body); err != nil {
@@ -5986,6 +5987,18 @@ func (s *Server) sunnyTasks(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 	task := s.createTask(typ, "sunny", body, total)
 	writeJSON(w, 200, serializeTask(task))
+}
+
+func (s *Server) sunnyRequireIcMeigoLoginSecret(body map[string]any) {
+	mailboxIDs := uintSlice(body["mailbox_ids"])
+	if len(mailboxIDs) == 0 {
+		return
+	}
+	var count int64
+	s.db.Model(&SunnyMailbox{}).Where("id IN ? AND mailbox_channel = ?", mailboxIDs, "icmeigo").Count(&count)
+	if count > 0 {
+		body["setup_login_secret"] = true
+	}
 }
 
 func sunnyRegistrationStage(body map[string]any) string {

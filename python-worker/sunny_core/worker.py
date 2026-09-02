@@ -2533,7 +2533,33 @@ def _run_one(
         db.event(message, "warning", detail={"email": email, "scope": "selected", "mailbox_id": mailbox_id, "mailbox_lease_busy": True})
         return False, message
     try:
-        return _run_one_impl(db, task_type, payload, mailbox, index, total, protocol_batch_policy)
+        ok, result = _run_one_impl(db, task_type, payload, mailbox, index, total, protocol_batch_policy)
+        login_secret_incomplete = (
+            task_type == "sunny_register"
+            and payload.get("setup_login_secret") is True
+            and ok
+            and isinstance(result, dict)
+            and not result.get("login_secret_complete")
+        )
+        retry_failure = classify_auth_failure(result) if task_type == "sunny_register" and not ok else None
+        retryable_failure = bool(retry_failure and retry_failure.retryable)
+        if login_secret_incomplete or retryable_failure:
+            email = str(mailbox.get("email") or "")
+            db.event(
+                f"[{email}] [系统] 首次流程未完整成功，将使用全新认证上下文自动重试一次",
+                "warning",
+                detail={"email": email, "scope": "selected", "automatic_retry": True},
+            )
+            if retry_failure and retry_failure.delay_seconds:
+                _interruptible_delay(db, retry_failure.delay_seconds)
+            mailbox = db.fetch_mailbox_by_email(email) or mailbox
+            ok, result = _run_one_impl(
+                db, "sunny_login" if login_secret_incomplete else task_type,
+                payload, mailbox, index, total, protocol_batch_policy,
+            )
+        if ok and payload.get("setup_login_secret") is True and isinstance(result, dict) and not result.get("login_secret_complete"):
+            return False, f"[{mailbox.get('email') or ''}] ChatGPT 注册已完成，但密码与 2FA 未全部设置成功"
+        return ok, result
     finally:
         if callable(release) and mailbox_id > 0:
             release(mailbox_id, owner)
