@@ -348,28 +348,6 @@ func sunnyPaymentProbeCountryList(groups map[string][]SunnyProxy) []string {
 	return countries
 }
 
-// sunnyPaymentProbeProxyForCountry returns one enabled payment-probe proxy
-// address for the given country, preferring proxies whose last check passed.
-// Used to route the post-registration $0 MoMo check through a VN egress proxy
-// (the promo is Vietnam-only; probing through the registration country's IP
-// would make OpenAI see the wrong billing environment).
-func (s *Server) sunnyPaymentProbeProxyForCountry(country string) (string, error) {
-	groups, err := s.sunnyPaymentProxyGroups()
-	if err != nil {
-		return "", err
-	}
-	proxies := groups[country]
-	if len(proxies) == 0 {
-		return "", fmt.Errorf("请先为支付探测用途配置至少一个已启用且国家代码为 %s 的代理", country)
-	}
-	for _, p := range proxies {
-		if p.LastCheckOK {
-			return normalizeSunnyProxyAddress(p.Address), nil
-		}
-	}
-	return normalizeSunnyProxyAddress(proxies[0].Address), nil
-}
-
 func selectSunnyPaymentProxyGroups(groups map[string][]SunnyProxy, requested []string) (map[string][]SunnyProxy, []string, error) {
 	if requested == nil {
 		countries := sunnyPaymentProbeCountryList(groups)
