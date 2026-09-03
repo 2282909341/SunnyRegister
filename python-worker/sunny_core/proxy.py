@@ -7,7 +7,7 @@ import socket
 import ssl
 import time
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import requests
 
@@ -29,29 +29,45 @@ def normalize_proxy_url(value: str, default_scheme: str = "http") -> str:
         return ""
     if "://" in value:
         parsed = urlparse(value)
-        return value if parsed.scheme and parsed.netloc else value
-    if "@" in value:
+        result = value if parsed.scheme and parsed.netloc else value
+    elif "@" in value:
         left, right = value.split("@", 1)
         left_parts = left.split(":")
         right_parts = right.split(":")
         if len(left_parts) >= 2 and len(right_parts) >= 2 and left_parts[1].isdigit() and _looks_like_host(left_parts[0]):
-            return _proxy_url(default_scheme, right_parts[0], ":".join(right_parts[1:]), left_parts[0], left_parts[1])
-        return f"{default_scheme}://{value}"
-    parts = value.split(":")
-    if len(parts) >= 4:
-        if parts[-1].isdigit() and _looks_like_host(parts[-2]):
-            user = parts[0]
-            password = ":".join(parts[1:-2])
-            host = parts[-2]
-            port = parts[-1]
-            return _proxy_url(default_scheme, user, password, host, port)
-        if len(parts) >= 4 and parts[1].isdigit() and _looks_like_host(parts[0]):
-            host = parts[0]
-            port = parts[1]
-            user = parts[2]
-            password = ":".join(parts[3:])
-            return _proxy_url(default_scheme, user, password, host, port)
-    return f"{default_scheme}://{value}"
+            result = _proxy_url(default_scheme, right_parts[0], ":".join(right_parts[1:]), left_parts[0], left_parts[1])
+        else:
+            result = f"{default_scheme}://{value}"
+    else:
+        parts = value.split(":")
+        if len(parts) >= 4:
+            if parts[-1].isdigit() and _looks_like_host(parts[-2]):
+                user = parts[0]
+                password = ":".join(parts[1:-2])
+                host = parts[-2]
+                port = parts[-1]
+                result = _proxy_url(default_scheme, user, password, host, port)
+            elif len(parts) >= 4 and parts[1].isdigit() and _looks_like_host(parts[0]):
+                host = parts[0]
+                port = parts[1]
+                user = parts[2]
+                password = ":".join(parts[3:])
+                result = _proxy_url(default_scheme, user, password, host, port)
+            else:
+                result = f"{default_scheme}://{value}"
+        else:
+            result = f"{default_scheme}://{value}"
+    return _apply_sticky_proxy_scheme(result)
+
+
+def _apply_sticky_proxy_scheme(value: str) -> str:
+    parsed = urlparse(value)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    port = str(parsed.port or "")
+    if scheme in {"http", "https"} and host.endswith("kookeey.info") and port in {"1000", "1086"}:
+        return urlunparse(("socks5h", parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+    return value
 
 
 def _looks_like_host(value: str) -> bool:
