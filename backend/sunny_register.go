@@ -3877,20 +3877,6 @@ func containsString(values []string, target string) bool {
 }
 
 func normalizeSunnyProxyAddress(raw string) string {
-	normalized := normalizeSunnyProxyAddressRaw(raw)
-	if u, err := url.Parse(normalized); err == nil {
-		scheme := strings.ToLower(u.Scheme)
-		if (scheme == "http" || scheme == "https") && strings.HasSuffix(strings.ToLower(u.Hostname()), "kookeey.info") {
-			if port := u.Port(); port == "1000" || port == "1086" {
-				u.Scheme = "socks5h"
-				return u.String()
-			}
-		}
-	}
-	return normalized
-}
-
-func normalizeSunnyProxyAddressRaw(raw string) string {
 	value := strings.TrimSpace(raw)
 	if value == "" {
 		return ""
