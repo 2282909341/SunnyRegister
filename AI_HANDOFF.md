@@ -50,7 +50,7 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 
 | 提交 | 内容 |
 |---|---|
-| 当前提交 | 协议注册恢复作者上游实现，仅保留 CA 证书路径处理与默认本地代理 `7890` |
+| 当前提交 | 协议注册与代理恢复作者上游实现，仅保留 CA 证书路径处理与默认本地代理 `7890`；Kookeey 粘性代理 socks5h 转换已回退（`362aefc`，见 §12） |
 | `8bf3a6e` | 前端：移除 Hero 光球常驻动画 + `will-change` 收敛 + 大阴影收窄（优化工作台滚动掉帧） |
 | `096f0e7` | 前端：移除吸顶栏与卡片 `backdrop-filter` 背景模糊（优化滚动掉帧） |
 | `f04823e` | 前端：`useCachedState` 去双写 + 任务持久化 250ms 防抖 + 表格紧凑化 |
@@ -69,6 +69,8 @@ SunnyRegister 是一套本地运行的账号注册与交付工作台：邮箱验
 已移除的定制项：账号指纹池、账号设备画像、国家代理注册选择、代理会话粘性、账号间 3-8 秒随机间隔、额外的新认证上下文重试、额外的密码/2FA 完整性强制判定、wuasai 取码适配。
 
 当前协议注册的 `curl_cffi` impersonate 回归原版固定 `chrome136`；Sentinel、浏览器回退、Worker 并发和验证码错误处理均以上游实现为准。
+
+代理归一化同样回归上游：注册链路**不再**把 Kookeey 粘性代理（SOCKS5-only，端口 1000/1086）从 http 转成 socks5h。曾临时加入该转换（`5e931ef`）后按用户要求回退（`362aefc`）。提链/checkout 路径的 Kookeey 规则（`backend/sunny_checkout.go:166-168`、`python-worker/tools/pay153_checkout/app.py:544-545`）是作者原版自带、独立存在，未受影响。
 
 ## 6. 封号调查结论（2026-09-02 波浪式扫号）
 
@@ -168,6 +170,8 @@ psql -h $h -p $p -U $u -d $d -c "SELECT ..."
 4. 核对任务 `payload_json` 的 `mailbox_ids/count/concurrency/identity` 与代理快照，不输出敏感字段。
 5. 任务页看似“卡住”时，先判断数据库是 `running` 还是已终止；不能只依赖页面缓存。
 6. 代理类报错（如 `curl: (7) CONNECT tunnel failed, response 502`）→ 按作者原版代理预检和代理池状态排查；当前无粘性代理开关。
+   - Kookeey 粘性代理（SOCKS5-only，端口 1000/1086）在**注册链路**会卡住（HTTP CONNECT 打到 SOCKS5 端口挂起）：注册请用 HTTP 粘性代理（如 bestgo/rrp `global.rrp.bestgo.work:10000`），Kookeey 仅用于提链/checkout。
+   - bestgo/rrp 是 HTTP（非 SOCKS5），归一化正常、全链路可用；其“卡住”并非代理 bug，可疑点为 `sessTime-10` 会话中途换 IP、注册 POST 触发挑战→Camoufox 无头降级慢、账号级风控。
 
 ## 13. 关键环境变量
 
