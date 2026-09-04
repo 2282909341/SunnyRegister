@@ -1498,28 +1498,11 @@ class OpenAIEmailRegisterFlow:
                                     self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
                                 return
                             # Session not confirmed yet. The SPA may be
-                            # stuck before the post-OTP transition; reload the
-                            # page once (never resubmitting the code) and let
-                            # the wait loop pick up the next stage.
-                            self.log("[邮箱] 邮箱验证码已提交但注册状态未推进且 Session 未就绪，刷新页面尝试恢复下一步")
-                            try:
-                                page.reload(wait_until="domcontentloaded", timeout=45000)
-                            except Exception as reload_exc:
-                                self.log(f"[邮箱] 刷新验证码页失败，停止重复提交同一验证码：{str(reload_exc)[:200]}")
-                            else:
-                                try:
-                                    self._wait_after_otp_submit(page, timeout=20)
-                                    return
-                                except RuntimeError as retry_exc:
-                                    if self._otp_session_confirmed(page):
-                                        self.log("[邮箱] 刷新后已确认 ChatGPT Session 可读取，注册实际已完成")
-                                        try:
-                                            self._goto_chatgpt_page(page, self.log, timeout=60000, wait_until="commit")
-                                        except Exception as nav_exc:
-                                            self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
-                                        return
-                                    if self._is_cloudflare_challenge(str(retry_exc)):
-                                        raise
+                            # stuck before the post-OTP transition; recover
+                            # with bounded reloads / Continue clicks, never
+                            # resubmitting the same code.
+                            if self._recover_after_otp_stall(page):
+                                return
                             self.log("[邮箱] 邮箱验证码已提交但注册状态未推进；停止重复提交同一验证码")
                             raise RuntimeError(
                                 "邮箱验证码已由页面提交，但注册状态未推进；为避免触发验证码尝试次数限制，"
@@ -2020,29 +2003,43 @@ class OpenAIEmailRegisterFlow:
             or ("不明なエラー" in value and "text/html" in value)
         )
 
-    def _otp_session_confirmed(self, page) -> bool:
+    def _otp_session_confirmed(self, page, attempts: int = 3) -> bool:
         """Check the ChatGPT session API through the browser cookie jar.
 
         The auth SPA occasionally accepts the email code (HTTP 200) but stalls
         before transitioning. The session cookie may already be valid; probing
         the session API without navigating avoids discarding a finished
         registration just because the frontend never moved.
+
+        The probe goes through the proxy like every other request, so a single
+        transient TLS/network failure must not be mistaken for "not logged in":
+        retry up to ``attempts`` times before returning False.
         """
-        try:
-            response = page.context.request.get(
-                f"{CHATGPT_BASE_URL}/api/auth/session",
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Language": self.fingerprint.accept_language,
-                    "Referer": f"{CHATGPT_BASE_URL}/",
-                },
-                timeout=30000,
-            )
-            body = response.text().strip()
-            data = json.loads(body) if body else {}
-            return isinstance(data, dict) and bool(data.get("accessToken") or data.get("access_token"))
-        except Exception:
-            return False
+        for attempt in range(max(1, attempts)):
+            self._check_cancelled()
+            try:
+                response = page.context.request.get(
+                    f"{CHATGPT_BASE_URL}/api/auth/session",
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Language": self.fingerprint.accept_language,
+                        "Referer": f"{CHATGPT_BASE_URL}/",
+                    },
+                    timeout=30000,
+                )
+                body = response.text().strip()
+                data = json.loads(body) if body else {}
+                if isinstance(data, dict) and bool(data.get("accessToken") or data.get("access_token")):
+                    return True
+            except Exception as exc:
+                if attempt + 1 < max(1, attempts):
+                    self.log(f"[邮箱] Session 确认请求遇到瞬时网络错误，正在重试 ({attempt + 1}/{max(1, attempts) - 1})：{str(exc)[:180]}")
+            if attempt + 1 < max(1, attempts):
+                try:
+                    page.wait_for_timeout(1000 * (attempt + 1))
+                except Exception:
+                    time.sleep(attempt + 1)
+        return False
 
     def _wait_after_otp_submit(self, page, timeout: int = 30) -> None:
         start = time.time()
@@ -2064,6 +2061,98 @@ class OpenAIEmailRegisterFlow:
                 return
             self._sleep_checked(1)
         raise RuntimeError(f"Still on email verification page after OTP submit: {self._page_text_summary(page)}")
+
+    def _click_continue_safe(self, page) -> bool:
+        """Click a visible Continue/Next button, never a resend/back control.
+
+        The stalled SPA sometimes leaves the code form and waits on a success
+        interstitial with a Continue button. This only targets forward-action
+        buttons and refuses anything that looks like resend/cancel/back.
+        """
+        selectors = [
+            'button[data-dd-action-name="Continue"][type="submit"]',
+            'button[data-dd-action-name="Continue"]',
+            'button:has-text("Continue")',
+            'button:has-text("Next")',
+            'button:has-text("继续")',
+            'button:has-text("続行")',
+            'button:has-text("次へ")',
+        ]
+        for selector in selectors:
+            try:
+                target = page.locator(selector).first
+                if not target.is_visible(timeout=700):
+                    continue
+                identity = ""
+                try:
+                    identity = f"{target.inner_text(timeout=500)} {target.get_attribute('aria-label') or ''}".lower()
+                except Exception:
+                    pass
+                if any(marker in identity for marker in (
+                    "resend", "重新发送", "再送信", "send again",
+                    "cancel", "back", "取消", "返回", "キャンセル", "戻る",
+                )):
+                    continue
+                target.click(timeout=5000, force=True)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _recover_after_otp_stall(self, page, rounds: int = 2) -> bool:
+        """Recover a stalled post-OTP SPA without resubmitting the same code.
+
+        The server accepted the code (HTTP 200) but the SPA never moved on.
+        Each round: re-probe the session API, click a safe Continue button
+        when the code form is gone, then reload the page once and wait for
+        the next stage. Never resubmits the code; bounded by ``rounds``.
+        """
+        for round_index in range(1, max(1, rounds) + 1):
+            self._check_cancelled()
+            if self._otp_session_confirmed(page):
+                self.log("[邮箱] 恢复尝试：已确认 ChatGPT Session 可读取，注册实际已完成")
+                try:
+                    self._goto_chatgpt_page(page, self.log, timeout=60000, wait_until="commit")
+                except Exception as nav_exc:
+                    self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
+                return True
+            if not self._has_otp_input(page) and self._click_continue_safe(page):
+                self.log("[邮箱] 恢复尝试：验证码表单已消失，点击了继续按钮推进 SPA")
+                try:
+                    self._wait_after_otp_submit(page, timeout=15)
+                except RuntimeError:
+                    pass
+                if self._otp_session_confirmed(page):
+                    self.log("[邮箱] 恢复尝试：点击继续后已确认 ChatGPT Session 可读取")
+                    try:
+                        self._goto_chatgpt_page(page, self.log, timeout=60000, wait_until="commit")
+                    except Exception as nav_exc:
+                        self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
+                    return True
+            self.log(f"[邮箱] 恢复尝试 {round_index}/{rounds}：验证码已接受但页面未推进，刷新页面等待下一步")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=45000)
+            except Exception as reload_exc:
+                self.log(f"[邮箱] 恢复尝试刷新失败：{str(reload_exc)[:200]}")
+                continue
+            try:
+                self._wait_after_otp_submit(page, timeout=20)
+                return True
+            except RuntimeError as retry_exc:
+                if self._is_cloudflare_challenge(str(retry_exc)):
+                    raise
+                if self._otp_session_confirmed(page):
+                    self.log("[邮箱] 恢复尝试：刷新后已确认 ChatGPT Session 可读取，注册实际已完成")
+                    try:
+                        self._goto_chatgpt_page(page, self.log, timeout=60000, wait_until="commit")
+                    except Exception as nav_exc:
+                        self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
+                    return True
+        return False
 
     def _is_cloudflare_challenge(self, text: str) -> bool:
         value = str(text or "")
