@@ -148,11 +148,11 @@ def _is_transient_browser_network_error(error: Any) -> bool:
     return any(marker in message for marker in _TRANSIENT_BROWSER_NETWORK_MARKERS)
 
 
-def _goto_chatgpt_page(page: Any, log: Callable[[str], None] | None = None, *, timeout: int = 60000):
+def _goto_chatgpt_page(page: Any, log: Callable[[str], None] | None = None, *, timeout: int = 60000, wait_until: str = "domcontentloaded"):
     """Open ChatGPT with bounded retries for proxy/browser TLS resets."""
     for attempt in range(3):
         try:
-            return page.goto(CHATGPT_BASE_URL, wait_until="domcontentloaded", timeout=timeout)
+            return page.goto(CHATGPT_BASE_URL, wait_until=wait_until, timeout=timeout)
         except Exception as exc:
             if attempt >= 2 or not _is_transient_browser_network_error(exc):
                 raise
@@ -691,7 +691,7 @@ class OpenAIEmailRegisterFlow:
                     )
                     _goto_auth_page(page, protocol_handoff["resume_url"], self.log, timeout=90000)
                 else:
-                    landing_response = _goto_chatgpt_page(page, self.log, timeout=60000)
+                    landing_response = _goto_chatgpt_page(page, self.log, timeout=30000, wait_until="commit")
                     if landing_response and landing_response.status >= 400:
                         self.log(f"[认证] ChatGPT 首页返回 HTTP {landing_response.status}，继续尝试通过浏览器会话初始化认证")
                     self._check_cancelled()
@@ -1403,6 +1403,23 @@ class OpenAIEmailRegisterFlow:
             return False
         return bool(self._visible_inputs(page, ['input[autocomplete="one-time-code"]', 'input[name="code"]', 'input[inputmode="numeric"]']))
 
+    def _wait_for_otp_input(self, page, timeout: float = 20.0) -> bool:
+        """Wait for the OTP input to appear before filling it.
+
+        The auth SPA can keep the email-verification form hidden for a few
+        seconds after the email submit redirects. Filling too early used to
+        fail with "Email OTP input was not found"; this bounds that race
+        without extending the overall registration deadline.
+        """
+        selectors = ['input[autocomplete="one-time-code"]', 'input[name="code"]', 'input[inputmode="numeric"]']
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._visible_inputs(page, selectors):
+                return True
+            self._check_cancelled()
+            self._sleep_checked(0.5)
+        return bool(self._visible_inputs(page, selectors))
+
     def _submit_email_code(self, page, min_timestamp: float) -> None:
         if not self.otp_reader:
             if self.account.mailbox_type == "apple" and self.account.mailbox_channel == "url_api" and not self.account.access_key:
@@ -1440,6 +1457,8 @@ class OpenAIEmailRegisterFlow:
                 self._wait_after_otp_submit(page)
                 return
 
+            if not self._wait_for_otp_input(page):
+                raise RuntimeError("Email OTP input was not found")
             if not self._fill_email_code_inputs(page, code):
                 raise RuntimeError("Email OTP input was not found")
             try:
@@ -1861,6 +1880,8 @@ class OpenAIEmailRegisterFlow:
 
     def _validate_email_code_api(self, page, code: str) -> str:
         last_detail = ""
+        fresh_code_attempted = False
+        previous_code = str(code or "").strip()
         for attempt in range(3):
             self._check_cancelled()
             try:
@@ -1913,6 +1934,23 @@ class OpenAIEmailRegisterFlow:
                 or "不正確なコード" in last_detail
                 or "验证码错误" in last_detail
             ):
+                # One bounded fresh-code retry: a stale or mistyped code is
+                # common after long mailbox round-trips. Re-sending is safe and
+                # never retries the same rejected code, avoiding check limits.
+                if not fresh_code_attempted and self._click_resend_email_code(page):
+                    fresh_code_attempted = True
+                    requested_at = time.time() - 2
+                    self.log("[邮箱] 邮箱验证码被 OpenAI 拒绝，已请求新的验证码并继续等待")
+                    try:
+                        code = self.otp_reader.wait_for_code(requested_at, EMAIL_OTP_RESEND_WAIT_SECONDS)
+                    except TimeoutError as exc:
+                        raise RuntimeError("重新发送 OpenAI 邮箱验证码后等待 60 秒仍未收到验证码") from exc
+                    if str(code) == str(previous_code):
+                        raise RuntimeError("邮箱服务返回了与已拒绝验证码相同的内容；已停止重复提交，请稍后重新发起任务")
+                    self.recent_email_code = str(code or "").strip()
+                    self.recent_email_code_at = time.time()
+                    self._reset_email_otp_submit_guard(page)
+                    continue
                 raise RuntimeError("邮箱验证码被 OpenAI 拒绝；系统已停止重复提交该验证码")
             if int(result.get("status") or 0) == 0 and attempt < 2:
                 self.log("[认证] EmailOtpValidate 浏览器请求被中止，将保持当前验证码并重试")

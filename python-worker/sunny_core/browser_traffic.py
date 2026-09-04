@@ -449,6 +449,15 @@ class BrowserTrafficOptimizer:
             return ""
         if resource_type in self._heavy_types:
             return resource_type
+        if not self.session_only and _host_matches(host, {"chatgpt.com"}) and resource_type in {"script", "stylesheet"}:
+            # The pre-auth landing only needs the response headers (Next-auth
+            # CSRF / device cookies). The chatgpt.com SPA bundles are never
+            # used: CSRF and sign-in run through API requests. Downloading
+            # them costs multiple MB per registration. cdn.openai.com and
+            # oaistatic.com stay untouched because the auth.openai.com forms
+            # load their scripts from them.
+            return f"pre_auth_{resource_type or 'other'}"
+
         if self.session_only and _host_matches(host, {"chatgpt.com"}):
             if resource_type == "document" or path.startswith(self._session_paths):
                 return ""

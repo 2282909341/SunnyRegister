@@ -1096,6 +1096,14 @@ class ProtocolRegistrationFlow:
             if response.status_code == 200:
                 break
             body = str(getattr(response, "text", "") or "")
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status >= 500 and attempt < len(retry_delays):
+                delay = retry_delays[attempt]
+                self.log(f"[认证] 创建账号收到 HTTP {status} 服务端错误，等待 {delay} 秒后重试 {attempt + 1}/{len(retry_delays) + 1}")
+                self._check_cancelled()
+                time.sleep(delay)
+                self._check_cancelled()
+                continue
             if "registration_disallowed" not in body or attempt >= len(retry_delays):
                 raise _response_error(response, "Create ChatGPT account")
             delay = retry_delays[attempt]
