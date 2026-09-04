@@ -129,6 +129,14 @@ _TRANSIENT_BROWSER_NETWORK_MARKERS = (
     "packet length too long",
     "tls_get_more_records",
     "unexpected eof",
+    # Proxy pool hiccups observed during batch registration:
+    # - Playwright reports "Timeout 30000ms exceeded" instead of "timed out"
+    # - Node's APIRequestContext reports "connect ETIMEDOUT <host>:<port>"
+    # - Camoufox reports NS_ERROR_UNKNOWN_PROXY_HOST when the proxy domain
+    #   fails to resolve for a moment
+    "timeout",
+    "etimedout",
+    "unknown_proxy_host",
 )
 
 

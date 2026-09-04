@@ -278,7 +278,7 @@ class BrowserTrafficOptimizer:
     }
     _static_suffixes = {"auth.openai.com", "chatgpt.com", "cdn.openai.com", "oaistatic.com"}
     _telemetry_suffixes = {
-        "browser-intake-datadoghq.com", "datadoghq.com", "featuregates.org",
+        "ab.chatgpt.com", "browser-intake-datadoghq.com", "datadoghq.com", "featuregates.org",
         "segment.com", "segment.io", "sentry.io", "statsigapi.net",
     }
     _heavy_types = {"image", "font", "media", "manifest"}
