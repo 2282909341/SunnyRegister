@@ -1492,8 +1492,8 @@ class OpenAIEmailRegisterFlow:
                             self.log("[邮箱] 页面拒绝了当前验证码；不会重复提交同一验证码，正在请求并等待新验证码")
                             self._retry_with_fresh_email_code(page, code)
                             return
-                        if self._email_otp_validation_was_sent(journal):
-                            # The server already answered 200: the code was
+                        if self._email_otp_validation_was_sent(journal) and not self._email_otp_validation_failed(journal):
+                            # The server answered (RESP 200): the code was
                             # accepted, only the SPA transition stalled.
                             # Confirm through the session API and, if logged
                             # in, move to the ChatGPT page so the main loop
@@ -1516,10 +1516,16 @@ class OpenAIEmailRegisterFlow:
                                 "邮箱验证码已由页面提交，但注册状态未推进；为避免触发验证码尝试次数限制，"
                                 f"已停止重复提交同一验证码。关键请求：{self._email_otp_network_summary(journal)}"
                             ) from exc
-                        self.log(
-                            "[邮箱] Camoufox 页面提交未推进注册状态，改用同一浏览器会话 "
-                            f"Sentinel 接口校验：{detail[:220]}"
-                        )
+                        if self._email_otp_validation_failed(journal):
+                            self.log(
+                                "[邮箱] Camoufox 页面提交的验证码请求未送达服务端（请求被中止），"
+                                "保持同一验证码改用浏览器会话 Sentinel 接口重新提交"
+                            )
+                        else:
+                            self.log(
+                                "[邮箱] Camoufox 页面提交未推进注册状态，改用同一浏览器会话 "
+                                f"Sentinel 接口校验：{detail[:220]}"
+                            )
                 else:
                     self.log("[邮箱] Camoufox 页面未找到可用提交控件，改用同一浏览器会话 Sentinel 接口校验")
                 continue_url = self._validate_email_code_api(page, code)
@@ -1771,6 +1777,16 @@ class OpenAIEmailRegisterFlow:
     def _email_otp_validation_was_sent(self, journal: list[str]) -> bool:
         return any(
             item.startswith("REQ POST ") and ("email-otp" in item or "email-verification" in item)
+            for item in journal
+        )
+
+    def _email_otp_validation_failed(self, journal: list[str]) -> bool:
+        # A FAIL journal line means the browser request was aborted before the
+        # server answered (e.g. NS_BINDING_ABORTED / NS_ERROR_ABORT): the code
+        # most likely never reached OpenAI, so resubmitting the SAME code is
+        # safe and does not consume the attempt limit.
+        return any(
+            item.startswith("FAIL POST ") and ("email-otp" in item or "email-verification" in item)
             for item in journal
         )
 
