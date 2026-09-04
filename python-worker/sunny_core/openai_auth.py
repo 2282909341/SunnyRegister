@@ -134,9 +134,14 @@ _TRANSIENT_BROWSER_NETWORK_MARKERS = (
     # - Node's APIRequestContext reports "connect ETIMEDOUT <host>:<port>"
     # - Camoufox reports NS_ERROR_UNKNOWN_PROXY_HOST when the proxy domain
     #   fails to resolve for a moment
+    # - Camoufox reports NS_ERROR_NET_PARTIAL_TRANSFER / NS_ERROR_NET_RESET
+    #   when the proxy tunnel dies mid-navigation to the OAuth authorize URL
     "timeout",
     "etimedout",
     "unknown_proxy_host",
+    "ns_error_net_partial_transfer",
+    "ns_error_net_reset",
+    "ns_error_net_interrupt",
 )
 
 
@@ -196,8 +201,10 @@ def _goto_auth_page(page: Any, url: str, log: Callable[[str], None] | None = Non
     """Navigate to auth while tolerating browser-engine redirect cancellation.
 
     Firefox/Camoufox reports NS_BINDING_ABORTED when an auth response replaces
-    the requested document with an immediate redirect. It is only considered
-    successful after the page has actually landed on an OpenAI/ChatGPT origin.
+    the requested document with an immediate redirect, and transient tunnel
+    failures (NS_ERROR_NET_PARTIAL_TRANSFER etc.) when the proxy connection
+    dies mid-navigation. Both are only considered successful after the page
+    has actually landed on an OpenAI/ChatGPT origin.
     """
     previous_url = str(getattr(page, "url", "") or "")
     try:
@@ -207,7 +214,7 @@ def _goto_auth_page(page: Any, url: str, log: Callable[[str], None] | None = Non
             if log:
                 log(f"[认证] 认证页面已进入 OpenAI 域，但 DOM 加载等待超时；继续处理当前页面：{page.url}")
             return None
-        if not _is_navigation_aborted(exc):
+        if not (_is_navigation_aborted(exc) or _is_transient_browser_network_error(exc)):
             raise
         try:
             page.wait_for_timeout(600)
@@ -220,7 +227,7 @@ def _goto_auth_page(page: Any, url: str, log: Callable[[str], None] | None = Non
         try:
             return page.goto(url, wait_until="commit", timeout=min(timeout, 30000))
         except Exception as retry_exc:
-            if _is_navigation_aborted(retry_exc) and _auth_navigation_landed(page, previous_url):
+            if (_is_navigation_aborted(retry_exc) or _is_transient_browser_network_error(retry_exc)) and _auth_navigation_landed(page, previous_url):
                 if log:
                     log(f"[认证] 认证导航重试已进入目标站点，继续处理当前页面：{page.url}")
                 return None
