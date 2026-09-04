@@ -1292,6 +1292,8 @@ class OpenAIEmailRegisterFlow:
             "cannot create an account with the information",
             "无法使用您输入的信息创建账户",
             "無法使用您輸入的資訊建立帳戶",
+            "誤りがあるようです",
+            "もう一度お試しください",
         )
         return text[:300] if any(marker in lowered for marker in markers) else ""
 
@@ -2478,7 +2480,9 @@ class OpenAIEmailRegisterFlow:
             raise RuntimeError("Profile page missing name/age inputs")
         self._force_fill(controls[0], name)
         date_controls = self._about_you_date_controls(controls)
-        if second_kind == "birth_date" and date_controls:
+        if date_controls and (
+            second_kind == "birth_date" or (second_kind == "birth_year" and len(date_controls) >= 2)
+        ):
             self._fill_about_you_date_controls(date_controls, birthdate, second_context)
         else:
             self._force_fill(controls[1], second_value)
@@ -2604,7 +2608,7 @@ class OpenAIEmailRegisterFlow:
             r"\bmm\s*[/.-]\s*dd\s*[/.-]\s*yyyy\b", r"\byyyy\s*[/.-]\s*mm\s*[/.-]\s*dd\b", r"type=date",
         ]
         birth_year_patterns = [
-            r"birth\s*year", r"year\s*of\s*birth", r"born\s*year", r"生年", r"出生年", r"生まれた年", r"出生年份",
+            r"birth\s*year", r"year\s*of\s*birth", r"born\s*year", r"生年(?!月)", r"出生年(?!月)", r"生まれた年", r"出生年份",
         ]
         age_patterns = [
             r"\bage\b", r"how\s*old", r"年齢", r"歳", r"才", r"何歳", r"何才", r"年龄", r"年纪",
