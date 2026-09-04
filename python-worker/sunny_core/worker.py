@@ -17,20 +17,13 @@ import requests
 from .access_token_probe import probe_access_token
 from .agent_identity import AgentIdentityUnavailableError, create_agent_identity_auth
 from .auth_resilience import classify_auth_failure, retry_allowed
-from .browser_backend import open_registration_browser
-from .browser_traffic import BrowserTrafficOptimizer, ProxyTrafficMeter, use_traffic_meter
+from .browser_traffic import ProxyTrafficMeter, use_traffic_meter
 from .db import SunnyDB, SunnyTaskCancelled, now_sql
 from .domain_mail_cleanup import cleanup_failed_mailbox
 from .firefox_sms import FIREFOX_RELEASE_DELAY_SECONDS, FireFoxSMSClient
 from .luban_sms import LubanSMSClient
 from .mailbox import MailboxAccessError, account_from_row, parse_account_line
-from .openai_auth import (
-    TaskCancelledError,
-    _goto_chatgpt_page,
-    generate_register_fingerprint,
-    login_or_register,
-    refresh_openai_access_token,
-)
+from .openai_auth import TaskCancelledError, login_or_register, refresh_openai_access_token
 from .phone_pool import read_sms_candidates, wait_sms_code
 from .protocol_auth import ProtocolChallengeRequired, ProtocolRegistrationError, login_or_register_protocol
 from .login_secret import setup_login_secret, setup_login_secret_protocol
@@ -1930,109 +1923,6 @@ def _run_one_impl(
             detail={"email": email, "scope": "selected", "stage": stage},
         )
 
-    def _warmup_protocol_session(
-        db: SunnyDB,
-        email: str,
-        session: dict[str, Any],
-        proxy_url: str,
-        *,
-        should_cancel: Callable[[], bool] | None = None,
-        log: Callable[[str, str], None] | None = None,
-        traffic_meter: ProxyTrafficMeter | None = None,
-        traffic_config: Any = None,
-    ) -> dict[str, Any]:
-        """Open chatgpt.com once with the protocol-created session to surface real
-        browser signals right after a pure-protocol registration/login. This runs
-        inside OpenAI's post-registration async review window (~10 minutes) so a
-        protocol account is not judged by its bare HTTP/TLS fingerprint alone.
-
-        Best-effort only: any failure or cancellation keeps the registered account
-        and never raises. Static/heavy resources are blocked to keep traffic small.
-        """
-        storage_state = session.get("storage_state_json")
-        cookies = storage_state.get("cookies") if isinstance(storage_state, dict) else None
-        if not isinstance(cookies, list) or not cookies:
-            if log:
-                log(f"[{email}] [暖机] 协议会话没有可用的存储 Cookie，跳过浏览器暖机", "warning")
-            session["warmup"] = {"ok": False, "reason": "no_cookies"}
-            return session
-        if should_cancel and should_cancel():
-            if log:
-                log(f"[{email}] [暖机] 收到取消请求，跳过浏览器暖机", "warning")
-            session["warmup"] = {"ok": False, "reason": "cancelled"}
-            return session
-        started = time.time()
-        try:
-            fingerprint = generate_register_fingerprint()
-            with open_registration_browser(
-                headless=True,
-                proxy_url=proxy_url,
-                fingerprint=fingerprint,
-                log=log or (lambda _m, _l="info": None),
-                storage_state=storage_state,
-            ) as browser_session:
-                context = browser_session.context
-                try:
-                    BrowserTrafficOptimizer(traffic_meter, traffic_config).attach(context)
-                except Exception as exc:
-                    if log:
-                        log(f"[{email}] [暖机] 浏览器流量优化器挂载失败，继续暖机：{str(exc)[:180]}", "warning")
-                page = context.new_page()
-                _goto_chatgpt_page(page, log, timeout=60000)
-                deadline = time.time() + 60
-                confirmed = False
-                cancelled = False
-                while time.time() < deadline:
-                    if should_cancel and should_cancel():
-                        cancelled = True
-                        break
-                    try:
-                        payload = page.evaluate(
-                            """async () => {
-                                try {
-                                    const r = await fetch('/api/auth/session', {credentials: 'include'});
-                                    if (!r.ok) return null;
-                                    return await r.json();
-                                } catch (e) { return null; }
-                            }"""
-                        )
-                    except Exception:
-                        payload = None
-                    if payload and (payload.get("accessToken") or payload.get("access_token")):
-                        confirmed = True
-                        break
-                    try:
-                        page.wait_for_timeout(3000)
-                    except Exception:
-                        time.sleep(3)
-                elapsed = round(time.time() - started, 1)
-                if confirmed:
-                    try:
-                        session["storage_state_json"] = context.storage_state()
-                    except Exception:
-                        pass
-                    session["warmup"] = {"ok": True, "elapsed_seconds": elapsed}
-                    if log:
-                        log(
-                            f"[{email}] [暖机] 协议账号已通过真实浏览器会话确认登录，"
-                            f"在 OpenAI 复查窗口内补充了浏览器信号（{elapsed} 秒）",
-                            "info",
-                        )
-                else:
-                    reason = "cancelled" if cancelled else "session_not_confirmed"
-                    session["warmup"] = {"ok": False, "reason": reason, "elapsed_seconds": elapsed}
-                    if log:
-                        log(
-                            f"[{email}] [暖机] "
-                            + ("收到取消请求，暖机未完成，账号已保留" if cancelled else "60 秒内未在浏览器会话确认登录，暖机未完成，账号已保留"),
-                            "warning",
-                        )
-        except Exception as exc:
-            session["warmup"] = {"ok": False, "reason": "error", "error": str(exc)[:300]}
-            if log:
-                log(f"[{email}] [暖机] 浏览器暖机失败，不影响已注册账号：{str(exc)[:300]}", "warning")
-        return session
-
     def run_protocol_headless_fallback(existing_session: dict[str, Any] | None = None) -> dict[str, Any]:
         """Use the single Camoufox path shared by direct and protocol fallback registration."""
         return login_or_register(
@@ -2227,7 +2117,6 @@ def _run_one_impl(
             )
         db.ensure_not_cancelled()
         _persist_authenticated_login(db, identity_email, mailbox_id, session, account.raw)
-        browser_touched_after_registration = str(session.get("execution_mode") or "") == "protocol_post_stage"
         persisted_access_token = str(session.get("access_token") or "").strip()
         persisted_refresh_token = str(session.get("refresh_token") or session.get("openai_rt") or "").strip()
         persisted_id_token = str(session.get("id_token") or "").strip()
@@ -2295,7 +2184,6 @@ def _run_one_impl(
                         browser_result[key] = protocol_login_secret_result[key]
                 login_secret_result = browser_result
                 login_secret_from_browser = True
-                browser_touched_after_registration = True
                 if isinstance(browser_result.get("session"), dict):
                     session = browser_result["session"]
             except Exception as exc:
@@ -2329,7 +2217,6 @@ def _run_one_impl(
                     ),
                 )
                 _raise_if_login_secret_account_deactivated(login_secret_result)
-                browser_touched_after_registration = True
                 if login_secret_result.get("password_added"):
                     db.save_chatgpt_password(mailbox_id, str(login_secret_result.get("password") or ""))
                 if login_secret_result.get("totp_added"):
@@ -2385,19 +2272,6 @@ def _run_one_impl(
                         "totp_complete": bool(login_secret_result.get("totp_secret")),
                         "access_token_refreshed": bool(login_secret_result.get("access_token_refreshed")),
                     },
-                )
-        if execution_mode == "protocol" and task_type == "sunny_register" and not browser_touched_after_registration:
-            session_mode = str(session.get("execution_mode") or "")
-            if session_mode not in {"protocol_post_stage", "protocol_headless_fallback"}:
-                session = _warmup_protocol_session(
-                    db,
-                    email,
-                    session,
-                    proxies["register"],
-                    should_cancel=db.cancel_requested,
-                    log=lambda m, lvl="info": db.event(m, lvl, detail={"email": email, "scope": "selected"}),
-                    traffic_meter=traffic_meter,
-                    traffic_config=payload.get("browser_traffic_optimization"),
                 )
         if session.get("phone_binding_skipped_reason"):
             phone_skipped_reason = str(session.get("phone_binding_skipped_reason") or "")
@@ -2463,8 +2337,6 @@ def _run_one_impl(
             result["protocol_traffic"] = session["protocol_traffic"]
         if session.get("protocol_fallback"):
             result["protocol_fallback"] = str(session["protocol_fallback"])
-        if isinstance(session.get("warmup"), dict):
-            result["warmup"] = session["warmup"]
         result["proxy_traffic"] = traffic_meter.snapshot()
         if post_registration_error:
             result["stage_error"] = post_registration_error
