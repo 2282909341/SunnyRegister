@@ -2521,7 +2521,9 @@ def _run_one(
     owner = f"{getattr(db, 'task_id', 'inline')}:{mailbox_id}:{index}:{uuid.uuid4().hex}"
     acquired = mailbox_id <= 0 or not callable(acquire)
     if callable(acquire) and mailbox_id > 0:
-        for _attempt in range(16):
+        # 60 秒内等待邮箱租约释放：并发注册与 add_ls 任务可能短暂占用同一邮箱，
+        # 16 秒窗口过短导致正常收尾中的任务被误判为冲突失败。
+        for _attempt in range(60):
             db.ensure_not_cancelled()
             if acquire(mailbox_id, owner, ttl_seconds=900):
                 acquired = True

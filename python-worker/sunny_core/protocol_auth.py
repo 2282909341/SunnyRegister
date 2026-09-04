@@ -335,7 +335,6 @@ class ProtocolRegistrationFlow:
             except Exception as exc:
                 if (
                     attempt < 2
-                    and method.upper() in {"GET", "HEAD", "OPTIONS"}
                     and _is_transient_transport_error(exc)
                 ):
                     self.log(f"[协议] {step} 遇到临时网络错误，正在重试 ({attempt + 1}/2)")
