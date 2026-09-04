@@ -122,6 +122,13 @@ _TRANSIENT_BROWSER_NETWORK_MARKERS = (
     "ns_error_net_timeout",
     "connection reset",
     "timed out",
+    # Proxy TLS tunnels frequently die mid-record: OpenSSL reports these as
+    # ERR_SSL_TLS_GET_MORE_RECORDS / EPROTO instead of a clean reset. Retrying
+    # the same request usually succeeds once the tunnel is re-established.
+    "eproto",
+    "packet length too long",
+    "tls_get_more_records",
+    "unexpected eof",
 )
 
 
