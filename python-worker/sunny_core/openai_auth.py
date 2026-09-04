@@ -1478,6 +1478,42 @@ class OpenAIEmailRegisterFlow:
                             self._retry_with_fresh_email_code(page, code)
                             return
                         if self._email_otp_validation_was_sent(journal):
+                            # The server already answered 200: the code was
+                            # accepted, only the SPA transition stalled.
+                            # Confirm through the session API and, if logged
+                            # in, move to the ChatGPT page so the main loop
+                            # sees the established session.
+                            if self._otp_session_confirmed(page):
+                                self.log("[邮箱] 邮箱验证码已被服务端接受且 ChatGPT Session 已可读取，注册实际已完成，返回 ChatGPT 页面继续")
+                                try:
+                                    self._goto_chatgpt_page(page, self.log, timeout=60000, wait_until="commit")
+                                except Exception as nav_exc:
+                                    self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
+                                return
+                            # Session not confirmed yet. The SPA may be
+                            # stuck before the post-OTP transition; reload the
+                            # page once (never resubmitting the code) and let
+                            # the wait loop pick up the next stage.
+                            self.log("[邮箱] 邮箱验证码已提交但注册状态未推进且 Session 未就绪，刷新页面尝试恢复下一步")
+                            try:
+                                page.reload(wait_until="domcontentloaded", timeout=45000)
+                            except Exception as reload_exc:
+                                self.log(f"[邮箱] 刷新验证码页失败，停止重复提交同一验证码：{str(reload_exc)[:200]}")
+                            else:
+                                try:
+                                    self._wait_after_otp_submit(page, timeout=20)
+                                    return
+                                except RuntimeError as retry_exc:
+                                    if self._otp_session_confirmed(page):
+                                        self.log("[邮箱] 刷新后已确认 ChatGPT Session 可读取，注册实际已完成")
+                                        try:
+                                            self._goto_chatgpt_page(page, self.log, timeout=60000, wait_until="commit")
+                                        except Exception as nav_exc:
+                                            self.log(f"[邮箱] 返回 ChatGPT 页面失败，按已验证完成继续：{str(nav_exc)[:220]}")
+                                        return
+                                    if self._is_cloudflare_challenge(str(retry_exc)):
+                                        raise
+                            self.log("[邮箱] 邮箱验证码已提交但注册状态未推进；停止重复提交同一验证码")
                             raise RuntimeError(
                                 "邮箱验证码已由页面提交，但注册状态未推进；为避免触发验证码尝试次数限制，"
                                 f"已停止重复提交同一验证码。关键请求：{self._email_otp_network_summary(journal)}"
@@ -1976,6 +2012,30 @@ class OpenAIEmailRegisterFlow:
             or ("Route Error" in value and "text/html" in value)
             or ("不明なエラー" in value and "text/html" in value)
         )
+
+    def _otp_session_confirmed(self, page) -> bool:
+        """Check the ChatGPT session API through the browser cookie jar.
+
+        The auth SPA occasionally accepts the email code (HTTP 200) but stalls
+        before transitioning. The session cookie may already be valid; probing
+        the session API without navigating avoids discarding a finished
+        registration just because the frontend never moved.
+        """
+        try:
+            response = page.context.request.get(
+                f"{CHATGPT_BASE_URL}/api/auth/session",
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Language": self.fingerprint.accept_language,
+                    "Referer": f"{CHATGPT_BASE_URL}/",
+                },
+                timeout=30000,
+            )
+            body = response.text().strip()
+            data = json.loads(body) if body else {}
+            return isinstance(data, dict) and bool(data.get("accessToken") or data.get("access_token"))
+        except Exception:
+            return False
 
     def _wait_after_otp_submit(self, page, timeout: int = 30) -> None:
         start = time.time()
