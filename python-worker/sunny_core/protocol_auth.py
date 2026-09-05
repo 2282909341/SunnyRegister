@@ -1124,26 +1124,36 @@ class ProtocolRegistrationFlow:
     def _finish_session(self, continue_url: str) -> dict[str, Any]:
         target = str(continue_url or self.auth_url or "").strip()
         self.browser_resume_url = target or self.browser_resume_url
-        if target:
-            response = self._request(
+        session_json: dict[str, Any] = {}
+        access_token = ""
+        for attempt in range(3):
+            if target:
+                response = self._request(
+                    "GET",
+                    target,
+                    step="Complete OpenAI callback",
+                    allow_redirects=True,
+                    headers={"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                )
+                if response.status_code >= 400:
+                    raise _response_error(response, "Complete OpenAI callback")
+            session_response = self._request(
                 "GET",
-                target,
-                step="Complete OpenAI callback",
-                allow_redirects=True,
-                headers={"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                f"{CHATGPT_BASE_URL}/api/auth/session",
+                step="Read ChatGPT session",
+                headers={"accept": "application/json", "referer": f"{CHATGPT_BASE_URL}/"},
             )
-            if response.status_code >= 400:
-                raise _response_error(response, "Complete OpenAI callback")
-        session_response = self._request(
-            "GET",
-            f"{CHATGPT_BASE_URL}/api/auth/session",
-            step="Read ChatGPT session",
-            headers={"accept": "application/json", "referer": f"{CHATGPT_BASE_URL}/"},
-        )
-        if session_response.status_code != 200:
-            raise _response_error(session_response, "Read ChatGPT session")
-        session_json = _json_response(session_response, "Read ChatGPT session")
-        access_token = str(session_json.get("accessToken") or session_json.get("access_token") or "")
+            if session_response.status_code != 200:
+                raise _response_error(session_response, "Read ChatGPT session")
+            session_json = _json_response(session_response, "Read ChatGPT session")
+            access_token = str(session_json.get("accessToken") or session_json.get("access_token") or "")
+            if access_token:
+                break
+            if attempt < 2:
+                delay = 1.5 * (attempt + 1)
+                self.log(f"[认证] 回调完成后未读取到 accessToken，可能是代理截断了回调链，{delay:.1f} 秒后重试（{attempt + 1}/3）")
+                time.sleep(delay)
+                self._check_cancelled()
         if not access_token:
             raise ProtocolRegistrationError("ChatGPT session did not return accessToken")
         account_payload = session_json.get("account") if isinstance(session_json.get("account"), dict) else {}

@@ -120,11 +120,18 @@ class ChangeEmailClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         started = time.monotonic()
-        try:
-            response = self.session.request(method, f"{CHATGPT_ORIGIN}{path}", headers=self._headers(path, kwargs.get("json") is not None), timeout=30, **kwargs)
-        except Exception as exc:
-            self.log(f"[换绑接口] {method} {path} 网络请求失败（耗时 {time.monotonic() - started:.1f}s）：{str(exc)[:300]}")
-            raise RebindError(f"换绑接口网络请求失败：{method} {path}: {exc}") from exc
+        for attempt in range(3):
+            try:
+                response = self.session.request(method, f"{CHATGPT_ORIGIN}{path}", headers=self._headers(path, kwargs.get("json") is not None), timeout=30, **kwargs)
+                break
+            except Exception as exc:
+                if attempt >= 2 or not _is_retryable_rebind_error(exc):
+                    self.log(f"[换绑接口] {method} {path} 网络请求失败（耗时 {time.monotonic() - started:.1f}s）：{str(exc)[:300]}")
+                    raise RebindError(f"换绑接口网络请求失败：{method} {path}: {exc}") from exc
+                delay = 0.5 * (2 ** attempt)
+                self.log(f"[换绑接口] {method} {path} 网络请求失败（耗时 {time.monotonic() - started:.1f}s），{delay:.1f} 秒后重试（{attempt + 1}/3）：{str(exc)[:200]}")
+                time.sleep(delay)
+                self.flow._check_cancelled()
         body = str(getattr(response, "text", "") or "")[:1000]
         request_id = str(getattr(response, "headers", {}).get("x-request-id") or "").strip()
         request_suffix = f"，request_id={request_id}" if request_id else ""
