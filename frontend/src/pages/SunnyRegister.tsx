@@ -2383,13 +2383,14 @@ function DomainMailboxProviderConfig({ t, config, setConfig, notify }: { t: type
   </Card>;
 }
 
-const MAILCOM_DOMAINS = ["mail.com","email.com","usa.com","europe.com","post.com","consultant.com","engineer.com","writeme.com","techie.com","journalist.com","musician.org"];
+const MAILCOM_DOMAINS = ["mail.com","email.com","usa.com","europe.com","post.com","consultant.com","engineer.com","writeme.com","techie.com","journalist.com","musician.org","dr.com"];
 
 function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh; config: AnyObj; setConfig: (v: AnyObj)=>void; notify:(type:"ok"|"fail", text:string)=>void }) {
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useCachedState("mailbox.mailcom.expanded", true);
   const [aliases, setAliases] = useState<AnyObj[]>([]);
   const [splitDomain, setSplitDomain] = useState("mail.com");
+  const [customDomain, setCustomDomain] = useState("");
   const [splitCount, setSplitCount] = useState(3);
   const [selectedMaster, setSelectedMaster] = useState("");
   const [checking, setChecking] = useState<string>("");
@@ -2430,9 +2431,10 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
   async function doSplit() {
     if (!enabled) { notify("fail", "请先启用 Mail.com 分裂邮箱"); return; }
     if (!selectedMaster) { notify("fail", "请选择主账号"); return; }
+    const domain = (customDomain || "").trim() || splitDomain;
     setBusy(true);
     try {
-      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain:splitDomain, count:splitCount})});
+      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain, count:splitCount})});
       const created = Number(result.created || 0);
       notify("ok", `分裂成功 ${created} 个：${result.email || ""}`);
       await loadAliases();
@@ -2484,6 +2486,7 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
       <div className="flex flex-wrap items-end gap-3 rounded-xl border border-slate-200 p-3">
         <div><Label>选择主账号</Label><SelectBox searchable value={selectedMaster} onChange={(v)=>setSelectedMaster(String(v))} options={[{value:"",label:"请选择…"}, ...accountEmails.map((email)=>String(email)).filter(Boolean).map((email)=>({value:email,label:email}))]} /></div>
         <div><Label>分裂域名</Label><SelectBox value={splitDomain} onChange={(v)=>setSplitDomain(String(v))} options={[{value:"",label:"原邮箱域名"}, ...MAILCOM_DOMAINS.map((domain)=>({value:domain,label:domain}))]} /></div>
+        <div><Label>自定义域名（可选，优先于下拉）</Label><Input value={customDomain} onChange={(e)=>setCustomDomain(e.target.value)} placeholder="dr.com" /></div>
         <div><Label>分裂数量</Label><Input type="number" min={1} max={9} value={splitCount} onChange={(e)=>setSplitCount(Math.max(1,Math.min(9,Number(e.target.value||1))))} className="w-24"/></div>
         <Button disabled={busy || !enabled} className="rounded-xl bg-emerald-600 px-4 text-white hover:bg-emerald-700" onClick={doSplit}><Plus className="mr-2 h-4 w-4"/>立即分裂</Button>
       </div>
