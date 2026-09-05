@@ -2371,6 +2371,9 @@ class OpenAIEmailRegisterFlow:
             'button:has-text("別の方法")', 'button:has-text("メールでコード")',
             'a:has-text("メールコード")', 'button:has-text("이메일 코드")',
             'button:has-text("다른 방법")',
+            'button:has-text("one-time code")', 'a:has-text("one-time code")',
+            'button:has-text("ワンタイムコード")', '[role="button"]:has-text("ワンタイムコード")', 'a:has-text("ワンタイムコード")',
+            'button:has-text("一次性代码")', 'a:has-text("一次性代码")',
         ]
         for selector in selectors:
             try:
@@ -2389,7 +2392,7 @@ class OpenAIEmailRegisterFlow:
                     const label = el => `${el.innerText || ''} ${el.textContent || ''} ${el.getAttribute('aria-label') || ''}`
                         .replace(/\s+/g, ' ').trim().toLowerCase();
                     const candidates = [...document.querySelectorAll('button,a,[role="button"],[role="link"]')].filter(visible);
-                    const target = candidates.find(el => /email (code|verification)|email me a code|use email|try another way|use a different method|send code|sign in with email|verification code|邮箱验证码|使用邮箱|尝试其他方式|其他方式|郵箱驗證碼|メール.*(コード|で)|別の方法|이메일.*코드|다른 방법/.test(label(el)));
+                    const target = candidates.find(el => /email (code|verification)|email me a code|use email|try another way|use a different method|send code|sign in with email|verification code|one.?time code|邮箱验证码|使用邮箱|尝试其他方式|其他方式|一次性代码|郵箱驗證碼|ワンタイム.*(コード|ログイン)|別の方法|이메일.*코드|다른 방법/.test(label(el)));
                     if (!target) return false;
                     target.scrollIntoView({block:'center'}); target.click(); return true;
                 }"""
