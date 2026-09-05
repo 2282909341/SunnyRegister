@@ -561,6 +561,17 @@ button:not(:disabled):active { transform: translateY(0) scale(.985); }
   text-overflow:ellipsis;
   white-space:nowrap;
 }
+.sr-session-table tbody tr:not(.sr-renewal-progress-row) > td:nth-child(2),
+.sr-session-table tbody tr:not(.sr-renewal-progress-row) > td:nth-child(3) {
+  overflow:visible;
+  white-space:normal;
+  word-break:break-all;
+  line-height:1.35;
+  vertical-align:middle;
+  text-align:left;
+}
+.sr-session-table tbody tr:not(.sr-renewal-progress-row) > td:nth-child(2) > *,
+.sr-session-table tbody tr:not(.sr-renewal-progress-row) > td:nth-child(3) > * { margin-left:0; margin-right:0; }
 .sr-resizable-table td[colspan],
 .sr-resizable-table .sr-renewal-progress-row td { overflow:visible; white-space:normal; }
 .sr-resizable-table td > :not(.sr-empty):not(.sr-renewal-progress) { max-width:100%; }
