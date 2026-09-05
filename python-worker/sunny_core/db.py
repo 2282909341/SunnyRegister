@@ -1438,6 +1438,23 @@ class SunnyDB:
         )
         self.conn.commit()
 
+    def release_task_mailbox_leases(self, task_id: str) -> int:
+        """Release every mailbox lease owned by one task (used on task stop/cancel).
+
+        Owner rows are stored as ``<task_id>:<mailbox_id>:<index>:<uuid>``. Deleting
+        by prefix is idempotent and cannot touch leases owned by other tasks; worker
+        threads still shutting down will observe an empty delete afterwards.
+        """
+        prefix = f"{str(task_id or '').strip()}:"
+        if prefix == ":":
+            return 0
+        cursor = self.conn.execute(
+            "delete from sunny_mailbox_leases where owner like ?",
+            (f"{prefix}%",),
+        )
+        self.conn.commit()
+        return max(0, int(getattr(cursor, "rowcount", 0) or 0))
+
     def mark_mailbox_credential_invalid(self, mailbox_id: int, error: str) -> None:
         if mailbox_id <= 0:
             return

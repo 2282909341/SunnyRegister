@@ -3863,6 +3863,12 @@ def run_sunny_task(task_id: str) -> None:
                         for future in pending:
                             future.cancel()
                         db.mark_cancelled("用户已中断注册任务")
+                        # Cancel pending threads cannot be preempted mid-call; their
+                        # mailbox leases (TTL 900s) would otherwise block a fresh
+                        # task on the same mailboxes for up to 15 minutes.
+                        release_task = getattr(db, "release_task_mailbox_leases", None)
+                        if callable(release_task):
+                            release_task(db.task_id)
                         return
                     done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
                     if not done:
@@ -3873,6 +3879,9 @@ def run_sunny_task(task_id: str) -> None:
                         except Exception as exc:
                             if _is_cancel_exception(exc):
                                 db.mark_cancelled("用户已中断注册任务")
+                                release_task = getattr(db, "release_task_mailbox_leases", None)
+                                if callable(release_task):
+                                    release_task(db.task_id)
                                 return
                             ok, result = False, f"parallel worker failed: {exc}"
                         db.ensure_not_cancelled()
@@ -3884,6 +3893,9 @@ def run_sunny_task(task_id: str) -> None:
                 # close their own browser, mailbox reader and DB connection.
                 pool.shutdown(wait=True, cancel_futures=True)
         db.ensure_not_cancelled()
+        release_task = getattr(db, "release_task_mailbox_leases", None)
+        if callable(release_task):
+            release_task(db.task_id)
         registered = len([x for x in items if x.get("auth_action") == "register"])
         logged_in = len([x for x in items if x.get("auth_action") != "register"])
         skipped_phone = len([x for x in items if x.get("phone_skipped_reason")])
