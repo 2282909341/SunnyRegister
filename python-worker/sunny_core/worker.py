@@ -3561,7 +3561,7 @@ def _rebind_with_proxy_rotation(
             current_payload["_excluded_register_proxies"] = sorted(excluded)
         proxy = _prepare_register_proxy(db, current_payload, email, slot + attempt).get("register", "")
         try:
-            return rebind_one(db, account, proxy, log)
+            return rebind_one(db, account, proxy, log, payload)
         except Exception as exc:
             failure = classify_auth_failure(exc)
             can_rotate = (

@@ -2067,7 +2067,7 @@ class RebindProxyRotationTests(unittest.TestCase):
             address = "http://proxy-one.example:8080" if not excluded else "http://proxy-two.example:8080"
             return {"register": address, "mode": "proxy_pool", "slot": slot}
 
-        def execute(_db, account, proxy, _log):
+        def execute(_db, account, proxy, _log, _payload=None):
             selected.append(proxy)
             if len(selected) == 1:
                 raise first_error
@@ -2124,7 +2124,7 @@ class RebindTaskTests(unittest.TestCase):
 
         with (
             patch.object(worker, "_prepare_register_proxy", side_effect=select_proxy),
-            patch.object(worker, "rebind_one", side_effect=lambda _db, account, _proxy, _log: {"email": account["email"], "status": "success"}),
+            patch.object(worker, "rebind_one", side_effect=lambda _db, account, _proxy, _log, _payload=None: {"email": account["email"], "status": "success"}),
         ):
             success, errors, items = worker._rebind_sessions(db, {"concurrency": 1})
 

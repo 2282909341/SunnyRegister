@@ -1816,9 +1816,173 @@ class URLAPIICloudReader:
         raise TimeoutError("Timed out waiting for OpenAI email OTP")
 
 
+class MailComCodeReader:
+    """mail.com split-alias code reader.
+
+    The mail-com-code-api service exposes each split alias as a JSON endpoint:
+    ``GET {code_url}?wait=60&max_age=600&sender=...`` returns
+    ``{"email": "...", "code": "123456", "mail": {...}}``. The code URL is the
+    access_key stored on the mailbox row (mailbox_type=mailcom).
+    """
+
+    MAILCOM_OTP_SENDER = "noreply@tm.openai.com"
+    MAILCOM_POLL_INTERVAL_SECONDS = 5
+    MAILCOM_CODE_URL_PATTERN = re.compile(r"^https?://[^\s]+/code/[A-Za-z0-9_-]+$")
+
+    def __init__(self, account: MailAccount, log: Callable[[str], None] | None, proxy_url: str = ""):
+        self.account = account
+        self.log = log or (lambda _m: None)
+        self.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        code_url = str(account.access_key or "").strip()
+        if not code_url:
+            raise MailboxAccessError("mailcom_credential_invalid", "Mail.com 分裂邮箱缺少取码 URL", terminal=True)
+        if not self.MAILCOM_CODE_URL_PATTERN.match(code_url):
+            raise MailboxAccessError("mailcom_credential_invalid", "Mail.com 分裂邮箱取码 URL 格式无效", terminal=True)
+        self.code_url = code_url
+        self.seen_keys: set[str] = set()
+        self.request_count = 0
+        self.last_status = 0
+        self.last_error = ""
+
+    def _request(self, wait: int = 0, max_age: int = 600, sender: str = "") -> Any:
+        self.request_count += 1
+        separator = "&" if "?" in self.code_url else "?"
+        target = f"{self.code_url}{separator}wait={max(0, min(60, int(wait or 0)))}&max_age={int(max_age or 600)}"
+        if sender:
+            target += f"&sender={sender}"
+        try:
+            response = requests.get(
+                target,
+                headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                timeout=min(65, 5 + max(0, min(60, int(wait or 0)))),
+                proxies=self.proxies,
+            )
+        except requests.RequestException as exc:
+            self.last_error = str(exc)
+            if self.request_count == 1 or self.request_count % 10 == 0:
+                self.log(f"[{self.account.email}] Mail.com 取码接口网络请求失败（第 {self.request_count} 次）：{str(exc)[:220]}")
+            raise MailboxAccessError("mailcom_network_error", "Mail.com 取码接口连接失败", str(exc)) from exc
+        try:
+            self.last_status = int(response.status_code or 0)
+            if response.status_code == 404:
+                self.last_error = "HTTP 404"
+                self.log(f"[{self.account.email}] Mail.com 取码 key 不存在或已失效（HTTP 404）")
+                raise MailboxAccessError("mailcom_key_invalid", "Mail.com 取码 key 不存在或已失效", "HTTP 404", terminal=True)
+            if response.status_code == 429:
+                self.last_error = "HTTP 429"
+                raise MailboxAccessError("mailcom_rate_limited", "Mail.com 取码请求过于频繁", "HTTP 429")
+            if response.status_code in {401, 403}:
+                self.last_error = f"HTTP {response.status_code}"
+                self.log(f"[{self.account.email}] Mail.com 取码接口返回 HTTP {response.status_code}，key 无权限")
+                raise MailboxAccessError("mailcom_key_invalid", "Mail.com 取码 key 无权限访问", f"HTTP {response.status_code}", terminal=True)
+            if not response.ok:
+                self.last_error = f"HTTP {response.status_code}"
+                if self.request_count == 1 or self.request_count % 10 == 0:
+                    self.log(f"[{self.account.email}] Mail.com 取码接口返回 HTTP {response.status_code}（第 {self.request_count} 次）")
+                raise MailboxAccessError("mailcom_provider_failed", "Mail.com 取码接口请求失败", f"HTTP {response.status_code}")
+            try:
+                return response.json()
+            except ValueError as exc:
+                self.last_error = "invalid_json"
+                self.log(f"[{self.account.email}] Mail.com 取码接口返回内容不是有效 JSON（HTTP {response.status_code}）")
+                raise MailboxAccessError("mailcom_response_invalid", "Mail.com 取码接口返回了无法解析的 JSON", str(exc), terminal=True) from exc
+        finally:
+            response.close()
+
+    def connect(self, access_token: str | None = None) -> None:
+        last_error: MailboxAccessError | None = None
+        for attempt in range(3):
+            try:
+                payload = self._request(wait=0)
+                if isinstance(payload, dict):
+                    code = str(payload.get("code") or "").strip()
+                    if re.fullmatch(r"\d{6}", code):
+                        self.seen_keys.add(f"{self.account.email}:{code}")
+                return None
+            except MailboxAccessError as exc:
+                if exc.terminal:
+                    raise
+                last_error = exc
+                if attempt < 2:
+                    self.log(f"[{self.account.email}] Mail.com 取码首次查询失败，将在 {2 * (attempt + 1)} 秒后重试（{attempt + 2}/3）：{str(exc)[:160]}")
+                    time.sleep(2 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+        raise MailboxAccessError("mailcom_network_error", "Mail.com 取码失败", "no response")
+
+    def close(self) -> None:
+        return None
+
+    def latest_message(self) -> dict[str, Any]:
+        try:
+            payload = self._request(wait=0)
+        except MailboxAccessError as exc:
+            return {"id": "", "email": self.account.email, "from": "", "to": self.account.email, "subject": f"Mail.com mailbox ({exc.code or 'error'})", "date": "", "body": str(exc), "body_preview": "", "otp": "", "source": "mailcom_code"}
+        if not isinstance(payload, dict):
+            return {"id": "", "email": self.account.email, "from": "", "to": self.account.email, "subject": "Mail.com mailbox", "date": "", "body": "", "body_preview": "", "otp": "", "source": "mailcom_code"}
+        mail = payload.get("mail")
+        mail_map = mail if isinstance(mail, dict) else {}
+        code = str(payload.get("code") or "").strip()
+        return {
+            "id": str(mail_map.get("id") or payload.get("email") or self.account.email),
+            "email": self.account.email,
+            "from": str(mail_map.get("sender") or mail_map.get("from") or ""),
+            "to": str(mail_map.get("recipient") or payload.get("email") or self.account.email),
+            "subject": str(mail_map.get("subject") or ("Mail.com 验证码" if code else "Mail.com mailbox")),
+            "date": str(mail_map.get("received_at") or mail_map.get("date") or ""),
+            "body": str(mail_map.get("body") or mail_map.get("text") or mail_map.get("content") or ""),
+            "body_preview": "",
+            "otp": code,
+            "source": "mailcom_code",
+        }
+
+    def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
+        started = time.monotonic()
+        last_notice = 0.0
+        last_error_notice = 0.0
+        last_backoff_until = 0.0
+        while time.monotonic() - started < timeout:
+            remaining = max(1, int(timeout - (time.monotonic() - started)))
+            if time.monotonic() < last_backoff_until:
+                time.sleep(min(2, remaining))
+                continue
+            try:
+                payload = self._request(wait=min(60, remaining), max_age=600, sender=self.MAILCOM_OTP_SENDER)
+            except MailboxAccessError as exc:
+                if exc.terminal:
+                    raise
+                if exc.error_code == "mailcom_rate_limited":
+                    last_backoff_until = time.monotonic() + min(10, remaining)
+                if time.monotonic() - last_error_notice >= 20:
+                    self.log(f"[{self.account.email}] Mail.com 取码接口暂时不可用，将继续重试：{str(exc)[:180]}")
+                    last_error_notice = time.monotonic()
+                time.sleep(min(3, remaining))
+                continue
+            if not isinstance(payload, dict):
+                time.sleep(min(2, remaining))
+                continue
+            code = str(payload.get("code") or "").strip()
+            if re.fullmatch(r"\d{6}", code):
+                key = f"{self.account.email}:{code}"
+                if key not in self.seen_keys:
+                    self.seen_keys.add(key)
+                    self.log(f"[{self.account.email}] 已通过 Mail.com 取码接口收到验证码（已脱敏）")
+                    return code
+            if time.monotonic() - last_notice >= 20:
+                self.log(f"[{self.account.email}] 仍在等待 Mail.com 分裂邮箱验证码，剩余约 {remaining} 秒")
+                last_notice = time.monotonic()
+            time.sleep(min(2, remaining))
+        detail = f"HTTP {self.last_status or '未知'}，累计查询 {self.request_count} 次"
+        if self.last_error:
+            detail += f"，最近错误：{self.last_error[:180]}"
+        raise TimeoutError(f"Timed out waiting for OpenAI email OTP via mail.com code API（{detail}）")
+
+
 def create_mailbox_reader(account: MailAccount, log: Callable[[str], None] | None, proxy_url: str = ""):
     if account.mailbox_type == "domain" or account.mailbox_channel == "domain_api":
         return DomainMailReader(account, log, proxy_url)
+    if account.mailbox_type == "mailcom" or account.mailbox_channel == "mailcom_code":
+        return MailComCodeReader(account, log, proxy_url)
     if account.mailbox_type == "remail" or account.mailbox_channel == "remail_api":
         return RemailReader(account, log, proxy_url)
     if account.mailbox_type == "apple":

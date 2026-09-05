@@ -7,19 +7,38 @@ import (
 )
 
 func (s *Server) createSunnyRebindTask(body map[string]any) (Task, error) {
-	cfg := mergeConfig(defaultDomainMailboxConfig(), s.sunnyGetConfig(sunnyCfgDomainMailbox, defaultDomainMailboxConfig()))
-	if !boolValue(cfg["enabled"], true) {
-		return Task{}, fmt.Errorf("自建域名邮箱池已关闭，请先在邮箱配置中启用")
+	channel := strings.TrimSpace(text(body["channel"]))
+	if channel == "" {
+		channel = "auto"
 	}
-	if !boolValue(cfg["enabled_for_rebinding"], false) {
-		return Task{}, fmt.Errorf("自建域名邮箱未启用邮箱换绑，请先在邮箱配置中启用")
+	if channel != "domain" && channel != "mailcom" && channel != "auto" {
+		return Task{}, fmt.Errorf("未知的换绑渠道：%s", channel)
 	}
-	if strings.TrimSpace(text(cfg["base_url"])) == "" || strings.TrimSpace(text(cfg["auth_token"])) == "" || strings.TrimSpace(text(cfg["site_password"])) == "" || strings.TrimSpace(text(cfg["domain"])) == "" {
-		return Task{}, fmt.Errorf("自建域名邮箱配置不完整，请先配置 CloudMail API、PUBLIC_API_TOKEN、PASSWORDS 和域名")
+	if channel == "domain" || channel == "auto" {
+		cfg := mergeConfig(defaultDomainMailboxConfig(), s.sunnyGetConfig(sunnyCfgDomainMailbox, defaultDomainMailboxConfig()))
+		if !boolValue(cfg["enabled"], true) {
+			return Task{}, fmt.Errorf("自建域名邮箱池已关闭，请先在邮箱配置中启用")
+		}
+		if !boolValue(cfg["enabled_for_rebinding"], false) {
+			return Task{}, fmt.Errorf("自建域名邮箱未启用邮箱换绑，请先在邮箱配置中启用")
+		}
+		if strings.TrimSpace(text(cfg["base_url"])) == "" || strings.TrimSpace(text(cfg["auth_token"])) == "" || strings.TrimSpace(text(cfg["site_password"])) == "" || strings.TrimSpace(text(cfg["domain"])) == "" {
+			return Task{}, fmt.Errorf("自建域名邮箱配置不完整，请先配置 CloudMail API、PUBLIC_API_TOKEN、PASSWORDS 和域名")
+		}
+		if _, err := domainMailboxPickupBaseURL(cfg); err != nil {
+			return Task{}, err
+		}
 	}
-	if _, err := domainMailboxPickupBaseURL(cfg); err != nil {
-		return Task{}, err
+	if channel == "mailcom" || channel == "auto" {
+		cfg := mergeConfig(defaultMailComConfig(), s.sunnyGetConfig(sunnyCfgMailCom, defaultMailComConfig()))
+		if !boolValue(cfg["enabled_for_rebinding"], false) {
+			return Task{}, fmt.Errorf("Mail.com 分裂邮箱未启用邮箱换绑，请先在邮箱配置中启用")
+		}
+		if mailComBaseURL(cfg) == "" || len(mailComAccounts(cfg)) == 0 {
+			return Task{}, fmt.Errorf("Mail.com 分裂邮箱配置不完整，请先配置服务地址和主账号")
+		}
 	}
+	body["channel"] = channel
 	sessionIDs := uintSlice(body["session_ids"])
 	accountIDs := uintSlice(body["account_ids"])
 	if len(accountIDs) == 0 && len(sessionIDs) > 0 {

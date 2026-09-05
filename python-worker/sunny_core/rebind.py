@@ -16,7 +16,7 @@ import requests
 
 from .db import SunnyDB
 from .domain_mail_cleanup import cleanup_failed_mailbox, retain_failed_mailbox
-from .mailbox import DomainMailReader, MailAccount, MailboxAccessError, account_from_row
+from .mailbox import DomainMailReader, MailAccount, MailboxAccessError, MailComCodeReader, account_from_row
 from .openai_auth import LoginSecretAuthenticationError, login_or_register
 from .protocol_auth import ProtocolChallengeRequired, ProtocolRegistrationFlow
 
@@ -238,6 +238,76 @@ def _domain_mailbox(db: SunnyDB, log: Callable[[str], None]) -> tuple[str, str, 
         else:
             last = f"HTTP {response.status_code}: {str(response.text or '')[:180]}"
     raise RebindError(f"生成自建域名邮箱失败：{last}")
+
+
+def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None]) -> tuple[str, str, str]:
+    """Generate a mail.com split alias as a rebind candidate.
+
+    Calls the mail-com-code-api ``POST /aliases/split`` endpoint and returns
+    ``(address, code_url, token_hash)`` where token_hash is a stable local
+    dedup key derived from the code URL. Unlike CloudMail candidates, a failed
+    mail.com candidate stays alive on the code API side and can be reclaimed
+    through the pool UI; no discard call is made here.
+    """
+    cfg = db.get_config("mail_com_code")
+    if cfg.get("enabled_for_rebinding") is not True:
+        raise RebindError("Mail.com 分裂邮箱未启用邮箱换绑")
+    base = str(cfg.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        raise RebindError("Mail.com 分裂邮箱服务地址未配置")
+    raw_accounts = cfg.get("accounts")
+    accounts: list[dict[str, str]] = []
+    if isinstance(raw_accounts, (list, tuple)):
+        for item in raw_accounts:
+            if isinstance(item, dict) and str(item.get("email") or "").strip() and str(item.get("password") or "").strip():
+                accounts.append({"email": str(item["email"]).strip(), "password": str(item["password"]).strip()})
+    elif isinstance(raw_accounts, str):
+        for line in re.split(r"[\r\n]+", raw_accounts):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("----", 1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                accounts.append({"email": parts[0].strip(), "password": parts[1].strip()})
+    if not accounts:
+        raise RebindError("Mail.com 分裂邮箱未配置主账号")
+    last = ""
+    for account in accounts:
+        try:
+            response = requests.post(
+                base + "/aliases/split",
+                json={"email": account["email"], "password": account["password"], "count": 1},
+                headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                timeout=30,
+            )
+            payload = {}
+            try:
+                payload = response.json()
+            except Exception:
+                pass
+            if not response.ok:
+                detail = str(payload.get("detail") or payload.get("error") or response.text or "")[:200]
+                last = f"HTTP {response.status_code}: {detail}"
+                continue
+            routes = payload.get("routes") if isinstance(payload, dict) else None
+            if not isinstance(routes, list) or not routes:
+                last = "上游未返回分裂别名路由"
+                continue
+            first = routes[0]
+            if not isinstance(first, dict):
+                last = "上游分裂别名路由格式无效"
+                continue
+            address = str(first.get("address") or "").strip()
+            code_url = str(first.get("url") or "").strip()
+            if not address or not code_url:
+                last = "上游分裂别名缺少地址或取码 URL"
+                continue
+            token_hash = hashlib.sha256(code_url.encode("utf-8")).hexdigest()
+            log(f"[{address}] 已从 Mail.com 分裂邮箱生成换绑邮箱：{address}----{code_url}")
+            return address, code_url, token_hash
+        except requests.RequestException as exc:
+            last = str(exc)
+    raise RebindError(f"生成 Mail.com 分裂邮箱失败：{last}")
 
 
 def _login_flow(account: MailAccount, proxy: str, log: Callable[[str], None], *, keep_session: bool, should_cancel: Callable[[], bool] | None = None) -> tuple[ProtocolRegistrationFlow, dict[str, Any]]:
@@ -488,7 +558,19 @@ def _handle_failed_domain_mailbox(
     pickup_token_hash: str,
     error: Exception,
     log: Callable[[str], None],
+    *,
+    channel: str = "domain",
 ) -> None:
+    if channel == "mailcom":
+        # mail.com split aliases live on the code API side, not CloudMail.
+        # Keep the local pool row so the alias stays visible in the pool UI;
+        # it can be reclaimed through /sunny/mailcom/delete later.
+        try:
+            db.persist_rebind_failure(old_email, new_email, new_api, pickup_token_hash, str(error))
+            log(f"[{old_email}] 换绑失败邮箱已保存到 Mail.com 分裂邮箱池：{new_email}")
+        except Exception as persist_exc:
+            log(f"[{old_email}] 保存失败邮箱记录失败：{persist_exc}")
+        return
     cfg = db.get_config("domain_mailbox")
     if retain_failed_mailbox(cfg):
         try:
@@ -509,13 +591,19 @@ def _discard_rejected_domain_mailbox(
     email: str,
     pickup_token_hash: str,
     log: Callable[[str], None],
+    *,
+    channel: str = "domain",
 ) -> None:
     """Always discard a mailbox rejected by ``change_email/begin``.
 
     The retention switch is intended for ordinary task failures. A 403 at
     ``begin`` means OpenAI will not send a code to this candidate, so retaining
-    it would only fill CloudMail/D1 with unusable addresses.
+    it would only fill CloudMail/D1 with unusable addresses. For mail.com
+    candidates the alias stays on the code API service and is only removed
+    from the local pool when the user deletes it through the pool UI.
     """
+    if channel == "mailcom":
+        return
     cfg = dict(db.get_config("domain_mailbox") or {})
     cfg["retain_failed_mailboxes"] = False
     try:
@@ -524,7 +612,7 @@ def _discard_rejected_domain_mailbox(
         log(f"[{email}] OpenAI 拒绝的候选邮箱清理未完全完成：{cleanup_exc}")
 
 
-def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callable[[str], None]) -> dict[str, Any]:
+def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callable[[str], None], payload: dict[str, Any] | None = None) -> dict[str, Any]:
     old_email = str(account_row.get("email") or "").strip()
     if not old_email:
         raise RebindError("账户邮箱为空")
@@ -536,13 +624,16 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
     merged = {**mailbox, **account_row}
     merged["email"] = old_email
     account = account_from_row(merged)
+    channel = str((payload or {}).get("channel") or "auto").strip().lower()
+    if channel not in {"domain", "mailcom", "auto"}:
+        channel = "auto"
     new_email = ""
     new_api = ""
     new_api_token_hash = ""
     old_flow = None
     new_flow = None
     try:
-        log(f"[{old_email}] 开始协议换绑")
+        log(f"[{old_email}] 开始协议换绑（渠道：{channel}）")
         old_flow, old_result = _login_flow(account, proxy, log, keep_session=True, should_cancel=db.cancel_requested)
         _persist_login_result(db, old_email, mailbox, old_result, log)
         client = ChangeEmailClient(old_flow, str(old_result.get("account_id") or ""), log)
@@ -550,13 +641,31 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
         client.eligibility()
         reader = None
         candidate_error: Exception | None = None
+        active_candidate_channel = "domain"
         for candidate_index in range(REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS):
-            new_email, new_api, new_api_token_hash = _domain_mailbox(db, log)
+            candidate_channel = channel
+            if candidate_channel == "auto":
+                candidate_channel = "domain" if candidate_index % 2 == 0 else "mailcom"
+            active_candidate_channel = candidate_channel
+            try:
+                if candidate_channel == "mailcom":
+                    new_email, new_api, new_api_token_hash = _mailcom_alias_mailbox(db, log)
+                else:
+                    new_email, new_api, new_api_token_hash = _domain_mailbox(db, log)
+            except RebindError as exc:
+                candidate_error = exc
+                log(f"[{old_email}] 生成 {candidate_channel} 换绑候选邮箱失败（{str(exc)[:160]}），更换下一个候选渠道")
+                new_email = new_api = new_api_token_hash = ""
+                continue
             # Register the one-time pickup credential before ChatGPT sends the
             # verification mail. The public pickup endpoint validates this row.
-            db.persist_rebind_pending(new_email, new_api, new_api_token_hash)
-            reader_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api)
-            candidate_reader = DomainMailReader(reader_account, log)
+            db.persist_rebind_pending(new_email, new_api, new_api_token_hash, mailbox_type=candidate_channel)
+            if candidate_channel == "mailcom":
+                reader_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="mailcom", mailbox_channel="mailcom_code", access_key=new_api)
+                candidate_reader: Any = MailComCodeReader(reader_account, log)
+            else:
+                reader_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api)
+                candidate_reader = DomainMailReader(reader_account, log)
             accepted = False
             try:
                 try:
@@ -564,17 +673,17 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
                 except MailboxAccessError as exc:
                     candidate_error = exc
                     log(f"[{old_email}] 换绑邮箱 {new_email} 取件监听建立失败（{str(exc)[:160]}），立即删除并更换下一个候选邮箱")
-                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log, channel=candidate_channel)
                     new_email = new_api = new_api_token_hash = ""
                     continue
                 issued_after = time.time()
-                log(f"[{old_email}] 已建立换绑邮箱取件监听（候选 {candidate_index + 1}/{REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS}），准备请求 ChatGPT 发送验证码")
+                log(f"[{old_email}] 已建立换绑邮箱取件监听（{candidate_channel} 候选 {candidate_index + 1}/{REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS}），准备请求 ChatGPT 发送验证码")
                 try:
                     _begin_with_retry(client, new_email, log)
                 except RebindMailboxRejected as exc:
                     candidate_error = exc
                     log(f"[{old_email}] 换绑邮箱 {new_email} 的验证码请求被 HTTP 403 拒绝，立即删除并更换下一个候选邮箱")
-                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log, channel=candidate_channel)
                     new_email = new_api = new_api_token_hash = ""
                     continue
                 except RebindError as exc:
@@ -595,7 +704,7 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
                     except RebindMailboxRejected as rejected_exc:
                         candidate_error = rejected_exc
                         log(f"[{old_email}] 重新认证后候选邮箱 {new_email} 仍被 HTTP 403 拒绝，立即删除并更换下一个候选邮箱")
-                        _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                        _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log, channel=candidate_channel)
                         new_email = new_api = new_api_token_hash = ""
                         continue
                     log(f"[{old_email}] 重新认证后已重新提交换绑验证码请求，等待新邮箱验证码")
@@ -605,7 +714,7 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
                 except (MailboxAccessError, TimeoutError) as exc:
                     candidate_error = exc
                     log(f"[{old_email}] 换绑邮箱 {new_email} 验证码等待失败（{str(exc)[:160]}），立即删除并更换下一个候选邮箱")
-                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log, channel=candidate_channel)
                     new_email = new_api = new_api_token_hash = ""
                     continue
                 reader = candidate_reader
@@ -623,14 +732,21 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
         reader.close()
         client.verify(new_email, code)
         log(f"[{old_email}] 已向 ChatGPT 提交换绑邮箱验证码")
-        new_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api, chatgpt_password=account.chatgpt_password, totp_secret=account.totp_secret)
+        success_channel = active_candidate_channel if active_candidate_channel in {"domain", "mailcom"} else "domain"
+        if success_channel == "mailcom":
+            new_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="mailcom", mailbox_channel="mailcom_code", access_key=new_api, chatgpt_password=account.chatgpt_password, totp_secret=account.totp_secret)
+        else:
+            new_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api, chatgpt_password=account.chatgpt_password, totp_secret=account.totp_secret)
         new_flow, new_result = _login_flow(new_account, proxy, log, keep_session=False, should_cancel=db.cancel_requested)
         if str(new_result.get("access_token") or "").strip() == "":
             raise RebindError("换绑后重新登录未返回新的 Access Token")
         if not str(new_result.get("refresh_token") or "").strip() and account.openai_rt:
             new_result["refresh_token"] = account.openai_rt
         _persist_login_result(db, old_email, mailbox, new_result, log)
-        db.persist_rebind(old_email, new_email, new_api, new_api_token_hash, new_result)
+        if success_channel == "mailcom":
+            db.persist_rebind(old_email, new_email, new_api, new_api_token_hash, new_result, mailbox_type="mailcom", mailbox_channel="mailcom_code")
+        else:
+            db.persist_rebind(old_email, new_email, new_api, new_api_token_hash, new_result)
         log(f"[{old_email}] 换绑成功：{new_email}")
         return {"email": old_email, "new_email": new_email, "status": "success"}
     except Exception as exc:
@@ -640,7 +756,7 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
             except Exception:
                 pass
         if new_email and new_api:
-            _handle_failed_domain_mailbox(db, old_email, new_email, new_api, new_api_token_hash, exc, log)
+            _handle_failed_domain_mailbox(db, old_email, new_email, new_api, new_api_token_hash, exc, log, channel=active_candidate_channel)
         raise
     finally:
         for flow in (old_flow, new_flow):

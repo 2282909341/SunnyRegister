@@ -2047,6 +2047,7 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
   const [mailboxForMail,setMailboxForMail]=useState<AnyObj|null>(null);
   const [mailboxCfg,setMailboxCfg]=useCachedState<AnyObj>("mailbox.config",{pool_enabled:true});
   const [remailCfg,setRemailCfg]=useCachedState<AnyObj>("mailbox.remail.config",{enabled:false,base_url:"https://remail.aishop6.com",project_id:0,service_mode:"purchase",supply:"private_first"});
+  const [mailComCfg,setMailComCfg]=useCachedState<AnyObj>("mailbox.mailcom.config",{enabled:false,enabled_for_rebinding:false,base_url:"http://185.114.48.56:8788",accounts:"",accounts_configured:0});
   const [domainCfg,setDomainCfg]=useCachedState<AnyObj>("mailbox.domain.config",{enabled:true,enabled_for_registration:false,enabled_for_rebinding:false,random_local_length:12,auto_add_user:true});
   const [fieldLoading,setFieldLoading]=useState<Record<string,boolean>>({});
   const [credentialVisible,setCredentialVisible]=useState<Record<string,boolean>>({});
@@ -2094,6 +2095,7 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
   useEffect(()=>{apiFetch("/sunny/mailboxes/config").then((cfg)=>setMailboxCfg(cfg || {pool_enabled:true})).catch(()=>{})},[]);
   useEffect(()=>{apiFetch("/sunny/remail/config").then((cfg)=>setRemailCfg(cfg || {})).catch(()=>{})},[]);
   useEffect(()=>{apiFetch("/sunny/domain-mail/config").then((cfg)=>setDomainCfg(cfg || {enabled:true})).catch(()=>{})},[]);
+  useEffect(()=>{apiFetch("/sunny/mailcom/config").then((cfg)=>setMailComCfg(cfg || {enabled:false,enabled_for_rebinding:false,base_url:"http://185.114.48.56:8788",accounts:"",accounts_configured:0})).catch(()=>{})},[]);
   useEffect(()=>{setPage(1)},[query, groupFilter, statusFilter, planFilter, rebindEmailFilter, passwordFilter, twoFactorFilter, sortBy, timeSort, pageSize]);
   useEffect(()=>{const pages=pageCount(total,pageSize); if(page>pages) setPage(pages);},[total,pageSize,page]);
   async function run(label:string, fn:()=>Promise<any>){try{await fn();notify("ok",label);void load();void loadGroups().catch(()=>{})}catch(e:any){notify("fail",e.message||String(e))}}
@@ -2185,6 +2187,7 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
   return <div className="space-y-4">
     <RemailProviderConfig t={t} config={remailCfg} setConfig={setRemailCfg} notify={notify}/>
     <DomainMailboxProviderConfig t={t} config={domainCfg} setConfig={setDomainCfg} notify={notify}/>
+    <MailComProviderConfig t={t} config={mailComCfg} setConfig={setMailComCfg} notify={notify}/>
     <Card className="sr-sms-provider-card sr-mailbox-provider-card rounded-[24px] p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -2376,6 +2379,122 @@ function DomainMailboxProviderConfig({ t, config, setConfig, notify }: { t: type
         <div className="flex flex-wrap items-end gap-5"><label className="flex items-center gap-2 text-sm text-slate-600"><span>{t.domainMailboxRegistration}</span><button type="button" aria-label={t.domainMailboxRegistration} disabled={!boolConfig(config.enabled) || busy} className={cn("sr-switch-only", boolConfig(config.enabled_for_registration) && "on")} onClick={()=>void toggle("enabled_for_registration")}><span/></button></label><label className="flex items-center gap-2 text-sm text-slate-600"><span>{t.domainMailboxRebinding}</span><button type="button" aria-label={t.domainMailboxRebinding} disabled={!boolConfig(config.enabled) || busy} className={cn("sr-switch-only", boolConfig(config.enabled_for_rebinding) && "on")} onClick={()=>void toggle("enabled_for_rebinding")}><span/></button></label></div>
       </div>
        <div className="flex flex-wrap items-center justify-end gap-2"><Button disabled={busy} variant="outline" className="rounded-xl" onClick={check}><RefreshCw className="mr-2 h-4 w-4"/>{t.domainMailboxCheck}</Button><Button disabled={busy || !boolConfig(config.enabled)} variant="outline" className="rounded-xl" onClick={generate}><Plus className="mr-2 h-4 w-4"/>{t.domainMailboxGenerate}</Button><Button disabled={busy} className="rounded-xl bg-emerald-600 px-5 text-white hover:bg-emerald-700" onClick={()=>void save()}><Save className="mr-2 h-4 w-4"/>{t.domainMailboxSave}</Button></div>
+    </div>}
+  </Card>;
+}
+
+const MAILCOM_DOMAINS = ["mail.com","email.com","usa.com","europe.com","post.com","consultant.com","engineer.com","writeme.com","techie.com","journalist.com","musician.org"];
+
+function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh; config: AnyObj; setConfig: (v: AnyObj)=>void; notify:(type:"ok"|"fail", text:string)=>void }) {
+  const [busy, setBusy] = useState(false);
+  const [expanded, setExpanded] = useCachedState("mailbox.mailcom.expanded", true);
+  const [aliases, setAliases] = useState<AnyObj[]>([]);
+  const [splitDomain, setSplitDomain] = useState("mail.com");
+  const [splitCount, setSplitCount] = useState(3);
+  const [selectedMaster, setSelectedMaster] = useState("");
+  const [checking, setChecking] = useState<string>("");
+  const update = (key:string, value:any) => setConfig({...config, [key]: value});
+  const accountEmails: string[] = Array.isArray(config.accounts) ? config.accounts.map((item:any)=>String(item?.email||item||"")) : [];
+  const enabled = boolConfig(config.enabled);
+  const rebindEnabled = boolConfig(config.enabled_for_rebinding);
+
+  async function loadAliases() {
+    try {
+      const result = await apiFetch("/sunny/mailcom/aliases");
+      setAliases(Array.isArray(result.items) ? result.items : []);
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+  }
+  useEffect(()=>{ void loadAliases(); },[]);
+
+  async function save(next = config) {
+    setBusy(true);
+    try {
+      const saved = await apiFetch("/sunny/mailcom/config", {method:"PUT", body:JSON.stringify(next)});
+      setConfig(saved || next);
+      notify("ok", t.done);
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+    finally { setBusy(false); }
+  }
+  async function toggle(key: "enabled" | "enabled_for_rebinding") {
+    await save({...config, [key]: !boolConfig(config[key])});
+  }
+  async function check() {
+    setBusy(true);
+    try {
+      const result = await apiFetch("/sunny/mailcom/check", {method:"POST", body:JSON.stringify(config)});
+      const url = result.url ? `，测试别名 ${result.address || ""}` : "";
+      notify("ok", `Mail.com 连接正常（${result.email || "-"}）${url}`);
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+    finally { setBusy(false); }
+  }
+  async function doSplit() {
+    if (!enabled) { notify("fail", "请先启用 Mail.com 分裂邮箱"); return; }
+    if (!selectedMaster) { notify("fail", "请选择主账号"); return; }
+    setBusy(true);
+    try {
+      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain:splitDomain, count:splitCount})});
+      const created = Number(result.created || 0);
+      notify("ok", `分裂成功 ${created} 个：${result.email || ""}`);
+      await loadAliases();
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+    finally { setBusy(false); }
+  }
+  async function doImport() {
+    setBusy(true);
+    try {
+      const result = await apiFetch("/sunny/mailcom/import", {method:"POST", body:JSON.stringify({...config, verify:true})});
+      notify("ok", `导入完成：${Number(result.imported || 0)} 个主账号`);
+      const fresh = await apiFetch("/sunny/mailcom/config");
+      setConfig(fresh || config);
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+    finally { setBusy(false); }
+  }
+  async function doDelete(item: AnyObj) {
+    try {
+      await apiFetch("/sunny/mailcom/delete", {method:"POST", body:JSON.stringify({email:item.email, url:item.url || ""})});
+      notify("ok", `已删除 ${item.email || ""}`);
+      await loadAliases();
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+  }
+  async function doFetchCode(item: AnyObj) {
+    if (!item.url) { notify("fail", "该别名缺少取码 URL"); return; }
+    setChecking(String(item.id || item.email));
+    try {
+      const result = await apiFetch("/sunny/mailcom/fetch-code", {method:"POST", body:JSON.stringify({url:item.url, wait:10, sender:"noreply@tm.openai.com"})});
+      const code = String(result.code || "").trim();
+      if (code) notify("ok", `验证码：${code}`);
+      else notify("ok", "暂未收到验证码（可稍后重试）");
+    } catch (e:any) { notify("fail", e.message || String(e)); }
+    finally { setChecking(""); }
+  }
+  async function copyText(value: string) {
+    try { await navigator.clipboard.writeText(value || ""); notify("ok", t.copySuccess); }
+    catch (e:any) { notify("fail", e.message || String(e)); }
+  }
+
+  return <Card className="sr-sms-provider-card rounded-[24px] p-5">
+    <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-lg font-bold">Mail.com 分裂邮箱池</h2><p className="mt-1 text-sm text-slate-500">导入 mail.com 主账号并按域名分裂真实收信别名，作为换绑候选邮箱通道。</p></div><div className="flex items-center gap-3"><button type="button" aria-label="折叠 Mail.com 配置" title="折叠 Mail.com 配置" className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white/80 text-slate-600 transition hover:border-emerald-300 hover:text-emerald-700" onClick={()=>setExpanded((value)=>!value)}><ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} /></button><button type="button" aria-label="启用 Mail.com 分裂邮箱池" title={enabled ? "关闭 Mail.com 分裂邮箱池" : "启用 Mail.com 分裂邮箱池"} disabled={busy} className={cn("sr-switch-only", enabled && "on")} onClick={()=>void toggle("enabled")}><span/></button></div></div>
+    {expanded && <div className="sr-mailbox-expanded mt-5 space-y-4">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <div><Label>服务地址</Label><Input value={config.base_url || ""} onChange={(e)=>update("base_url",e.target.value)} placeholder="http://185.114.48.56:8788"/></div>
+        <div className="lg:col-span-2"><Label>主账号（每行一个，格式：邮箱----密码）</Label><Textarea className="min-h-20 rounded-xl" value={Array.isArray(config.accounts) ? (config.accounts as any[]).map((item:any)=>`${item?.email||""}----${item?.password||""}`).join("\n") : String(config.accounts || "")} onChange={(e)=>update("accounts",e.target.value)} placeholder={"first@mail.com----password\nsecond@mail.com----password"}/></div>
+        <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>用于邮箱换绑</span><button type="button" aria-label="Mail.com 用于邮箱换绑" disabled={!enabled || busy} className={cn("sr-switch-only", rebindEnabled && "on")} onClick={()=>void toggle("enabled_for_rebinding")}><span/></button></label></div>
+        <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>已配置主账号 {Number(config.accounts_configured || 0)} 个</span></label></div>
+      </div>
+      <div className="flex flex-wrap items-end gap-3 rounded-xl border border-slate-200 p-3">
+        <div><Label>选择主账号</Label><SelectBox searchable value={selectedMaster} onChange={(v)=>setSelectedMaster(String(v))} options={[{value:"",label:"请选择…"}, ...accountEmails.map((email)=>String(email)).filter(Boolean).map((email)=>({value:email,label:email}))]} /></div>
+        <div><Label>分裂域名</Label><SelectBox value={splitDomain} onChange={(v)=>setSplitDomain(String(v))} options={[{value:"",label:"原邮箱域名"}, ...MAILCOM_DOMAINS.map((domain)=>({value:domain,label:domain}))]} /></div>
+        <div><Label>分裂数量</Label><Input type="number" min={1} max={9} value={splitCount} onChange={(e)=>setSplitCount(Math.max(1,Math.min(9,Number(e.target.value||1))))} className="w-24"/></div>
+        <Button disabled={busy || !enabled} className="rounded-xl bg-emerald-600 px-4 text-white hover:bg-emerald-700" onClick={doSplit}><Plus className="mr-2 h-4 w-4"/>立即分裂</Button>
+      </div>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <Button disabled={busy} variant="outline" className="rounded-xl" onClick={check}><RefreshCw className="mr-2 h-4 w-4"/>测试连接</Button>
+        <Button disabled={busy} variant="outline" className="rounded-xl" onClick={doImport}><Upload className="mr-2 h-4 w-4"/>验证并导入主账号</Button>
+        <Button disabled={busy} className="rounded-xl bg-emerald-600 px-5 text-white hover:bg-emerald-700" onClick={()=>void save()}><Save className="mr-2 h-4 w-4"/>保存配置</Button>
+      </div>
+      {aliases.length > 0 && <div className="sr-table-card overflow-hidden rounded-[18px] p-0">
+        <div className="sr-table-scroll"><table className="w-full text-left text-sm"><thead><tr className="border-b border-slate-200 text-xs text-slate-500"><th className="px-3 py-2">分裂邮箱</th><th className="px-3 py-2">取码 URL</th><th className="px-3 py-2">状态</th><th className="px-3 py-2">操作</th></tr></thead><tbody>{aliases.map((item:AnyObj)=><tr key={String(item.id||item.email)} className="border-b border-slate-100"><td className="px-3 py-2 font-mono text-xs">{item.email}</td><td className="px-3 py-2 font-mono text-xs text-slate-500 truncate max-w-56">{item.url}</td><td className="px-3 py-2 text-xs">{item.status || "未注册"}</td><td className="px-3 py-2"><div className="flex flex-wrap gap-2"><button className="sr-link" onClick={()=>void copyText(String(item.email||""))}>复制地址</button><button className="sr-link" onClick={()=>void copyText(String(item.url||""))}>复制URL</button><button className="sr-link" disabled={checking===String(item.id||item.email)} onClick={()=>void doFetchCode(item)}>{checking===String(item.id||item.email)?<Loader2 className="h-3.5 w-3.5 animate-spin"/>:"测试取码"}</button><ConfirmBubble message="删除该分裂别名？" detail={item.email || ""} onConfirm={()=>void doDelete(item)}><button className="sr-link text-red-500">删除</button></ConfirmBubble></div></td></tr>)}</tbody></table></div>
+      </div>}
     </div>}
   </Card>;
 }
@@ -3944,6 +4063,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
   const [paymentProbeCountriesLoading,setPaymentProbeCountriesLoading]=useState(false);
   const [paymentProbeUseTrialPromotion,setPaymentProbeUseTrialPromotion]=useState(false);
   const [rebindCountryPreference,setRebindCountryPreference]=useCachedState<string[]|null>("session.rebindCountries",null);
+  const [rebindChannelPreference,setRebindChannelPreference]=useCachedState<string>("session.rebindChannel","auto");
   const [rebindCountryDialog,setRebindCountryDialog]=useState<{ids:number[];row?:AnyObj}|null>(null);
   const [rebindCountries,setRebindCountries]=useState<string[]>([]);
   const [rebindCountrySelection,setRebindCountrySelection]=useState<string[]>([]);
@@ -4323,14 +4443,15 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     const target=rebindCountryDialog;
     setRebindCountryPreference(countries);
     setRebindCountryDialog(null);
-    void rebindAccounts(target.ids,countries,target.row);
+    void rebindAccounts(target.ids,countries,target.row,rebindChannelPreference);
   }
-  async function rebindAccounts(ids: number[], countries: string[], row?: AnyObj) {
+  async function rebindAccounts(ids: number[], countries: string[], row?: AnyObj, channel?: string) {
     if (!ids.length) { notify("fail", "请选择需要换绑的账户"); return; }
     if (row && ["已封禁", "banned", "disabled"].includes(String(row.status || ""))) { notify("ok", "已跳过已封禁账户"); return; }
     const targetIds = Array.from(new Set(ids.map(Number).filter(Boolean)));
+    const selectedChannel = channel || rebindChannelPreference || "auto";
     try {
-      const task = await runPersistentSessionTask("rebind", targetIds, row?.email, () => apiFetch("/sunny/sessions/rebind", { method:"POST", body:JSON.stringify({ session_ids: targetIds, countries }) }));
+      const task = await runPersistentSessionTask("rebind", targetIds, row?.email, () => apiFetch("/sunny/sessions/rebind", { method:"POST", body:JSON.stringify({ session_ids: targetIds, countries, channel: selectedChannel }) }));
       const result = task.result || {};
       const failed = Number(result.failed || 0);
       const skipped = Number(result.skipped || 0);
@@ -4555,7 +4676,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     {failureDetail && <FailureDetailModal t={t} value={failureDetail} onClose={()=>setFailureDetail(null)}/>}
     {trialCountryDialog && <CountryProbeModal title={t.trialCountryTitle} hint={t.trialCountryHint} empty={t.trialCountryEmpty} start={t.trialStart} t={t} countries={trialCountries} selected={trialCountrySelection} loading={trialCountriesLoading} onToggle={(country)=>setTrialCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setTrialCountrySelection(trialCountries)} onClear={()=>setTrialCountrySelection([])} onClose={()=>setTrialCountryDialog(null)} onConfirm={confirmTrialCountries}/>}
     {paymentProbeDialog && <PaymentProbeCountryModal t={t} countries={paymentProbeCountries} selected={paymentProbeCountrySelection} useTrialPromotion={paymentProbeUseTrialPromotion} loading={paymentProbeCountriesLoading} onToggleTrialPromotion={()=>setPaymentProbeUseTrialPromotion((value)=>!value)} onToggle={(country)=>setPaymentProbeCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setPaymentProbeCountrySelection(paymentProbeCountries)} onClear={()=>setPaymentProbeCountrySelection([])} onClose={()=>setPaymentProbeDialog(null)} onConfirm={confirmPaymentProbeCountries}/>}
-    {rebindCountryDialog && <CountryProbeModal title={t.rebindCountryTitle} hint={t.rebindCountryHint} empty={t.rebindCountryEmpty} start={t.rebindCountryStart} t={t} countries={rebindCountries} selected={rebindCountrySelection} loading={rebindCountriesLoading} onToggle={(country)=>setRebindCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setRebindCountrySelection(rebindCountries)} onClear={()=>setRebindCountrySelection([])} onClose={()=>setRebindCountryDialog(null)} onConfirm={confirmRebindCountries}/>}
+    {rebindCountryDialog && <CountryProbeModal title={t.rebindCountryTitle} hint={t.rebindCountryHint} empty={t.rebindCountryEmpty} start={t.rebindCountryStart} t={t} countries={rebindCountries} selected={rebindCountrySelection} loading={rebindCountriesLoading} onToggle={(country)=>setRebindCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setRebindCountrySelection(rebindCountries)} onClear={()=>setRebindCountrySelection([])} onClose={()=>setRebindCountryDialog(null)} onConfirm={confirmRebindCountries} channel={rebindChannelPreference} onChannelChange={(channel)=>{setRebindChannelPreference(channel)}}/>}
     <AccountLogFloat t={t} open={accountLogOpen} kind={accountLogKind} logs={accountLogs[accountLogKind] || []} canCancel={cancellableAccountLogTasks.length > 0} cancelling={terminatingAccountLog} onCancel={()=>void terminateAccountLogTasks()} onToggle={()=>setAccountLogOpen((value)=>!value)} onKindChange={setAccountLogKind} onClear={()=>publishAccountLogs({ ...accountLogSnapshot, [accountLogKind]: [] })} />
   </Card>;
 }
@@ -4586,7 +4707,7 @@ function PaymentProbeCountryModal({t,countries,selected,useTrialPromotion,loadin
   </div></div></PagePortal>;
 }
 
-function CountryProbeModal({t,title,hint,empty,start,countries,selected,loading,onToggle,onSelectAll,onClear,onClose,onConfirm}:{
+function CountryProbeModal({t,title,hint,empty,start,countries,selected,loading,onToggle,onSelectAll,onClear,onClose,onConfirm,channel,onChannelChange}:{
   t: typeof zh;
   title: string;
   hint: string;
@@ -4600,10 +4721,15 @@ function CountryProbeModal({t,title,hint,empty,start,countries,selected,loading,
   onClear:()=>void;
   onClose:()=>void;
   onConfirm:()=>void;
+  channel?: string;
+  onChannelChange?: (channel:string)=>void;
 }) {
   return <PagePortal><div className="sr-modal-mask"><div className="sr-modal sr-payment-country-modal" role="dialog" aria-modal="true">
     <div className="sr-modal-head"><h3>{title}</h3><button title={t.close} onClick={onClose}><X className="h-5 w-5"/></button></div>
     <div className="sr-modal-body">
+      {channel && onChannelChange && <div className="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-600"><span>换绑邮箱渠道</span>{["auto","domain","mailcom"].map((value)=>(
+        <button key={value} type="button" className={cn("rounded-full border px-3 py-1 text-xs", channel===value ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-slate-200 text-slate-500 hover:border-emerald-300")} onClick={()=>onChannelChange(value)}>{value==="auto"?"自动（双通道）":value==="domain"?"CloudMail 域名邮箱":"Mail.com 分裂邮箱"}</button>
+      ))}</div>}
       <div className="sr-payment-country-toolbar"><p>{hint}</p><div><button disabled={loading||countries.length===0} onClick={onSelectAll}>{t.paymentProbeCountryAll}</button><button disabled={loading||selected.length===0} onClick={onClear}>{t.paymentProbeCountryClear}</button></div></div>
       {loading ? <div className="sr-payment-country-state"><Loader2 className="h-5 w-5 animate-spin"/><span>{t.loadingData}</span></div> : countries.length ? <div className="sr-payment-country-grid">{countries.map((country)=>{
         const checked=selected.includes(country);

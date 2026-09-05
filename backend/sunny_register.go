@@ -68,6 +68,9 @@ func (s *Server) handleSunny(w http.ResponseWriter, r *http.Request, rest string
 	case "domain-mail":
 		s.domainMailboxConfigHandler(w, r, parts[1:])
 		return
+	case "mailcom":
+		s.sunnyMailComHandler(w, r, parts[1:])
+		return
 	case "phones":
 		s.sunnyPhones(w, r, parts[1:])
 		return
