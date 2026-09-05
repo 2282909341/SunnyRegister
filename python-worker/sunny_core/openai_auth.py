@@ -129,6 +129,11 @@ _TRANSIENT_BROWSER_NETWORK_MARKERS = (
     "packet length too long",
     "tls_get_more_records",
     "unexpected eof",
+    # Playwright APIRequestContext reports this when the proxy tunnel dies
+    # between the CONNECT request and the CONNECT response; the request itself
+    # was never sent upstream, so retrying over a fresh tunnel is safe.
+    "proxy connection ended",
+    "connect response",
     # Proxy pool hiccups observed during batch registration:
     # - Playwright reports "Timeout 30000ms exceeded" instead of "timed out"
     # - Node's APIRequestContext reports "connect ETIMEDOUT <host>:<port>"
