@@ -324,7 +324,7 @@ class ProtocolRegistrationFlow:
         self._check_cancelled()
         kwargs.setdefault("timeout", 30)
         response = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 if self.traffic_meter is None:
                     response = self.session.request(method, url, **kwargs)
@@ -334,11 +334,16 @@ class ProtocolRegistrationFlow:
                 break
             except Exception as exc:
                 if (
-                    attempt < 2
+                    attempt < 3
                     and _is_transient_transport_error(exc)
                 ):
-                    self.log(f"[协议] {step} 遇到临时网络错误，正在重试 ({attempt + 1}/2)")
-                    time.sleep(0.35 * (attempt + 1))
+                    # Proxy tunnels (bestgo dynamic rotation) often reset the
+                    # CONNECT for a few seconds during rebind/login; a short
+                    # fixed delay retries inside the outage window. Use
+                    # exponential backoff so the tunnel has time to recover.
+                    delay = 0.5 * (2 ** attempt)
+                    self.log(f"[协议] {step} 遇到临时网络错误，{delay:.1f} 秒后重试 ({attempt + 1}/3)")
+                    time.sleep(delay)
                     self._check_cancelled()
                     continue
                 error = ProtocolRegistrationError(f"{step} request failed: {exc}")
