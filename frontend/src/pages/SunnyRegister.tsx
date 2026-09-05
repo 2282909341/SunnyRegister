@@ -39,10 +39,10 @@ const DATA_TABLE_COLUMNS: Record<string, DataTableColumn[]> = {
     { width: 180, minWidth: 140 }, { width: 140, minWidth: 110 }, { width: 190, minWidth: 150 }, { width: 170, minWidth: 130, maxWidth: 420 },
   ],
   sessions: [
-    { width: 44, minWidth: 44, maxWidth: 72 }, { width: 210, minWidth: 150 }, { width: 150, minWidth: 110 },
+    { width: 44, minWidth: 44, maxWidth: 72 }, { width: 200, minWidth: 150 }, { width: 150, minWidth: 110 },
     { width: 120, minWidth: 90 },
     { width: 84, minWidth: 72 }, { width: 80, minWidth: 68 }, { width: 56, minWidth: 48 }, { width: 56, minWidth: 48 }, { width: 56, minWidth: 48 }, { width: 56, minWidth: 48 },
-    { width: 120, minWidth: 100 }, { width: 88, minWidth: 76 }, { width: 150, minWidth: 110 },
+    { width: 150, minWidth: 110 }, { width: 88, minWidth: 76 }, { width: 210, minWidth: 150 },
     { width: 110, minWidth: 92 }, { width: 120, minWidth: 100 }, { width: 210, minWidth: 160, maxWidth: 420 },
   ],
 };
@@ -3903,13 +3903,7 @@ function TrialEligibilityBadge({ t, row }: { t: AnyObj; row: AnyObj }) {
   const countryResults = row.trial_country_results && typeof row.trial_country_results === "object" ? row.trial_country_results as Record<string, string> : {};
   const eligibleCountries = Object.entries(countryResults).filter(([, value])=>value === "eligible").map(([country])=>country).sort();
   const ineligibleCountries = Object.entries(countryResults).filter(([, value])=>value === "ineligible").map(([country])=>country).sort();
-  const compact=(countries:string[],color:string)=>{
-    if (!countries.length) return null;
-    const shown=countries.slice(0,2).join(",");
-    const extra=countries.length>2?` 等${countries.length}国`:"";
-    return <span className={cn("font-semibold leading-4 whitespace-nowrap",color)} title={countries.join(",")}>{shown}{extra}</span>;
-  };
-  if (eligibleCountries.length || ineligibleCountries.length) return <span className="inline-flex flex-col items-start gap-0.5 font-semibold leading-4 whitespace-nowrap">{compact(eligibleCountries,"text-emerald-600 dark:text-emerald-400")}{compact(ineligibleCountries,"text-red-500")}</span>;
+  if (eligibleCountries.length || ineligibleCountries.length) return <span className="inline-flex flex-col items-start gap-0.5 font-semibold leading-4"><span className={eligibleCountries.length ? "text-emerald-600 dark:text-emerald-400" : "hidden"}>{eligibleCountries.join(",")}</span><span className={ineligibleCountries.length ? "text-red-500" : "hidden"}>{ineligibleCountries.join(",")}</span></span>;
   if (row.trial_eligibility === "eligible") return <span className="font-semibold text-emerald-600 dark:text-emerald-400">{t.trialEligible}</span>;
   if (row.trial_eligibility === "ineligible") return <span className="font-semibold text-red-500">{t.trialIneligible}</span>;
   return <span className="text-slate-400">-</span>;
@@ -3938,10 +3932,7 @@ function paymentProbeTitle(row: AnyObj) {
 function PaymentMethodsBadge({ row }: { row: AnyObj }) {
   if (!Array.isArray(row.payment_methods) || row.payment_methods.length === 0) return <span className="text-slate-400">-</span>;
   const title=paymentProbeTitle(row);
-  const methods=row.payment_methods as string[];
-  const visible=methods.slice(0,3);
-  const extra=methods.length-visible.length;
-  return <div className="flex flex-wrap gap-1" title={title}>{visible.map((method:string)=><Badge key={method} variant="secondary" className="whitespace-nowrap !px-1.5 !py-0 !text-[10px] leading-4">{paymentMethodLabel(method)}</Badge>)}{extra>0&&<Badge variant="secondary" className="whitespace-nowrap !px-1.5 !py-0 !text-[10px] leading-4" title={methods.slice(3).map(paymentMethodLabel).join(", ")}>+{extra}</Badge>}</div>;
+  return <div className="flex flex-wrap gap-1" title={title}>{row.payment_methods.map((method:string)=><Badge key={method} variant="secondary" className="whitespace-nowrap !px-1.5 !py-0 !text-[10px] leading-4">{paymentMethodLabel(method)}</Badge>)}</div>;
 }
 type PaymentProbeFilterValue = "" | "unknown";
 function PaymentMethodFilterHeader({t,value,status,options,onChange,onStatusChange}:{t:AnyObj;value:string[];status:PaymentProbeFilterValue;options:string[];onChange:(value:string[])=>void;onStatusChange:(value:PaymentProbeFilterValue)=>void}) {
