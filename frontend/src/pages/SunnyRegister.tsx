@@ -2105,7 +2105,7 @@ function MailboxConfig({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fai
   useEffect(()=>{apiFetch("/sunny/mailboxes/config").then((cfg)=>setMailboxCfg(cfg || {pool_enabled:true})).catch(()=>{})},[]);
   useEffect(()=>{apiFetch("/sunny/remail/config").then((cfg)=>setRemailCfg(cfg || {})).catch(()=>{})},[]);
   useEffect(()=>{apiFetch("/sunny/domain-mail/config").then((cfg)=>setDomainCfg(cfg || {enabled:true})).catch(()=>{})},[]);
-  useEffect(()=>{apiFetch("/sunny/mailcom/config").then((cfg)=>setMailComCfg(cfg || {enabled:false,enabled_for_rebinding:false,base_url:"http://185.114.48.56:8788",accounts:"",accounts_configured:0})).catch(()=>{})},[]);
+  useEffect(()=>{apiFetch("/sunny/mailcom/config").then((cfg)=>{const saved=(cfg as AnyObj)||{};setMailComCfg((old)=>{const merged={enabled:false,enabled_for_rebinding:false,base_url:"http://185.114.48.56:8788",accounts:"",accounts_configured:0,...saved};if(!String(merged.base_url||"").trim())merged.base_url=(old&&String((old as AnyObj).base_url||"").trim())||"http://185.114.48.56:8788";return merged;})}).catch(()=>{})},[]);
   useEffect(()=>{setPage(1)},[query, groupFilter, statusFilter, planFilter, rebindEmailFilter, passwordFilter, twoFactorFilter, sortBy, timeSort, pageSize]);
   useEffect(()=>{const pages=pageCount(total,pageSize); if(page>pages) setPage(pages);},[total,pageSize,page]);
   async function run(label:string, fn:()=>Promise<any>){try{await fn();notify("ok",label);void load();void loadGroups().catch(()=>{})}catch(e:any){notify("fail",e.message||String(e))}}
@@ -2489,9 +2489,10 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
     {expanded && <div className="sr-mailbox-expanded mt-5 space-y-4">
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         <div><Label>服务地址</Label><Input value={config.base_url || ""} onChange={(e)=>update("base_url",e.target.value)} placeholder="http://185.114.48.56:8788"/></div>
+        <div><Label>换绑分裂域名（可选，留空用原域名）</Label><Input value={config.rebind_domain || ""} onChange={(e)=>update("rebind_domain",e.target.value)} placeholder="dr.com"/></div>
+        <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>已配置主账号 {Number(config.accounts_configured || 0)} 个</span></label></div>
         <div className="lg:col-span-2"><Label>主账号（每行一个，格式：邮箱----密码）</Label><Textarea className="min-h-20 rounded-xl" value={Array.isArray(config.accounts) ? (config.accounts as any[]).map((item:any)=>`${item?.email||""}----${item?.password||""}`).join("\n") : String(config.accounts || "")} onChange={(e)=>update("accounts",e.target.value)} placeholder={"first@mail.com----password\nsecond@mail.com----password"}/></div>
         <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>用于邮箱换绑</span><button type="button" aria-label="Mail.com 用于邮箱换绑" disabled={!enabled || busy} className={cn("sr-switch-only", rebindEnabled && "on")} onClick={()=>void toggle("enabled_for_rebinding")}><span/></button></label></div>
-        <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>已配置主账号 {Number(config.accounts_configured || 0)} 个</span></label></div>
       </div>
       <div className="flex flex-wrap items-end gap-3 rounded-xl border border-slate-200 p-3">
         <div><Label>选择主账号</Label><SelectBox searchable value={selectedMaster} onChange={(v)=>setSelectedMaster(String(v))} options={[{value:"",label:"请选择…"}, ...accountEmails.map((email)=>String(email)).filter(Boolean).map((email)=>({value:email,label:email}))]} /></div>

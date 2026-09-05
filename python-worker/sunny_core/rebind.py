@@ -272,11 +272,15 @@ def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None]) -> tuple[str
     if not accounts:
         raise RebindError("Mail.com 分裂邮箱未配置主账号")
     last = ""
+    rebind_domain = str(cfg.get("rebind_domain") or "").strip().lstrip("@").lower()
     for account in accounts:
         try:
+            split_body: dict[str, Any] = {"email": account["email"], "password": account["password"], "count": 1}
+            if rebind_domain:
+                split_body["domain"] = rebind_domain
             response = requests.post(
                 base + "/aliases/split",
-                json={"email": account["email"], "password": account["password"], "count": 1},
+                json=split_body,
                 headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
                 timeout=30,
             )

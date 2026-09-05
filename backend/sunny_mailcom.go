@@ -21,6 +21,7 @@ func defaultMailComConfig() map[string]any {
 		"base_url":              "",
 		"accounts":              []map[string]any{},
 		"shared_token":          "",
+		"rebind_domain":         "",
 	}
 }
 
@@ -54,7 +55,7 @@ func mailComCfgWithBody(cfg map[string]any, body map[string]any) map[string]any 
 	if rawAccounts, ok := body["accounts"]; ok {
 		next["accounts"] = rawAccounts
 	}
-	for _, key := range []string{"enabled", "enabled_for_rebinding"} {
+	for _, key := range []string{"enabled", "enabled_for_rebinding", "rebind_domain"} {
 		if value, ok := body[key]; ok {
 			next[key] = value
 		}
@@ -236,6 +237,7 @@ func (s *Server) mailComConfigHandler(w http.ResponseWriter, r *http.Request, pa
 			"enabled":               boolValue(cfg["enabled"], false),
 			"enabled_for_rebinding": boolValue(cfg["enabled_for_rebinding"], false),
 			"base_url":              mailComBaseURL(cfg),
+			"rebind_domain":         strings.TrimSpace(text(cfg["rebind_domain"])),
 			"accounts_configured":   len(accounts),
 			"accounts":              []string{},
 		}
@@ -300,12 +302,16 @@ func (s *Server) mailComConfigHandler(w http.ResponseWriter, r *http.Request, pa
 		if strings.TrimSpace(text(body["base_url"])) != "" {
 			next["base_url"] = strings.TrimRight(strings.TrimSpace(text(body["base_url"])), "/")
 		}
+		if _, hasRebindDomain := body["rebind_domain"]; hasRebindDomain {
+			next["rebind_domain"] = strings.TrimSpace(strings.ToLower(text(body["rebind_domain"])))
+		}
 		s.sunnySaveConfig(sunnyCfgMailCom, next)
 
 		out := map[string]any{
 			"enabled":               boolValue(next["enabled"], false),
 			"enabled_for_rebinding": boolValue(next["enabled_for_rebinding"], false),
 			"base_url":              mailComBaseURL(next),
+			"rebind_domain":         strings.TrimSpace(text(next["rebind_domain"])),
 			"accounts_configured":   len(emails),
 			"accounts":              emails,
 		}
