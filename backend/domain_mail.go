@@ -626,6 +626,12 @@ func (s *Server) domainMailboxPickupHandler(w http.ResponseWriter, r *http.Reque
 	}
 	messages, err := s.domainMailboxMessagesForToken(r.Context(), email, token)
 	if err != nil {
+		if strings.Contains(err.Error(), "自建域名邮箱请求失败") {
+			// 上游 CloudMail 请求/网络失败是瞬时的，返回 502 让 Python 侧有限重试；
+			// 只有本地校验类错误（凭证无效/邮箱停用/池关闭）才返回 403 终止。
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}

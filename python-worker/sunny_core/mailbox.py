@@ -1446,9 +1446,23 @@ class DomainMailReader:
         return max(candidates, key=lambda item: (float(item.get("timestamp") or 0), -int(item.get("order") or 0)), default={})
 
     def connect(self, access_token: str | None = None) -> None:
-        current = self._latest()
-        if current.get("key"):
-            self.seen_keys.add(str(current["key"]))
+        last_error: MailboxAccessError | None = None
+        for attempt in range(3):
+            try:
+                current = self._latest()
+                if current.get("key"):
+                    self.seen_keys.add(str(current["key"]))
+                return None
+            except MailboxAccessError as exc:
+                if exc.terminal:
+                    raise
+                last_error = exc
+                if attempt < 2:
+                    self.log(f"[{self.account.email}] 自建域名邮箱取件首次查询失败，将在 {2 * (attempt + 1)} 秒后重试（{attempt + 2}/3）：{str(exc)[:160]}")
+                    time.sleep(2 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+        raise MailboxAccessError("domain_network_error", "自建域名邮箱取件失败", "no response")
 
     def close(self) -> None:
         return None

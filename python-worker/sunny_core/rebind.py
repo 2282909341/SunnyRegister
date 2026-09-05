@@ -16,7 +16,7 @@ import requests
 
 from .db import SunnyDB
 from .domain_mail_cleanup import cleanup_failed_mailbox, retain_failed_mailbox
-from .mailbox import DomainMailReader, MailAccount, account_from_row
+from .mailbox import DomainMailReader, MailAccount, MailboxAccessError, account_from_row
 from .openai_auth import LoginSecretAuthenticationError, login_or_register
 from .protocol_auth import ProtocolChallengeRequired, ProtocolRegistrationFlow
 
@@ -552,7 +552,14 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
             candidate_reader = DomainMailReader(reader_account, log)
             accepted = False
             try:
-                candidate_reader.connect()
+                try:
+                    candidate_reader.connect()
+                except MailboxAccessError as exc:
+                    candidate_error = exc
+                    log(f"[{old_email}] 换绑邮箱 {new_email} 取件监听建立失败（{str(exc)[:160]}），立即删除并更换下一个候选邮箱")
+                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                    new_email = new_api = new_api_token_hash = ""
+                    continue
                 issued_after = time.time()
                 log(f"[{old_email}] 已建立换绑邮箱取件监听（候选 {candidate_index + 1}/{REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS}），准备请求 ChatGPT 发送验证码")
                 try:
@@ -586,6 +593,14 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
                         continue
                     log(f"[{old_email}] 重新认证后已重新提交换绑验证码请求，等待新邮箱验证码")
                 log(f"[{old_email}] ChatGPT 换绑验证码请求已接受，等待新邮箱验证码")
+                try:
+                    code = _wait_for_rebind_code(candidate_reader, client, new_email, issued_after, log)
+                except (MailboxAccessError, TimeoutError) as exc:
+                    candidate_error = exc
+                    log(f"[{old_email}] 换绑邮箱 {new_email} 验证码等待失败（{str(exc)[:160]}），立即删除并更换下一个候选邮箱")
+                    _discard_rejected_domain_mailbox(db, new_email, new_api_token_hash, log)
+                    new_email = new_api = new_api_token_hash = ""
+                    continue
                 reader = candidate_reader
                 accepted = True
                 break
@@ -595,13 +610,10 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
         if reader is None:
             if candidate_error is not None:
                 raise RebindError(
-                    f"连续 {REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS} 个候选换绑邮箱均被 OpenAI 的 begin 接口拒绝"
+                    f"连续 {REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS} 个候选换绑邮箱均未能完成取件监听或验证码接收"
                 ) from candidate_error
             raise RebindError("未能建立可用的换绑邮箱取件监听")
-        try:
-            code = _wait_for_rebind_code(reader, client, new_email, issued_after, log)
-        finally:
-            reader.close()
+        reader.close()
         client.verify(new_email, code)
         log(f"[{old_email}] 已向 ChatGPT 提交换绑邮箱验证码")
         new_account = MailAccount(email=new_email, password="", client_id="", refresh_token="", raw=f"{new_email}----{new_api}", mailbox_type="domain", mailbox_channel="domain_api", access_key=new_api, chatgpt_password=account.chatgpt_password, totp_secret=account.totp_secret)
