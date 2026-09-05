@@ -1376,11 +1376,20 @@ class DomainMailReader:
         self.request_count += 1
         try:
             if self.pickup_url:
+                pickup_host = str(urlparse(self.pickup_url).hostname or "").lower()
+                # The pickup URL is served by the local backend (127.0.0.1),
+                # which relays to CloudMail. Routing it through the task proxy
+                # only fails (bestgo CONNECT aborts on loopback), so force a
+                # direct connection for loopback hosts, ignoring env proxies.
+                if pickup_host in {"127.0.0.1", "localhost", "::1"} or pickup_host.startswith("127."):
+                    pickup_proxies = {"http": None, "https": None}
+                else:
+                    pickup_proxies = self.proxies
                 response = requests.get(
                     self.pickup_url,
                     headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
                     timeout=30,
-                    proxies=self.proxies,
+                    proxies=pickup_proxies,
                 )
             else:
                 response = requests.post(
