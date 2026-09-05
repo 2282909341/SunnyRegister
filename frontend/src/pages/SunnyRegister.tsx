@@ -2444,7 +2444,7 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
     const domain = (customDomain || "").trim() || splitDomain;
     setBusy(true);
     try {
-      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain, count:splitCount})});
+      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain, count:splitCount, base_url:config.base_url, accounts:config.accounts})});
       const created = Number(result.created || 0);
       notify("ok", `分裂成功 ${created} 个：${result.email || ""}`);
       await loadAliases();

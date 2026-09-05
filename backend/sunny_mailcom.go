@@ -37,6 +37,31 @@ func mailComBaseURL(cfg map[string]any) string {
 	return strings.TrimRight(strings.TrimSpace(text(cfg["base_url"])), "/")
 }
 
+// mailComCfgWithBody overlays operational fields carried by a request body
+// onto the stored config, so actions like check/split/import work even when
+// the user has not persisted the config yet.
+func mailComCfgWithBody(cfg map[string]any, body map[string]any) map[string]any {
+	if body == nil {
+		return cfg
+	}
+	next := make(map[string]any, len(cfg)+4)
+	for key, value := range cfg {
+		next[key] = value
+	}
+	if rawBase := strings.TrimSpace(text(body["base_url"])); rawBase != "" {
+		next["base_url"] = strings.TrimRight(rawBase, "/")
+	}
+	if rawAccounts, ok := body["accounts"]; ok {
+		next["accounts"] = rawAccounts
+	}
+	for _, key := range []string{"enabled", "enabled_for_rebinding"} {
+		if value, ok := body[key]; ok {
+			next[key] = value
+		}
+	}
+	return next
+}
+
 func mailComAccounts(cfg map[string]any) []mailComAccount {
 	raw := cfg["accounts"]
 	var out []mailComAccount
@@ -293,6 +318,8 @@ func (s *Server) mailComConfigHandler(w http.ResponseWriter, r *http.Request, pa
 // ---- check ----
 
 func (s *Server) mailComCheckHandler(w http.ResponseWriter, r *http.Request, cfg map[string]any) {
+	body, _ := parseBody(r)
+	cfg = mailComCfgWithBody(cfg, body)
 	accounts := mailComAccounts(cfg)
 	if len(accounts) == 0 {
 		writeError(w, http.StatusBadRequest, "请先配置 Mail.com 主账号")
@@ -356,6 +383,7 @@ func (s *Server) mailComSplitHandler(w http.ResponseWriter, r *http.Request, cfg
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	cfg = mailComCfgWithBody(cfg, body)
 	client, err := newMailComClient(cfg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -521,6 +549,18 @@ func (s *Server) mailComImportHandler(w http.ResponseWriter, r *http.Request, cf
 	_ = status
 	// Save/update accounts locally regardless of upstream verify outcome.
 	current := mergeConfig(defaultMailComConfig(), s.sunnyGetConfig(sunnyCfgMailCom, defaultMailComConfig()))
+	// Honor operational fields carried by the import request (the frontend
+	// sends the whole config), so base_url/enabled survive an import-first
+	// workflow instead of being silently dropped.
+	if rawBase := strings.TrimSpace(text(body["base_url"])); rawBase != "" {
+		current["base_url"] = strings.TrimRight(rawBase, "/")
+	}
+	if _, hasEnabled := body["enabled"]; hasEnabled {
+		current["enabled"] = boolValue(body["enabled"], boolValue(current["enabled"], false))
+	}
+	if _, hasRebind := body["enabled_for_rebinding"]; hasRebind {
+		current["enabled_for_rebinding"] = boolValue(body["enabled_for_rebinding"], boolValue(current["enabled_for_rebinding"], false))
+	}
 	existing := map[string]string{}
 	for _, account := range mailComAccounts(current) {
 		existing[account.Email] = account.Password
