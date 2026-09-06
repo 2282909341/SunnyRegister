@@ -2401,6 +2401,7 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
   const [aliases, setAliases] = useState<AnyObj[]>([]);
   const [splitDomain, setSplitDomain] = useState("mail.com");
   const [customDomain, setCustomDomain] = useState("");
+  const [accountsText, setAccountsText] = useState("");
   const [splitCount, setSplitCount] = useState(3);
   const [selectedMaster, setSelectedMaster] = useState("");
   const [checking, setChecking] = useState<string>("");
@@ -2420,7 +2421,9 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
   async function save(next = config) {
     setBusy(true);
     try {
-      const saved = await apiFetch("/sunny/mailcom/config", {method:"PUT", body:JSON.stringify(next)});
+      const payload: AnyObj = {...next};
+      if (accountsText.trim()) payload.accounts = accountsText;
+      const saved = await apiFetch("/sunny/mailcom/config", {method:"PUT", body:JSON.stringify(payload)});
       setConfig(saved || next);
       notify("ok", t.done);
     } catch (e:any) { notify("fail", e.message || String(e)); }
@@ -2444,7 +2447,7 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
     const domain = (customDomain || "").trim() || splitDomain;
     setBusy(true);
     try {
-      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain, count:splitCount, base_url:config.base_url, accounts:config.accounts})});
+      const result = await apiFetch("/sunny/mailcom/split", {method:"POST", body:JSON.stringify({email:selectedMaster, domain, count:splitCount, base_url:config.base_url})});
       const created = Number(result.created || 0);
       notify("ok", `分裂成功 ${created} 个：${result.email || ""}`);
       await loadAliases();
@@ -2454,7 +2457,9 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
   async function doImport() {
     setBusy(true);
     try {
-      const result = await apiFetch("/sunny/mailcom/import", {method:"POST", body:JSON.stringify({...config, verify:true})});
+      const payload: AnyObj = {...config, verify:true};
+      if (accountsText.trim()) payload.accounts = accountsText;
+      const result = await apiFetch("/sunny/mailcom/import", {method:"POST", body:JSON.stringify(payload)});
       notify("ok", `导入完成：${Number(result.imported || 0)} 个主账号`);
       const fresh = await apiFetch("/sunny/mailcom/config");
       setConfig(fresh || config);
@@ -2491,7 +2496,7 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
         <div><Label>服务地址</Label><Input value={config.base_url || ""} onChange={(e)=>update("base_url",e.target.value)} placeholder="http://185.114.48.56:8788"/></div>
         <div><Label>换绑分裂域名（可选，留空用原域名）</Label><Input value={config.rebind_domain || ""} onChange={(e)=>update("rebind_domain",e.target.value)} placeholder="dr.com"/></div>
         <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>已配置主账号 {Number(config.accounts_configured || 0)} 个</span></label></div>
-        <div className="lg:col-span-2"><Label>主账号（每行一个，格式：邮箱----密码）</Label><Textarea className="min-h-20 rounded-xl" value={Array.isArray(config.accounts) ? (config.accounts as any[]).map((item:any)=>`${item?.email||""}----${item?.password||""}`).join("\n") : String(config.accounts || "")} onChange={(e)=>update("accounts",e.target.value)} placeholder={"first@mail.com----password\nsecond@mail.com----password"}/></div>
+        <div className="lg:col-span-2"><Label>主账号（每行一个，格式：邮箱----密码）</Label><Textarea className="min-h-20 rounded-xl" value={accountsText} onChange={(e)=>setAccountsText(e.target.value)} placeholder={"first@mail.com----password\nsecond@mail.com----password"}/></div>
         <div className="flex items-end"><label className="flex min-h-11 items-center gap-2 text-sm text-slate-600"><span>用于邮箱换绑</span><button type="button" aria-label="Mail.com 用于邮箱换绑" disabled={!enabled || busy} className={cn("sr-switch-only", rebindEnabled && "on")} onClick={()=>void toggle("enabled_for_rebinding")}><span/></button></label></div>
       </div>
       <div className="flex flex-wrap items-end gap-3 rounded-xl border border-slate-200 p-3">

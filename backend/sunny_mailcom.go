@@ -40,7 +40,10 @@ func mailComBaseURL(cfg map[string]any) string {
 
 // mailComCfgWithBody overlays operational fields carried by a request body
 // onto the stored config, so actions like check/split/import work even when
-// the user has not persisted the config yet.
+// the user has not persisted the config yet. Account credentials are NEVER
+// taken from the body: passwords only live server-side (sunny_configs) and a
+// body-sent account list (emails without passwords after a config GET round
+// trip) would wipe them. Use the stored accounts.
 func mailComCfgWithBody(cfg map[string]any, body map[string]any) map[string]any {
 	if body == nil {
 		return cfg
@@ -51,9 +54,6 @@ func mailComCfgWithBody(cfg map[string]any, body map[string]any) map[string]any 
 	}
 	if rawBase := strings.TrimSpace(text(body["base_url"])); rawBase != "" {
 		next["base_url"] = strings.TrimRight(rawBase, "/")
-	}
-	if rawAccounts, ok := body["accounts"]; ok {
-		next["accounts"] = rawAccounts
 	}
 	for _, key := range []string{"enabled", "enabled_for_rebinding", "rebind_domain"} {
 		if value, ok := body[key]; ok {
