@@ -1185,6 +1185,17 @@ class SunnyDB:
         )
         self.conn.commit()
 
+    def list_mailcom_idle_aliases(self) -> list[dict[str, Any]]:
+        """Idle mail.com split aliases in the local pool (not used by any
+        session/rebind yet). Used by rebinding to reuse existing aliases
+        before splitting fresh ones upstream."""
+        rows = self.conn.execute(
+            "select id,email,access_key,rebind_mailbox_api,status from sunny_mailboxes "
+            "where mailbox_type='mailcom' and coalesce(status,'') in ('','未注册','换绑中') "
+            "and enabled=1 order by id asc limit 50"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_config(self, key: str) -> dict[str, Any]:
         row = self.conn.execute("select value_json from sunny_configs where key=?", (key,)).fetchone()
         if not row:

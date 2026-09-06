@@ -314,6 +314,49 @@ def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None], domain_overr
     raise RebindError(f"生成 Mail.com 分裂邮箱失败：{last}")
 
 
+def _mailcom_pool_candidate(db: SunnyDB, log: Callable[[str], None], domain_override: str = "") -> tuple[str, str, str] | None:
+    """Reuse an already-split mail.com alias from the local pool when one is
+    idle (status 未注册/empty), so rebinding does not hit the upstream alias
+    quota while unused aliases sit in the pool. Returns None when the pool has
+    no idle mailcom alias for the configured master account(s); callers then
+    fall back to splitting a fresh alias."""
+    cfg = db.get_config("mail_com_code")
+    raw_accounts = cfg.get("accounts")
+    prefixes: set[str] = set()
+    if isinstance(raw_accounts, (list, tuple)):
+        for item in raw_accounts:
+            if isinstance(item, dict):
+                email = str(item.get("email") or "").strip()
+                if email and "@" in email:
+                    prefixes.add(email.split("@", 1)[0].lower())
+    elif isinstance(raw_accounts, str):
+        for line in re.split(r"[\r\n]+", str(raw_accounts)):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            email = line.split("----", 1)[0].strip()
+            if email and "@" in email:
+                prefixes.add(email.split("@", 1)[0].lower())
+    if not prefixes:
+        return None
+    domain = str(domain_override or cfg.get("rebind_domain") or "").strip().lstrip("@").lower()
+    rows = db.list_mailcom_idle_aliases()
+    for row in rows:
+        email = str(row.get("email") or "").strip().lower()
+        code_url = str(row.get("access_key") or row.get("rebind_mailbox_api") or "").strip()
+        if not email or not code_url or "-split-" not in email:
+            continue
+        local = email.split("@", 1)[0].lower()
+        if not any(local.startswith(prefix) for prefix in prefixes):
+            continue
+        if domain and not email.endswith("@" + domain):
+            continue
+        token_hash = hashlib.sha256(code_url.encode("utf-8")).hexdigest()
+        log(f"[{email}] 复用本地 Mail.com 分裂邮箱池中的换绑候选：{email}")
+        return email, code_url, token_hash
+    return None
+
+
 def _login_flow(account: MailAccount, proxy: str, log: Callable[[str], None], *, keep_session: bool, should_cancel: Callable[[], bool] | None = None) -> tuple[ProtocolRegistrationFlow, dict[str, Any]]:
     if not account.has_login_secret:
         log("[认证] 未检测到完整 LS，直接使用 Camoufox 邮箱验证码登录")
@@ -653,7 +696,11 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
             active_candidate_channel = candidate_channel
             try:
                 if candidate_channel == "mailcom":
-                    new_email, new_api, new_api_token_hash = _mailcom_alias_mailbox(db, log, str((payload or {}).get("mailcom_domain") or ""))
+                    pool_candidate = _mailcom_pool_candidate(db, log, str((payload or {}).get("mailcom_domain") or ""))
+                    if pool_candidate is not None:
+                        new_email, new_api, new_api_token_hash = pool_candidate
+                    else:
+                        new_email, new_api, new_api_token_hash = _mailcom_alias_mailbox(db, log, str((payload or {}).get("mailcom_domain") or ""))
                 else:
                     new_email, new_api, new_api_token_hash = _domain_mailbox(db, log)
             except RebindError as exc:
