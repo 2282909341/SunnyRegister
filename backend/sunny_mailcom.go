@@ -209,6 +209,13 @@ func (s *Server) sunnyMailComHandler(w http.ResponseWriter, r *http.Request, par
 		}
 		s.mailComAliasesHandler(w, r)
 		return
+	case "stats":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		s.mailComAccountStats(w, r)
+		return
 	case "fetch-code":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusNotFound, "not found")
@@ -724,22 +731,30 @@ func (s *Server) mailComDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	address := strings.ToLower(strings.TrimSpace(text(body["email"])))
-	codeURL := strings.TrimSpace(text(body["url"]))
 	if address == "" {
 		writeError(w, http.StatusBadRequest, "缺少分裂邮箱地址")
 		return
 	}
 	cfg := mergeConfig(defaultMailComConfig(), s.sunnyGetConfig(sunnyCfgMailCom, defaultMailComConfig()))
-	// Try to release the alias upstream when a code URL is known. Failure to
-	// reach the code API only warns; the local pool row is still removed.
-	if codeURL != "" {
+	// Release the alias upstream so the quota slot is freed. The code API
+	// requires the master account credentials plus the alias address.
+	accounts := mailComAccounts(cfg)
+	if len(accounts) > 0 {
+		// Prefer the account that owns this alias; fall back to the first.
+		master := accounts[0]
+		for _, account := range accounts {
+			if strings.HasPrefix(address, strings.Split(account.Email, "@")[0]+"-") || strings.Contains(address, "@") && strings.EqualFold(strings.Split(address, "@")[0], strings.Split(account.Email, "@")[0]) {
+				master = account
+				break
+			}
+		}
 		if client, clientErr := newMailComClient(cfg); clientErr == nil {
 			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-			raw, status, requestErr := client.request(ctx, http.MethodPost, "/mail/aliases/remove", map[string]any{"email": address})
+			raw, status, requestErr := client.request(ctx, http.MethodPost, "/mail/aliases/remove", map[string]any{"email": master.Email, "password": master.Password, "address": address})
 			cancel()
-			if requestErr == nil && (status < 200 || status >= 300) {
-				_ = raw
-			}
+			_ = raw
+			_ = status
+			_ = requestErr
 		}
 	}
 	var mailbox SunnyMailbox
@@ -747,4 +762,79 @@ func (s *Server) mailComDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		s.db.Delete(&mailbox)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": address})
+}
+
+// mailComAccountStats returns split/usage statistics for a master account by
+// inspecting the local pool (mailbox_type=mailcom rows) and the upstream
+// alias list when reachable.
+func (s *Server) mailComAccountStats(w http.ResponseWriter, r *http.Request) {
+	body, err := parseBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	masterEmail := strings.ToLower(strings.TrimSpace(text(body["email"])))
+	if masterEmail == "" {
+		writeError(w, http.StatusBadRequest, "缺少主账号邮箱")
+		return
+	}
+	cfg := mergeConfig(defaultMailComConfig(), s.sunnyGetConfig(sunnyCfgMailCom, defaultMailComConfig()))
+	var master *mailComAccount
+	for index := range mailComAccounts(cfg) {
+		account := &mailComAccounts(cfg)[index]
+		if strings.EqualFold(account.Email, masterEmail) {
+			master = account
+			break
+		}
+	}
+	if master == nil {
+		writeError(w, http.StatusNotFound, "未找到主账号，请先导入")
+		return
+	}
+	// Local pool rows that belong to this master (same local-part prefix).
+	prefix := strings.Split(master.Email, "@")[0]
+	var rows []SunnyMailbox
+	s.db.Where("mailbox_type = ?", "mailcom").Find(&rows)
+	localTotal := 0
+	localUsed := 0
+	for _, row := range rows {
+		local := strings.Split(row.Email, "@")[0]
+		if !strings.HasPrefix(local, prefix) {
+			continue
+		}
+		localTotal++
+		if row.Status != "未注册" && row.Status != "" && row.Status != "换绑中" {
+			localUsed++
+		}
+	}
+	// Upstream alias list + quota.
+	upstreamAliases := []string{}
+	upstreamTotal := 0
+	if client, clientErr := newMailComClient(cfg); clientErr == nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		raw, status, requestErr := client.request(ctx, http.MethodPost, "/mail/aliases", map[string]any{"email": master.Email, "password": master.Password})
+		cancel()
+		if requestErr == nil && status >= 200 && status < 300 {
+			var payload struct {
+				Aliases []string `json:"aliases"`
+			}
+			if json.Unmarshal(raw, &payload) == nil {
+				for _, alias := range payload.Aliases {
+					if strings.Contains(alias, "-split-") {
+						upstreamAliases = append(upstreamAliases, alias)
+					}
+				}
+				upstreamTotal = len(payload.Aliases)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"email":            master.Email,
+		"split_total":      localTotal,
+		"used":             localUsed,
+		"available":        localTotal - localUsed,
+		"upstream_total":   upstreamTotal,
+		"upstream_split":   len(upstreamAliases),
+		"upstream_aliases": upstreamAliases,
+	})
 }

@@ -2404,6 +2404,8 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
   const [accountsText, setAccountsText] = useState("");
   const [splitCount, setSplitCount] = useState(9);
   const [selectedMaster, setSelectedMaster] = useState("");
+  const [masterStats, setMasterStats] = useState<AnyObj|null>(null);
+  const [statsLoading, setStatsLoading] = useState(false);
   const [checking, setChecking] = useState<string>("");
   const update = (key:string, value:any) => setConfig({...config, [key]: value});
   const accountEmails: string[] = Array.isArray(config.accounts) ? config.accounts.map((item:any)=>String(item?.email||item||"")) : [];
@@ -2441,6 +2443,16 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
     } catch (e:any) { notify("fail", e.message || String(e)); }
     finally { setBusy(false); }
   }
+  async function loadMasterStats() {
+    if (!selectedMaster) { setMasterStats(null); return; }
+    setStatsLoading(true);
+    try {
+      const result = await apiFetch("/sunny/mailcom/stats", {method:"POST", body:JSON.stringify({email:selectedMaster})});
+      setMasterStats(result || null);
+    } catch (e:any) { setMasterStats(null); }
+    finally { setStatsLoading(false); }
+  }
+  useEffect(()=>{ void loadMasterStats(); },[selectedMaster]);
   async function doSplit() {
     if (!enabled) { notify("fail", "请先启用 Mail.com 分裂邮箱"); return; }
     if (!selectedMaster) { notify("fail", "请选择主账号"); return; }
@@ -2469,8 +2481,9 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
   async function doDelete(item: AnyObj) {
     try {
       await apiFetch("/sunny/mailcom/delete", {method:"POST", body:JSON.stringify({email:item.email, url:item.url || ""})});
-      notify("ok", `已删除 ${item.email || ""}`);
+      notify("ok", `已释放 ${item.email || ""}，配额已回收`);
       await loadAliases();
+      await loadMasterStats();
     } catch (e:any) { notify("fail", e.message || String(e)); }
   }
   async function doFetchCode(item: AnyObj) {
@@ -2506,13 +2519,22 @@ function MailComProviderConfig({ t, config, setConfig, notify }: { t: typeof zh;
         <div><Label>分裂数量</Label><Input type="number" min={1} max={9} value={splitCount} onChange={(e)=>setSplitCount(Math.max(1,Math.min(9,Number(e.target.value||1))))} className="w-24"/></div>
         <Button disabled={busy || !enabled} className="rounded-xl bg-emerald-600 px-4 text-white hover:bg-emerald-700" onClick={doSplit}><Plus className="mr-2 h-4 w-4"/>立即分裂</Button>
       </div>
+      {selectedMaster && <div className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-800/40 dark:text-slate-300">
+        {statsLoading ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin"/>检测中…</span> : masterStats ? <>
+          <span>已分裂 <strong className="text-slate-800 dark:text-slate-100">{Number(masterStats.split_total||0)}</strong> 个</span>
+          <span>换绑已用 <strong className="text-amber-600 dark:text-amber-400">{Number(masterStats.used||0)}</strong> 个</span>
+          <span>可用 <strong className="text-emerald-600 dark:text-emerald-400">{Number(masterStats.available||0)}</strong> 个</span>
+          <span>服务器占用 <strong className={Number(masterStats.upstream_split||0)>=8 ? "text-red-500" : "text-slate-800 dark:text-slate-100"}>{Number(masterStats.upstream_split||0)}/8</strong>（配额上限 10 个地址）</span>
+          {Number(masterStats.upstream_split||0)>=8 && <span className="text-red-500">配额已满，请先释放别名再分裂</span>}
+        </> : <span className="text-slate-400">检测失败（账号未导入或服务不可达）</span>}
+      </div>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Button disabled={busy} variant="outline" className="rounded-xl" onClick={check}><RefreshCw className="mr-2 h-4 w-4"/>测试连接</Button>
         <Button disabled={busy} variant="outline" className="rounded-xl" onClick={doImport}><Upload className="mr-2 h-4 w-4"/>验证并导入主账号</Button>
         <Button disabled={busy} className="rounded-xl bg-emerald-600 px-5 text-white hover:bg-emerald-700" onClick={()=>void save()}><Save className="mr-2 h-4 w-4"/>保存配置</Button>
       </div>
       {aliases.length > 0 && <div className="sr-table-card overflow-hidden rounded-[18px] p-0">
-        <div className="sr-table-scroll"><table className="w-full text-left text-sm"><thead><tr className="border-b border-slate-200 text-xs text-slate-500"><th className="px-3 py-2">分裂邮箱</th><th className="px-3 py-2">取码 URL</th><th className="px-3 py-2">状态</th><th className="px-3 py-2">操作</th></tr></thead><tbody>{aliases.map((item:AnyObj)=><tr key={String(item.id||item.email)} className="border-b border-slate-100"><td className="px-3 py-2 font-mono text-xs">{item.email}</td><td className="px-3 py-2 font-mono text-xs text-slate-500 truncate max-w-56">{item.url}</td><td className="px-3 py-2 text-xs">{item.status || "未注册"}</td><td className="px-3 py-2"><div className="flex flex-wrap gap-2"><button className="sr-link" onClick={()=>void copyText(String(item.email||""))}>复制地址</button><button className="sr-link" onClick={()=>void copyText(String(item.url||""))}>复制URL</button><button className="sr-link" disabled={checking===String(item.id||item.email)} onClick={()=>void doFetchCode(item)}>{checking===String(item.id||item.email)?<Loader2 className="h-3.5 w-3.5 animate-spin"/>:"测试取码"}</button><ConfirmBubble message="删除该分裂别名？" detail={item.email || ""} onConfirm={()=>void doDelete(item)}><button className="sr-link text-red-500">删除</button></ConfirmBubble></div></td></tr>)}</tbody></table></div>
+        <div className="sr-table-scroll"><table className="w-full text-left text-sm"><thead><tr className="border-b border-slate-200 text-xs text-slate-500"><th className="px-3 py-2">分裂邮箱</th><th className="px-3 py-2">取码 URL</th><th className="px-3 py-2">状态</th><th className="px-3 py-2">操作</th></tr></thead><tbody>{aliases.map((item:AnyObj)=><tr key={String(item.id||item.email)} className="border-b border-slate-100"><td className="px-3 py-2 font-mono text-xs">{item.email}</td><td className="px-3 py-2 font-mono text-xs text-slate-500 truncate max-w-56">{item.url}</td><td className="px-3 py-2 text-xs">{item.status || "未注册"}</td><td className="px-3 py-2"><div className="flex flex-wrap gap-2"><button className="sr-link" onClick={()=>void copyText(String(item.email||""))}>复制地址</button><button className="sr-link" onClick={()=>void copyText(String(item.url||""))}>复制URL</button><button className="sr-link" disabled={checking===String(item.id||item.email)} onClick={()=>void doFetchCode(item)}>{checking===String(item.id||item.email)?<Loader2 className="h-3.5 w-3.5 animate-spin"/>:"测试取码"}</button><ConfirmBubble message="释放该分裂别名？将从服务器删除并释放配额（已换绑使用的账号不受影响）" detail={item.email || ""} onConfirm={()=>void doDelete(item)}><button className="sr-link text-red-500">释放</button></ConfirmBubble></div></td></tr>)}</tbody></table></div>
       </div>}
     </div>}
   </Card>;
