@@ -1832,7 +1832,10 @@ class MailComCodeReader:
     def __init__(self, account: MailAccount, log: Callable[[str], None] | None, proxy_url: str = ""):
         self.account = account
         self.log = log or (lambda _m: None)
-        self.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        # The mail-com-code-api server (a dedicated VPS) is reached directly;
+        # routing it through the task proxy (often a local Clash on 127.0.0.1:7890)
+        # makes code fetching time out. Direct connection only.
+        self.proxies = None
         code_url = str(account.access_key or "").strip()
         if not code_url:
             raise MailboxAccessError("mailcom_credential_invalid", "Mail.com 分裂邮箱缺少取码 URL", terminal=True)
@@ -1855,7 +1858,11 @@ class MailComCodeReader:
                 target,
                 headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
                 timeout=min(65, 5 + max(0, min(60, int(wait or 0)))),
-                proxies=self.proxies,
+                # Explicitly bypass any environment/system proxy: the
+                # mail-com-code-api server is a dedicated VPS reached directly.
+                # A local Clash (127.0.0.1:7890) inherited via env proxies makes
+                # these requests time out.
+                proxies={"http": None, "https": None},
             )
         except requests.RequestException as exc:
             self.last_error = str(exc)

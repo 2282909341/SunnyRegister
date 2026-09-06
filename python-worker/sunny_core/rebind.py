@@ -270,6 +270,7 @@ def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None], domain_overr
                 json=split_body,
                 headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
                 timeout=30,
+                proxies={"http": None, "https": None},
             )
             payload = {}
             try:
@@ -339,6 +340,23 @@ def _mailcom_pool_candidate(db: SunnyDB, log: Callable[[str], None], domain_over
         if domain and not email.endswith("@" + domain):
             continue
         token_hash = hashlib.sha256(code_url.encode("utf-8")).hexdigest()
+        # Lightweight liveness probe: a split alias may have been released
+        # upstream (quota cleanup) while its local row still exists. Skip and
+        # mark dead rows so rebinding does not burn attempts on stale keys.
+        try:
+            probe = requests.get(
+                code_url + ("&" if "?" in code_url else "?") + "wait=0&max_age=600",
+                headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                timeout=8,
+                proxies={"http": None, "https": None},
+            )
+            if probe.status_code in (401, 403, 404):
+                db.mark_mailcom_alias_released(email)
+                log(f"[{email}] 本地池候选取码 key 已失效（HTTP {probe.status_code}），跳过")
+                continue
+        except requests.RequestException as exc:
+            log(f"[{email}] 本地池候选探测失败（{str(exc)[:120]}），跳过")
+            continue
         log(f"[{email}] 复用本地 Mail.com 分裂邮箱池中的换绑候选：{email}")
         return email, code_url, token_hash
     return None
@@ -369,6 +387,7 @@ def _release_mailcom_alias(db: SunnyDB, email: str, log: Callable[[str], None]) 
             json={"email": master["email"], "password": master["password"], "address": email},
             headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
             timeout=30,
+            proxies={"http": None, "https": None},
         )
         if response.ok:
             db.mark_mailcom_alias_released(email)
