@@ -1857,7 +1857,7 @@ class MailComCodeReader:
             response = requests.get(
                 target,
                 headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
-                timeout=min(65, 5 + max(0, min(60, int(wait or 0)))),
+                timeout=min(65, max(25, 5 + max(0, min(60, int(wait or 0))))),
                 # Explicitly bypass any environment/system proxy: the
                 # mail-com-code-api server is a dedicated VPS reached directly.
                 # A local Clash (127.0.0.1:7890) inherited via env proxies makes

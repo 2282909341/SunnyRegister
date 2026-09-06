@@ -347,7 +347,7 @@ def _mailcom_pool_candidate(db: SunnyDB, log: Callable[[str], None], domain_over
             probe = requests.get(
                 code_url + ("&" if "?" in code_url else "?") + "wait=0&max_age=600",
                 headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
-                timeout=8,
+                timeout=30,
                 proxies={"http": None, "https": None},
             )
             if probe.status_code in (401, 403, 404):
