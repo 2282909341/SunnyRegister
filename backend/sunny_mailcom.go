@@ -438,10 +438,35 @@ func (s *Server) mailComSplitHandler(w http.ResponseWriter, r *http.Request, cfg
 		if json.Unmarshal(raw, &payload) == nil {
 			detail = firstText(text(payload["detail"]), text(payload["error"]))
 		}
+		// A partial split failure (e.g. alias quota exhausted mid-batch) can
+		// still have created some aliases upstream. Persist any routes the
+		// response carries so the pool table reflects reality and the user
+		// does not re-split the same aliases blindly.
+		savedPartial := 0
+		if routes, ok := payload["routes"].([]any); ok {
+			for _, route := range routes {
+				item, ok := route.(map[string]any)
+				if !ok {
+					continue
+				}
+				address := strings.ToLower(strings.TrimSpace(text(item["address"])))
+				codeURL := strings.TrimSpace(text(item["url"]))
+				if address == "" || codeURL == "" {
+					continue
+				}
+				if _, persistErr := s.persistMailComAlias(selected.Email, address, codeURL); persistErr == nil {
+					savedPartial++
+				}
+			}
+		}
 		if detail == "" {
 			detail = summary
 		}
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("分裂别名失败：HTTP %d：%s", status, detail))
+		message := fmt.Sprintf("分裂别名失败：HTTP %d：%s", status, detail)
+		if savedPartial > 0 {
+			message = fmt.Sprintf("分裂别名部分成功：已创建 %d 个（配额不足），其余失败：%s", savedPartial, detail)
+		}
+		writeError(w, http.StatusBadGateway, message)
 		return
 	}
 	var result mailComSplitResponse

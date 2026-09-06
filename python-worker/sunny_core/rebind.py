@@ -240,7 +240,7 @@ def _domain_mailbox(db: SunnyDB, log: Callable[[str], None]) -> tuple[str, str, 
     raise RebindError(f"生成自建域名邮箱失败：{last}")
 
 
-def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None]) -> tuple[str, str, str]:
+def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None], domain_override: str = "") -> tuple[str, str, str]:
     """Generate a mail.com split alias as a rebind candidate.
 
     Calls the mail-com-code-api ``POST /aliases/split`` endpoint and returns
@@ -272,7 +272,7 @@ def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None]) -> tuple[str
     if not accounts:
         raise RebindError("Mail.com 分裂邮箱未配置主账号")
     last = ""
-    rebind_domain = str(cfg.get("rebind_domain") or "").strip().lstrip("@").lower()
+    rebind_domain = str(domain_override or cfg.get("rebind_domain") or "").strip().lstrip("@").lower()
     for account in accounts:
         try:
             split_body: dict[str, Any] = {"email": account["email"], "password": account["password"], "count": 1}
@@ -653,7 +653,7 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
             active_candidate_channel = candidate_channel
             try:
                 if candidate_channel == "mailcom":
-                    new_email, new_api, new_api_token_hash = _mailcom_alias_mailbox(db, log)
+                    new_email, new_api, new_api_token_hash = _mailcom_alias_mailbox(db, log, str((payload or {}).get("mailcom_domain") or ""))
                 else:
                     new_email, new_api, new_api_token_hash = _domain_mailbox(db, log)
             except RebindError as exc:

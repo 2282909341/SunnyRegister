@@ -4083,6 +4083,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
   const [paymentProbeUseTrialPromotion,setPaymentProbeUseTrialPromotion]=useState(false);
   const [rebindCountryPreference,setRebindCountryPreference]=useCachedState<string[]|null>("session.rebindCountries",null);
   const [rebindChannelPreference,setRebindChannelPreference]=useCachedState<string>("session.rebindChannel","auto");
+  const [rebindDomainPreference,setRebindDomainPreference]=useCachedState<string>("session.rebindDomain","dr.com");
   const [rebindCountryDialog,setRebindCountryDialog]=useState<{ids:number[];row?:AnyObj}|null>(null);
   const [rebindCountries,setRebindCountries]=useState<string[]>([]);
   const [rebindCountrySelection,setRebindCountrySelection]=useState<string[]>([]);
@@ -4462,15 +4463,17 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     const target=rebindCountryDialog;
     setRebindCountryPreference(countries);
     setRebindCountryDialog(null);
-    void rebindAccounts(target.ids,countries,target.row,rebindChannelPreference);
+    void rebindAccounts(target.ids,countries,target.row,rebindChannelPreference,rebindDomainPreference);
   }
-  async function rebindAccounts(ids: number[], countries: string[], row?: AnyObj, channel?: string) {
+  async function rebindAccounts(ids: number[], countries: string[], row?: AnyObj, channel?: string, mailcomDomain?: string) {
     if (!ids.length) { notify("fail", "请选择需要换绑的账户"); return; }
     if (row && ["已封禁", "banned", "disabled"].includes(String(row.status || ""))) { notify("ok", "已跳过已封禁账户"); return; }
     const targetIds = Array.from(new Set(ids.map(Number).filter(Boolean)));
     const selectedChannel = channel || rebindChannelPreference || "auto";
+    const body: AnyObj = { session_ids: targetIds, countries, channel: selectedChannel };
+    if (selectedChannel === "mailcom" && mailcomDomain) body.mailcom_domain = mailcomDomain;
     try {
-      const task = await runPersistentSessionTask("rebind", targetIds, row?.email, () => apiFetch("/sunny/sessions/rebind", { method:"POST", body:JSON.stringify({ session_ids: targetIds, countries, channel: selectedChannel }) }));
+      const task = await runPersistentSessionTask("rebind", targetIds, row?.email, () => apiFetch("/sunny/sessions/rebind", { method:"POST", body:JSON.stringify(body) }));
       const result = task.result || {};
       const failed = Number(result.failed || 0);
       const skipped = Number(result.skipped || 0);
@@ -4695,7 +4698,7 @@ function SessionManager({ t, notify }: { t: typeof zh; notify: (type: "ok" | "fa
     {failureDetail && <FailureDetailModal t={t} value={failureDetail} onClose={()=>setFailureDetail(null)}/>}
     {trialCountryDialog && <CountryProbeModal title={t.trialCountryTitle} hint={t.trialCountryHint} empty={t.trialCountryEmpty} start={t.trialStart} t={t} countries={trialCountries} selected={trialCountrySelection} loading={trialCountriesLoading} onToggle={(country)=>setTrialCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setTrialCountrySelection(trialCountries)} onClear={()=>setTrialCountrySelection([])} onClose={()=>setTrialCountryDialog(null)} onConfirm={confirmTrialCountries}/>}
     {paymentProbeDialog && <PaymentProbeCountryModal t={t} countries={paymentProbeCountries} selected={paymentProbeCountrySelection} useTrialPromotion={paymentProbeUseTrialPromotion} loading={paymentProbeCountriesLoading} onToggleTrialPromotion={()=>setPaymentProbeUseTrialPromotion((value)=>!value)} onToggle={(country)=>setPaymentProbeCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setPaymentProbeCountrySelection(paymentProbeCountries)} onClear={()=>setPaymentProbeCountrySelection([])} onClose={()=>setPaymentProbeDialog(null)} onConfirm={confirmPaymentProbeCountries}/>}
-    {rebindCountryDialog && <CountryProbeModal title={t.rebindCountryTitle} hint={t.rebindCountryHint} empty={t.rebindCountryEmpty} start={t.rebindCountryStart} t={t} countries={rebindCountries} selected={rebindCountrySelection} loading={rebindCountriesLoading} onToggle={(country)=>setRebindCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setRebindCountrySelection(rebindCountries)} onClear={()=>setRebindCountrySelection([])} onClose={()=>setRebindCountryDialog(null)} onConfirm={confirmRebindCountries} channel={rebindChannelPreference} onChannelChange={(channel)=>{setRebindChannelPreference(channel)}}/>}
+    {rebindCountryDialog && <CountryProbeModal title={t.rebindCountryTitle} hint={t.rebindCountryHint} empty={t.rebindCountryEmpty} start={t.rebindCountryStart} t={t} countries={rebindCountries} selected={rebindCountrySelection} loading={rebindCountriesLoading} onToggle={(country)=>setRebindCountrySelection((old)=>old.includes(country)?old.filter((value)=>value!==country):[...old,country])} onSelectAll={()=>setRebindCountrySelection(rebindCountries)} onClear={()=>setRebindCountrySelection([])} onClose={()=>setRebindCountryDialog(null)} onConfirm={confirmRebindCountries} channel={rebindChannelPreference} onChannelChange={(channel)=>{setRebindChannelPreference(channel)}} domain={rebindDomainPreference} onDomainChange={(domain)=>{setRebindDomainPreference(domain)}}/>}
     <AccountLogFloat t={t} open={accountLogOpen} kind={accountLogKind} logs={accountLogs[accountLogKind] || []} canCancel={cancellableAccountLogTasks.length > 0} cancelling={terminatingAccountLog} onCancel={()=>void terminateAccountLogTasks()} onToggle={()=>setAccountLogOpen((value)=>!value)} onKindChange={setAccountLogKind} onClear={()=>publishAccountLogs({ ...accountLogSnapshot, [accountLogKind]: [] })} />
   </Card>;
 }
@@ -4726,7 +4729,7 @@ function PaymentProbeCountryModal({t,countries,selected,useTrialPromotion,loadin
   </div></div></PagePortal>;
 }
 
-function CountryProbeModal({t,title,hint,empty,start,countries,selected,loading,onToggle,onSelectAll,onClear,onClose,onConfirm,channel,onChannelChange}:{
+function CountryProbeModal({t,title,hint,empty,start,countries,selected,loading,onToggle,onSelectAll,onClear,onClose,onConfirm,channel,onChannelChange,domain,onDomainChange}:{
   t: typeof zh;
   title: string;
   hint: string;
@@ -4742,13 +4745,17 @@ function CountryProbeModal({t,title,hint,empty,start,countries,selected,loading,
   onConfirm:()=>void;
   channel?: string;
   onChannelChange?: (channel:string)=>void;
+  domain?: string;
+  onDomainChange?: (domain:string)=>void;
 }) {
   return <PagePortal><div className="sr-modal-mask"><div className="sr-modal sr-payment-country-modal" role="dialog" aria-modal="true">
     <div className="sr-modal-head"><h3>{title}</h3><button title={t.close} onClick={onClose}><X className="h-5 w-5"/></button></div>
     <div className="sr-modal-body">
       {channel && onChannelChange && <div className="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-600"><span>换绑邮箱渠道</span>{["auto","domain","mailcom"].map((value)=>(
         <button key={value} type="button" className={cn("rounded-full border px-3 py-1 text-xs", channel===value ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-slate-200 text-slate-500 hover:border-emerald-300")} onClick={()=>onChannelChange(value)}>{value==="auto"?"自动（双通道）":value==="domain"?"CloudMail 域名邮箱":"Mail.com 分裂邮箱"}</button>
-      ))}</div>}
+      ))}{channel==="mailcom" && domain && onDomainChange && <span className="ml-2 inline-flex items-center gap-2"><span className="text-slate-400">分裂域名</span>{["dr.com","mail.com","lovecat.com","自定义"].map((value)=>(
+        <button key={value} type="button" className={cn("rounded-full border px-3 py-1 text-xs", domain===value ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-slate-200 text-slate-500 hover:border-emerald-300")} onClick={()=>onDomainChange(value)}>{value}</button>
+      ))}</span>}</div>}
       <div className="sr-payment-country-toolbar"><p>{hint}</p><div><button disabled={loading||countries.length===0} onClick={onSelectAll}>{t.paymentProbeCountryAll}</button><button disabled={loading||selected.length===0} onClick={onClear}>{t.paymentProbeCountryClear}</button></div></div>
       {loading ? <div className="sr-payment-country-state"><Loader2 className="h-5 w-5 animate-spin"/><span>{t.loadingData}</span></div> : countries.length ? <div className="sr-payment-country-grid">{countries.map((country)=>{
         const checked=selected.includes(country);

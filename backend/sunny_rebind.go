@@ -39,6 +39,9 @@ func (s *Server) createSunnyRebindTask(body map[string]any) (Task, error) {
 		}
 	}
 	body["channel"] = channel
+	if domain := strings.TrimSpace(text(body["mailcom_domain"])); domain != "" {
+		body["mailcom_domain"] = strings.TrimPrefix(strings.ToLower(domain), "@")
+	}
 	sessionIDs := uintSlice(body["session_ids"])
 	accountIDs := uintSlice(body["account_ids"])
 	if len(accountIDs) == 0 && len(sessionIDs) > 0 {
