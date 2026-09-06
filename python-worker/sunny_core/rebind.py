@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import replace
@@ -37,6 +38,11 @@ REBIND_OTP_SECOND_WAIT_SECONDS = 45
 REBIND_OTP_FINAL_WAIT_SECONDS = 45
 REBIND_DOMAIN_MAILBOX_MAX_ATTEMPTS = 5
 _DOMAIN_ROTATION = itertools.count()
+
+# Global lock serializing ALL mail.com upstream operations (split, release,
+# pool probing) across concurrent rebind tasks. mail.com risk control trips on
+# rapid parallel logins, and parallel tasks steal each other's split aliases.
+_MAILCOM_LOCK = threading.Lock()
 
 
 class RebindError(RuntimeError):
@@ -260,45 +266,46 @@ def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None], domain_overr
         raise RebindError("Mail.com 分裂邮箱未配置主账号")
     last = ""
     rebind_domain = str(domain_override or cfg.get("rebind_domain") or "").strip().lstrip("@").lower()
-    for account in accounts:
-        try:
-            split_body: dict[str, Any] = {"email": account["email"], "password": account["password"], "count": 1}
-            if rebind_domain:
-                split_body["domain"] = rebind_domain
-            response = requests.post(
-                base + "/aliases/split",
-                json=split_body,
-                headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
-                timeout=30,
-                proxies={"http": None, "https": None},
-            )
-            payload = {}
+    with _MAILCOM_LOCK:
+        for account in accounts:
             try:
-                payload = response.json()
-            except Exception:
-                pass
-            if not response.ok:
-                detail = str(payload.get("detail") or payload.get("error") or response.text or "")[:200]
-                last = f"HTTP {response.status_code}: {detail}"
-                continue
-            routes = payload.get("routes") if isinstance(payload, dict) else None
-            if not isinstance(routes, list) or not routes:
-                last = "上游未返回分裂别名路由"
-                continue
-            first = routes[0]
-            if not isinstance(first, dict):
-                last = "上游分裂别名路由格式无效"
-                continue
-            address = str(first.get("address") or "").strip()
-            code_url = str(first.get("url") or "").strip()
-            if not address or not code_url:
-                last = "上游分裂别名缺少地址或取码 URL"
-                continue
-            token_hash = hashlib.sha256(code_url.encode("utf-8")).hexdigest()
-            log(f"[{address}] 已从 Mail.com 分裂邮箱生成换绑邮箱：{address}----{code_url}")
-            return address, code_url, token_hash
-        except requests.RequestException as exc:
-            last = str(exc)
+                split_body: dict[str, Any] = {"email": account["email"], "password": account["password"], "count": 1}
+                if rebind_domain:
+                    split_body["domain"] = rebind_domain
+                response = requests.post(
+                    base + "/aliases/split",
+                    json=split_body,
+                    headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                    timeout=30,
+                    proxies={"http": None, "https": None},
+                )
+                payload = {}
+                try:
+                    payload = response.json()
+                except Exception:
+                    pass
+                if not response.ok:
+                    detail = str(payload.get("detail") or payload.get("error") or response.text or "")[:200]
+                    last = f"HTTP {response.status_code}: {detail}"
+                    continue
+                routes = payload.get("routes") if isinstance(payload, dict) else None
+                if not isinstance(routes, list) or not routes:
+                    last = "上游未返回分裂别名路由"
+                    continue
+                first = routes[0]
+                if not isinstance(first, dict):
+                    last = "上游分裂别名路由格式无效"
+                    continue
+                address = str(first.get("address") or "").strip()
+                code_url = str(first.get("url") or "").strip()
+                if not address or not code_url:
+                    last = "上游分裂别名缺少地址或取码 URL"
+                    continue
+                token_hash = hashlib.sha256(code_url.encode("utf-8")).hexdigest()
+                log(f"[{address}] 已从 Mail.com 分裂邮箱生成换绑邮箱：{address}----{code_url}")
+                return address, code_url, token_hash
+            except requests.RequestException as exc:
+                last = str(exc)
     raise RebindError(f"生成 Mail.com 分裂邮箱失败：{last}")
 
 
@@ -344,12 +351,13 @@ def _mailcom_pool_candidate(db: SunnyDB, log: Callable[[str], None], domain_over
         # upstream (quota cleanup) while its local row still exists. Skip and
         # mark dead rows so rebinding does not burn attempts on stale keys.
         try:
-            probe = requests.get(
-                code_url + ("&" if "?" in code_url else "?") + "wait=0&max_age=600",
-                headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
-                timeout=30,
-                proxies={"http": None, "https": None},
-            )
+            with _MAILCOM_LOCK:
+                probe = requests.get(
+                    code_url + ("&" if "?" in code_url else "?") + "wait=0&max_age=600",
+                    headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                    timeout=30,
+                    proxies={"http": None, "https": None},
+                )
             if probe.status_code in (401, 403, 404):
                 db.mark_mailcom_alias_released(email)
                 log(f"[{email}] 本地池候选取码 key 已失效（HTTP {probe.status_code}），跳过")
@@ -382,13 +390,14 @@ def _release_mailcom_alias(db: SunnyDB, email: str, log: Callable[[str], None]) 
             master = account
             break
     try:
-        response = requests.post(
-            base + "/mail/aliases/remove",
-            json={"email": master["email"], "password": master["password"], "address": email},
-            headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
-            timeout=30,
-            proxies={"http": None, "https": None},
-        )
+        with _MAILCOM_LOCK:
+            response = requests.post(
+                base + "/mail/aliases/remove",
+                json={"email": master["email"], "password": master["password"], "address": email},
+                headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                timeout=30,
+                proxies={"http": None, "https": None},
+            )
         if response.ok:
             db.mark_mailcom_alias_released(email)
             log(f"[{email}] 换绑完成，已自动释放该别名并回收配额")

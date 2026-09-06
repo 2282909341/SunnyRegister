@@ -69,7 +69,15 @@ func (s *Server) createSunnyRebindTask(body map[string]any) (Task, error) {
 	}
 	body["account_ids"] = accountIDs
 	body["session_ids"] = sessionIDs
-	body["concurrency"] = s.sunnyRebindConcurrency()
+	// mail.com accounts are extremely sensitive to rapid repeated logins and
+	// concurrent splits/code fetches: parallel rebind tasks racing on the same
+	// master account trigger upstream risk control (HTTP 401) and steal each
+	// other's split aliases. Force serial execution for the mailcom channel.
+	if channel == "mailcom" {
+		body["concurrency"] = 1
+	} else {
+		body["concurrency"] = s.sunnyRebindConcurrency()
+	}
 	body = s.sunnyTaskProxySnapshot(body)
 	nextBody, err := s.sunnyApplyCountriesToProxyPool(body, s.sunnyRebindProxyPoolForCountries)
 	if err != nil {
