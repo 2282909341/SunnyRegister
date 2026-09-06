@@ -255,20 +255,7 @@ def _mailcom_alias_mailbox(db: SunnyDB, log: Callable[[str], None], domain_overr
     base = str(cfg.get("base_url") or "").strip().rstrip("/")
     if not base:
         raise RebindError("Mail.com 分裂邮箱服务地址未配置")
-    raw_accounts = cfg.get("accounts")
-    accounts: list[dict[str, str]] = []
-    if isinstance(raw_accounts, (list, tuple)):
-        for item in raw_accounts:
-            if isinstance(item, dict) and str(item.get("email") or "").strip() and str(item.get("password") or "").strip():
-                accounts.append({"email": str(item["email"]).strip(), "password": str(item["password"]).strip()})
-    elif isinstance(raw_accounts, str):
-        for line in re.split(r"[\r\n]+", raw_accounts):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("----", 1)
-            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-                accounts.append({"email": parts[0].strip(), "password": parts[1].strip()})
+    accounts = _mailcom_accounts_from_cfg(cfg)
     if not accounts:
         raise RebindError("Mail.com 分裂邮箱未配置主账号")
     last = ""
@@ -355,6 +342,59 @@ def _mailcom_pool_candidate(db: SunnyDB, log: Callable[[str], None], domain_over
         log(f"[{email}] 复用本地 Mail.com 分裂邮箱池中的换绑候选：{email}")
         return email, code_url, token_hash
     return None
+
+
+def _release_mailcom_alias(db: SunnyDB, email: str, log: Callable[[str], None]) -> None:
+    """Release a used mail.com split alias upstream so its quota slot is
+    reclaimed for future splits. The local pool row is kept (it records the
+    rebind history) but marked so it is not reused."""
+    if not email or "-split-" not in email:
+        return
+    cfg = db.get_config("mail_com_code")
+    base = str(cfg.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        return
+    accounts = _mailcom_accounts_from_cfg(cfg)
+    if not accounts:
+        return
+    local = email.split("@", 1)[0].lower()
+    master = accounts[0]
+    for account in accounts:
+        if local.startswith(account["email"].split("@", 1)[0].lower()):
+            master = account
+            break
+    try:
+        response = requests.post(
+            base + "/mail/aliases/remove",
+            json={"email": master["email"], "password": master["password"], "address": email},
+            headers={"Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+            timeout=30,
+        )
+        if response.ok:
+            db.mark_mailcom_alias_released(email)
+            log(f"[{email}] 换绑完成，已自动释放该别名并回收配额")
+        else:
+            log(f"[{email}] 换绑完成，但自动释放别名失败（HTTP {response.status_code}），可稍后在 UI 手动释放")
+    except requests.RequestException as exc:
+        log(f"[{email}] 换绑完成，但自动释放别名失败：{str(exc)[:160]}，可稍后在 UI 手动释放")
+
+
+def _mailcom_accounts_from_cfg(cfg: dict[str, Any]) -> list[dict[str, str]]:
+    raw_accounts = cfg.get("accounts")
+    accounts: list[dict[str, str]] = []
+    if isinstance(raw_accounts, (list, tuple)):
+        for item in raw_accounts:
+            if isinstance(item, dict) and str(item.get("email") or "").strip() and str(item.get("password") or "").strip():
+                accounts.append({"email": str(item["email"]).strip(), "password": str(item["password"]).strip()})
+    elif isinstance(raw_accounts, str):
+        for line in re.split(r"[\r\n]+", raw_accounts):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("----", 1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                accounts.append({"email": parts[0].strip(), "password": parts[1].strip()})
+    return accounts
 
 
 def _login_flow(account: MailAccount, proxy: str, log: Callable[[str], None], *, keep_session: bool, should_cancel: Callable[[], bool] | None = None) -> tuple[ProtocolRegistrationFlow, dict[str, Any]]:
@@ -796,6 +836,7 @@ def rebind_one(db: SunnyDB, account_row: dict[str, Any], proxy: str, log: Callab
         _persist_login_result(db, old_email, mailbox, new_result, log)
         if success_channel == "mailcom":
             db.persist_rebind(old_email, new_email, new_api, new_api_token_hash, new_result, mailbox_type="mailcom", mailbox_channel="mailcom_code")
+            _release_mailcom_alias(db, new_email, log)
         else:
             db.persist_rebind(old_email, new_email, new_api, new_api_token_hash, new_result)
         log(f"[{old_email}] 换绑成功：{new_email}")

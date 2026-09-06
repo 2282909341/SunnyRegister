@@ -1196,6 +1196,18 @@ class SunnyDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_mailcom_alias_released(self, email: str) -> None:
+        """Mark a mail.com alias as released (quota reclaimed upstream). The
+        row stays in the pool as rebind history but is no longer reusable."""
+        email = str(email or "").strip()
+        if not email:
+            return
+        self.conn.execute(
+            "update sunny_mailboxes set last_error='已释放', status='已释放', updated_at=? where lower(email)=lower(?) and mailbox_type='mailcom'",
+            (now_sql(), email),
+        )
+        self.conn.commit()
+
     def get_config(self, key: str) -> dict[str, Any]:
         row = self.conn.execute("select value_json from sunny_configs where key=?", (key,)).fetchone()
         if not row:
