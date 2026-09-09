@@ -27,7 +27,19 @@ const countryNames: Record<string, string> = {
   BE: "比利时", FI: "芬兰", PT: "葡萄牙", GR: "希腊", LU: "卢森堡", SK: "斯洛伐克", SI: "斯洛文尼亚",
   EE: "爱沙尼亚", LV: "拉脱维亚", LT: "立陶宛", CY: "塞浦路斯", MT: "马耳他", HR: "克罗地亚",
 };
-const currencyByCountry: Record<string, string> = { US: "USD", DE: "EUR", FR: "EUR", NL: "EUR", IN: "INR", ID: "IDR", BR: "BRL", VN: "VND", GB: "GBP", JP: "JPY", KR: "KRW", PH: "PHP", AU: "AUD", CA: "CAD", CH: "CHF", PL: "PLN" };
+const currencyByCountry: Record<string, string> = {
+  US: "USD", GB: "GBP", JP: "JPY", CN: "CNY", HK: "HKD", TW: "TWD", KR: "KRW",
+  IN: "INR", BR: "BRL", AU: "AUD", CA: "CAD", NZ: "NZD", SG: "SGD", MY: "MYR",
+  TH: "THB", ID: "IDR", PH: "PHP", VN: "VND", TR: "TRY", IL: "ILS", AE: "AED",
+  SA: "SAR", QA: "QAR", KW: "KWD", BH: "BHD", OM: "OMR", ZA: "ZAR", EG: "EGP",
+  NG: "NGN", KE: "KES", MX: "MXN", AR: "ARS", CL: "CLP", CO: "COP", PE: "PEN",
+  UY: "UYU", PY: "PYG", BO: "BOB", CR: "CRC", DO: "DOP", CH: "CHF", SE: "SEK",
+  NO: "NOK", DK: "DKK", PL: "PLN", CZ: "CZK", HU: "HUF", RO: "RON", BG: "BGN",
+  IS: "ISK", RS: "RSD", UA: "UAH", GE: "GEL", KZ: "KZT", DE: "EUR", FR: "EUR",
+  IE: "EUR", NL: "EUR", ES: "EUR", IT: "EUR", AT: "EUR", BE: "EUR", FI: "EUR",
+  PT: "EUR", GR: "EUR", LU: "EUR", SK: "EUR", SI: "EUR", EE: "EUR", LV: "EUR",
+  LT: "EUR", CY: "EUR", MT: "EUR", HR: "EUR",
+};
 const sessionStatuses = ["未注册", "已注册", "已接码", "已反代", "已封禁", "需二验", "登录刷新", "失败"];
 const sessionPlans = ["free", "plus", "k12", "team", "pro"];
 const checkoutPreferencesStorageKey = "sunnyregister.checkout.preferences.v1";
