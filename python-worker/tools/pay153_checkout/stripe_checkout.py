@@ -231,8 +231,45 @@ def _paypal_setup_diagnostic(payload: dict) -> dict:
     return summary
 
 
-def build_http(proxy: Optional[str]):
-    """curl_cffi Session（Firefox 144 TLS 指纹），跟随支付代理。"""
+def _proxy_relay_module():
+    """惰性导入 sunny_core.proxy_relay；引擎目录可被独立加载时返回 None。"""
+    try:
+        import sys
+        from pathlib import Path
+
+        worker_root = str(Path(__file__).resolve().parents[2])
+        if worker_root not in sys.path:
+            sys.path.insert(0, worker_root)
+        from sunny_core import proxy_relay
+    except Exception:
+        return None
+    return proxy_relay
+
+
+def proxy_relay_options(relay: Optional[str] = None) -> dict:
+    """本机中继（pre-proxy）的 curl_cffi 选项；不可用时返回空字典。"""
+    module = _proxy_relay_module()
+    if module is None:
+        return {}
+    return module.relay_curl_options(module.resolve_relay_url() if relay is None else relay)
+
+
+def apply_proxy_relay(http, relay: Optional[str] = None) -> str:
+    """给会话注入本机中继，返回实际生效的中继地址（空串表示直连）。"""
+    module = _proxy_relay_module()
+    if module is None:
+        return ""
+    return module.apply_relay(http, relay)
+
+
+def build_http(proxy: Optional[str], relay: Optional[str] = None):
+    """curl_cffi Session（Firefox 144 TLS 指纹），跟随支付代理。
+
+    完整链路为 ``本机中继(pre-proxy) -> 支付/住宅代理 -> 目标``：住宅代理网关
+    往往无法从本机直连，需要先接入本机中继（如 FlClash 的 7890）转发。中继
+    地址由 ``SUNNY_PROXY_RELAY`` 决定（默认 socks5h://127.0.0.1:7890），设为
+    ``off`` 即恢复直连。
+    """
     from curl_cffi.requests import Session as CffiSession
 
     http = CffiSession(impersonate="firefox144")
@@ -245,6 +282,7 @@ def build_http(proxy: Optional[str]):
             http.proxies = {"http": proxy, "https": proxy}
         except Exception:
             pass
+        apply_proxy_relay(http, relay)
     return http
 
 

@@ -470,6 +470,9 @@ class ProxySentinel(BaseSentinel):
             if self.proxy:
                 kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
             self._session = requests.AsyncSession(**kwargs)
+            if self.proxy:
+                # sentinel 请求必须与建单走同一条链路：中继 -> 住宅代理 -> 目标。
+                sc.apply_proxy_relay(self._session)
         return self._session
 
 
@@ -3310,6 +3313,7 @@ def fetch_gcash_public_qr(authorization_url: str, proxy: str = "", log=lambda _m
             proxies={"http": proxy, "https": proxy} if proxy else None,
             timeout=30,
             impersonate="chrome",
+            curl_options=sc.proxy_relay_options() if proxy else None,
         )
         payload = response.json() if response.text else {}
         if not isinstance(payload, dict) or int(payload.get("resultStatus") or 0) != 1000:

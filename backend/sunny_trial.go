@@ -164,6 +164,14 @@ func sunnyCommerceHTTPClientWithMeter(meter *sunnyTrafficMeter, proxyURLs ...str
 		if proxyText != "" {
 			if proxy, parseErr := url.Parse(proxyText); parseErr == nil && proxy.Scheme != "" && proxy.Host != "" {
 				transport.Proxy = http.ProxyURL(proxy)
+				// 住宅代理网关无法从本机直连时，改走本机中继：中继 -> 住宅代理 -> 目标。
+				// 中继不可用时保留直连单代理行为。
+				if relay := defaultSunnyProxyRelayURL(); relay != "" {
+					if dial, dialErr := sunnyProxyChainDialContext(relay, proxyText); dialErr == nil {
+						transport.Proxy = nil
+						transport.DialContext = dial
+					}
+				}
 			}
 		}
 	}

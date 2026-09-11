@@ -11,6 +11,7 @@ from curl_cffi import requests as curl_requests
 
 from .browser_traffic import ProxyTrafficMeter, use_traffic_meter
 from .ca_bundle import ca_bundle_path
+from .proxy_relay import apply_relay, looks_like_relay_transport_error, relay_override
 
 try:
     from tools.pay153_checkout.paypal_routing import session_checkout_kind
@@ -91,7 +92,7 @@ def _request_with_retry(request: Any) -> Any:
     raise last_error
 
 
-def _session(proxy_url: str) -> Any:
+def _session(proxy_url: str, relay: Any = None) -> Any:
     # verify 必须指向 ASCII 路径的 CA bundle：本项目目录名含中文，
     # curl_cffi 默认的 certifi 路径经 libcurl（ANSI 代码页）解析时必然
     # 报 CURLE_SSL_CACERT_BADFILE（curl 77），所有 HTTPS 探测直接失败。
@@ -102,6 +103,8 @@ def _session(proxy_url: str) -> Any:
         pass
     if proxy_url:
         session.proxies = {"http": proxy_url, "https": proxy_url}
+        # 住宅代理网关无法直连时先接本机中继：client -> 中继 -> 住宅代理 -> 目标。
+        apply_relay(session, relay)
     return session
 
 
@@ -265,25 +268,39 @@ def probe_payment_methods(
         "checkout": {"kind": "", "payment_methods": [], "http": 0, "error": ""},
         "traffic": {"requests": 0, "total_bytes": 0},
     }
+
+    def _attempt() -> dict[str, Any]:
+        return _task_style_checkout_probe(
+            token,
+            billing_country,
+            billing_currency,
+            selected_proxy,
+            use_trial_promotion,
+        )
+
     try:
         with use_traffic_meter(meter):
-            result["checkout"] = _task_style_checkout_probe(
-                token,
-                billing_country,
-                billing_currency,
-                selected_proxy,
-                use_trial_promotion,
-            )
+            result["checkout"] = _attempt()
     except Exception as exc:
         message = f"{type(exc).__name__}: {str(exc)[:240]}"
-        # 从错误信息中提取真实 HTTP 状态码（400/401/403/408/429/5xx 等），
-        # 避免把 400/429 等非 401/403 的失败映射成 http=0，导致后端判定为
-        # “网络类失败”而对已限流账号反复换代理重试、延长冷却时间。
-        status = 0
-        if http_match := re.search(r"HTTP\s+(\d{3})", message):
-            status = int(http_match.group(1))
-        result["checkout"]["http"] = status
-        result["checkout"]["error"] = message
+        if looks_like_relay_transport_error(message):
+            # 中继没起来（FlClash 未运行等）时退化为直连重试一次：该失败发生在
+            # 本地代理链路，请求没有到过 OpenAI，不产生额外风控信号。
+            try:
+                with use_traffic_meter(meter), relay_override(""):
+                    result["checkout"] = _attempt()
+                message = ""
+            except Exception as retry_exc:
+                message = f"{type(retry_exc).__name__}: {str(retry_exc)[:240]}"
+        if message:
+            # 从错误信息中提取真实 HTTP 状态码（400/401/403/408/429/5xx 等），
+            # 避免把 400/429 等非 401/403 的失败映射成 http=0，导致后端判定为
+            # “网络类失败”而对已限流账号反复换代理重试、延长冷却时间。
+            status = 0
+            if http_match := re.search(r"HTTP\s+(\d{3})", message):
+                status = int(http_match.group(1))
+            result["checkout"]["http"] = status
+            result["checkout"]["error"] = message
     result["traffic"] = meter.snapshot()
     return result
 
