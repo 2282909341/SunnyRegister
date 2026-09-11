@@ -23,6 +23,78 @@ const sunnyPaymentProbeTaskType = "sunny_account_payment_probe"
 // 少量代理即可覆盖偶发故障，探测期间全程无反馈的问题也随之消失。
 const sunnyPaymentProbeMaxAttempts = 3
 
+// 风控熔断阈值。OpenAI 对支付探测返回 HTTP 400 unusual activity / HTTP 429
+// checkout_creation_rate_limited 时，说明当前出口或账号已被风控标记。实测
+// （2026-09-01 全库探测）对 9 个不同账号跨段抽样全部返回 429，限流与账号
+// 无关而是出口级普遍限流；此时继续遍历剩余账号只会继续抬高账号风险评分
+// 并延长冷却窗口，因此累计命中达到阈值后立即中止整个任务，把剩余账号
+// 留给冷却窗口之后的下一轮探测。0 表示关闭熔断。
+const sunnyPaymentProbeRiskBreakerLimit = 3
+
+const sunnyPaymentProbeRiskBreakerKey = "payment_probe_risk_breaker"
+
+// 代理健康数据陈旧阈值。代理列表里的 last_check_ok 可能长期没有刷新
+// （例如健康检查任务停跑），任务会拿着已经失效的代理反复探测。超过该
+// 时长仍未复检的代理会在任务开始时触发告警事件，提示先做一次代理健康
+// 检查，避免整批探测白跑并污染探测结果。
+const sunnyPaymentProbeProxyStaleHours = 12
+
+// sunnyPaymentProbeRiskMarkers 是 OpenAI 侧风控/限流的错误特征。命中即认为
+// 该次探测消耗了账号风险额度，需要计入熔断计数。
+var sunnyPaymentProbeRiskMarkers = []string{
+	"unusual activity",
+	"检测到异常活动",
+	"账户风控标记",
+	"checkout_creation_rate_limited",
+	"rate_limited",
+}
+
+func sunnyPaymentProbeRiskMessage(message string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(message))
+	if lowered == "" {
+		return false
+	}
+	for _, marker := range sunnyPaymentProbeRiskMarkers {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// sunnyPaymentProbeProxyFailure 判断一次探测是否属于「请求根本没到达 OpenAI」
+// 的代理/网络类失败：这类失败不消耗账号风控额度，但说明出口代理已经不可用，
+// 需要立刻回写代理健康状态。任务取消属于控制流而不是代理故障，必须排除，
+// 否则熔断中止任务时会把整批可用代理误标成失效。
+func sunnyPaymentProbeProxyFailure(probed sunnyPaymentProbeResponse, ctxErr error) bool {
+	if probed.HTTP != 0 || ctxErr != nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(probed.Error))
+	if message == "" || strings.Contains(message, "cancel") {
+		return false
+	}
+	return true
+}
+
+// sunnyMomoProbeStatus 依据一次 VN Checkout 探测结果推导 MoMo 与 0 元优惠的
+// 兼容状态；第二个返回值为 false 表示本次结果不足以给出确定结论，调用方
+// 应保持 unknown 不写库。实测结论（2026-09-01 全库 VN 探测）：MoMo 只在 VN
+// 全价 Checkout 下发布，带 0 元优惠建单时服务端会把 MoMo 剥离成 card/link，
+// 两者无法并存。因此「探到 MoMo」必然是全价，「未探到 MoMo 且未请求优惠」
+// 必然是两者都不支持。而请求了优惠却没探到 MoMo 时，无法区分「不满足优惠
+// 资格」与「优惠剥离了 MoMo」，此时不写库以免污染既有结论。
+func sunnyMomoProbeStatus(countryDetail map[string]any, useTrialPromotion bool) (string, bool) {
+	methods := normalizeSunnyPaymentMethods(stringSlice(countryDetail["methods"]))
+	if containsString(methods, "momo") {
+		return "momo_only", true
+	}
+	if useTrialPromotion {
+		return "", false
+	}
+	return "unsupported", true
+}
+
 type sunnyPaymentPromotionContextKey struct{}
 
 type sunnyPaymentProbeCandidate struct {
@@ -41,18 +113,22 @@ type sunnyPaymentCountryProbe struct {
 	Attempts     int
 	HTTP         int
 	InvalidToken bool
+	Risk         bool
+	ProxyFailed  bool
 	Error        string
 	TrafficBytes int64
 }
 
 type sunnyPaymentAccountProbe struct {
-	Candidate    sunnyPaymentProbeCandidate
-	Methods      []string
-	Countries    map[string]any
-	Errors       []string
-	Succeeded    int
-	InvalidToken bool
-	TrafficBytes int64
+	Candidate      sunnyPaymentProbeCandidate
+	Methods        []string
+	Countries      map[string]any
+	Errors         []string
+	Succeeded      int
+	InvalidToken   bool
+	Risk           bool
+	FailedProxyIDs []uint
+	TrafficBytes   int64
 }
 
 type sunnyPaymentProbeResponse struct {
@@ -246,6 +322,59 @@ func (s *Server) sunnyPaymentCountryConcurrency() int {
 	return s.sunnyConfiguredConcurrency("payment_country_concurrency", "SUNNY_PAYMENT_PROBE_COUNTRY_CONCURRENCY", 8)
 }
 
+// sunnyPaymentProbeRiskBreaker 返回风控熔断阈值；0 表示关闭熔断。
+func (s *Server) sunnyPaymentProbeRiskBreaker() int {
+	s.maintenanceMu.RLock()
+	raw, configured := s.maintenance[sunnyPaymentProbeRiskBreakerKey]
+	s.maintenanceMu.RUnlock()
+	if configured {
+		return max(0, min(intValue(raw, sunnyPaymentProbeRiskBreakerLimit), 100))
+	}
+	if fromEnv := strings.TrimSpace(os.Getenv("SUNNY_PAYMENT_PROBE_RISK_BREAKER")); fromEnv != "" {
+		return max(0, min(intValue(fromEnv, sunnyPaymentProbeRiskBreakerLimit), 100))
+	}
+	return sunnyPaymentProbeRiskBreakerLimit
+}
+
+// markSunnyPaymentProbeProxyUnhealthy 把探测期间确认不可达的代理立刻回写为
+// 失效。代理列表的 last_check_ok 可能长期未刷新（陈旧 true），不回写会让
+// 后续每一轮探测继续拿已失效的代理建单。
+func (s *Server) markSunnyPaymentProbeProxyUnhealthy(proxyID uint, message string) {
+	if s.db == nil || proxyID == 0 {
+		return
+	}
+	detail := strings.TrimSpace(message)
+	if len(detail) > 500 {
+		detail = detail[:500]
+	}
+	s.db.Model(&SunnyProxy{}).Where("id = ?", proxyID).Updates(map[string]any{
+		"last_check_ok":   false,
+		"last_error":      detail,
+		"last_checked_at": time.Now(),
+	})
+}
+
+// sunnyPaymentProbeStaleProxyCountries 返回没有任何「近期复检且通过」代理的
+// 国家列表。这些国家的探测大概率会直接失败，任务开始时先告警避免整批白跑。
+func sunnyPaymentProbeStaleProxyCountries(groups map[string][]SunnyProxy) []string {
+	now := time.Now()
+	stale := make([]string, 0, len(groups))
+	for country, proxies := range groups {
+		fresh := false
+		for _, proxy := range proxies {
+			if proxy.LastCheckedAt != nil && proxy.LastCheckOK && now.Sub(*proxy.LastCheckedAt) <= time.Duration(sunnyPaymentProbeProxyStaleHours)*time.Hour {
+				fresh = true
+				break
+			}
+		}
+		if !fresh {
+			stale = append(stale, country)
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
 func (s *Server) sunnyPaymentProbeCandidates(ids []uint) ([]sunnyPaymentProbeCandidate, error) {
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("请选择需要探测支付方式的账户")
@@ -423,6 +552,8 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 		cancel()
 		result.TrafficBytes += meter.totalBytes() + probed.TrafficBytes
 		result.ProxyID, result.HTTP, result.InvalidToken, result.Error = proxy.ID, probed.HTTP, probed.InvalidToken, probed.Error
+		result.Risk = probed.HTTP == http.StatusTooManyRequests || sunnyPaymentProbeRiskMessage(probed.Error)
+		result.ProxyFailed = sunnyPaymentProbeProxyFailure(probed, ctx.Err())
 		if probed.InvalidToken {
 			return result
 		}
@@ -475,6 +606,13 @@ func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate 
 			allMethods = append(allMethods, probe.Methods...)
 		}
 		result.InvalidToken = result.InvalidToken || probe.InvalidToken
+		result.Risk = result.Risk || probe.Risk
+		if probe.ProxyFailed && probe.ProxyID != 0 {
+			result.FailedProxyIDs = append(result.FailedProxyIDs, probe.ProxyID)
+		}
+		if probe.Risk {
+			detail["risk"] = true
+		}
 		result.Countries[probe.Country] = detail
 	}
 	sort.Strings(result.Errors)
@@ -556,17 +694,26 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			"scope": "global", "progress_type": "payment_probe", "current": 0, "total": len(candidates),
 			"countries": selectedCountries, "use_trial_promotion": useTrialPromotion,
 		})
+	if stale := sunnyPaymentProbeStaleProxyCountries(groups); len(stale) > 0 {
+		s.appendTaskEvent(task.ID,
+			fmt.Sprintf("代理健康数据陈旧告警：%s 的支付探测代理超过 %d 小时未复检，或最近一次复检未通过。请先执行一次代理健康检查再探测，否则这些国家的探测会直接失败。",
+				strings.Join(stale, ", "), sunnyPaymentProbeProxyStaleHours),
+			"log", "warning", map[string]any{"countries": stale, "stale_hours": sunnyPaymentProbeProxyStaleHours})
+	}
 	skipped := map[uint]bool{}
 	for _, id := range uintSlice(payload["skip_session_ids"]) {
 		skipped[id] = true
 	}
 	for index := range candidates {
-		if skipped[candidates[index].SessionID] {
+		if skipped[candidates[index].SessionID] && candidates[index].SkipReason == "" {
 			candidates[index].SkipReason = "已有支付方式探测任务正在执行，已跳过"
 		}
 	}
 	result := map[string]any{"requested": len(candidates), "detected": 0, "partial": 0, "skipped": 0, "failed": 0, "items": []any{}, "use_trial_promotion": useTrialPromotion}
 	items := make([]any, 0, len(candidates))
+	riskBreaker := s.sunnyPaymentProbeRiskBreaker()
+	riskHits := 0
+	riskBreakerOpen := false
 	probeCtx := context.WithValue(ctx, sunnyPaymentPromotionContextKey{}, useTrialPromotion)
 	outcomes := streamSunnyWorkerPoolContext(probeCtx, candidates, s.sunnyPaymentProbeConcurrency(), func(candidate sunnyPaymentProbeCandidate) sunnyPaymentAccountProbe {
 		return s.probeSunnyPaymentAccountContext(probeCtx, candidate, groups, func(country string, current, total int) {
@@ -584,6 +731,9 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		now := time.Now()
 		item := map[string]any{"session_id": outcome.Candidate.SessionID, "email": outcome.Candidate.Email, "payment_methods": outcome.Methods, "countries": outcome.Countries, "proxy_traffic_bytes": outcome.TrafficBytes}
 		s.recordSunnyProxyTraffic(outcome.Candidate.Email, outcome.TrafficBytes)
+		for _, proxyID := range outcome.FailedProxyIDs {
+			s.markSunnyPaymentProbeProxyUnhealthy(proxyID, fallback(strings.Join(outcome.Errors, "; "), "支付探测代理不可达"))
+		}
 		if outcome.Candidate.SkipReason == "" && outcome.Candidate.Error == "" {
 			countries := make([]string, 0, len(outcome.Countries))
 			for country := range outcome.Countries {
@@ -621,7 +771,13 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			if queryErr := s.db.Where("email = ?", outcome.Candidate.Email).First(&account).Error; queryErr == nil {
 				mergedCountries, mergedMethods := mergeSunnyPaymentProbeResults(account.PaymentProbeResultsJSON, outcome.Countries)
 				item["payment_methods"] = mergedMethods
-				s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(map[string]any{"payment_methods_json": dumpJSON(mergedMethods), "payment_probe_methods_json": dumpJSON(mergedMethods), "payment_probe_results_json": dumpJSON(mergedCountries), "payment_probe_error": message})
+				failed := map[string]any{"payment_methods_json": dumpJSON(mergedMethods), "payment_probe_methods_json": dumpJSON(mergedMethods), "payment_probe_results_json": dumpJSON(mergedCountries), "payment_probe_error": message}
+				if vnDetail, ok := outcome.Countries["VN"].(map[string]any); ok {
+					if vnError := text(vnDetail["error"]); vnError != "" {
+						failed["momo_promo_error"] = vnError
+					}
+				}
+				s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(failed)
 			}
 		default:
 			message := strings.Join(outcome.Errors, "; ")
@@ -641,6 +797,23 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			mergedCountries, mergedMethods := mergeSunnyPaymentProbeResults(account.PaymentProbeResultsJSON, outcome.Countries)
 			item["payment_methods"] = mergedMethods
 			updates := map[string]any{"payment_methods_json": dumpJSON(mergedMethods), "payment_probe_methods_json": dumpJSON(mergedMethods), "payment_probe_results_json": dumpJSON(mergedCountries), "payment_probe_error": message, "payment_probed_at": now}
+			// VN 探测结果同时回写 MoMo 专用字段，让「MoMo 可用性」不再只能
+			// 依赖外部脚本落库；只写入有确定结论的场景，不确定时保持原值。
+			if vnDetail, ok := outcome.Countries["VN"].(map[string]any); ok {
+				if vnError := text(vnDetail["error"]); vnError != "" {
+					updates["momo_promo_error"] = vnError
+				} else if momoStatus, certain := sunnyMomoProbeStatus(vnDetail, useTrialPromotion); certain {
+					updates["momo_promo_status"] = momoStatus
+					updates["momo_promo_error"] = ""
+					updates["momo_promo_probed_at"] = now
+					updates["momo_promo_result_json"] = dumpJSON(map[string]any{
+						"status": momoStatus, "country": "VN", "currency": "VND",
+						"methods": normalizeSunnyPaymentMethods(stringSlice(vnDetail["methods"])),
+						"http":    intValue(vnDetail["http"], 0), "proxy_id": intValue(vnDetail["proxy_id"], 0),
+						"attempts": intValue(vnDetail["attempts"], 0), "use_trial_promotion": useTrialPromotion,
+					})
+				}
+			}
 			updateErr := queryErr
 			if updateErr == nil {
 				updateErr = s.db.Model(&SunnyAccount{}).Where("id = ?", account.ID).Updates(updates).Error
@@ -655,6 +828,21 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 			errorMessage := fallback(strings.Join(outcome.Errors, "; "), "Access Token 无效或已过期")
 			s.db.Model(&SunnySession{}).Where("id = ?", outcome.Candidate.SessionID).Updates(map[string]any{"access_token_status": "invalid", "access_token_error": errorMessage, "access_token_checked_at": now})
 		}
+		// 风控熔断：本轮探测被 OpenAI 标记为异常活动或建单限流后，剩余账号
+		// 大概率会被同样标记。此时主动停下，避免把整批账号的风险评分打高。
+		if outcome.Risk {
+			riskHits++
+			riskDetail := strings.Join(outcome.Errors, "; ")
+			s.appendAccountTaskEvent(task.ID, outcome.Candidate.Email, "payment", "payment_probe.risk",
+				fmt.Sprintf("[%s] [支付探测] OpenAI 风控命中（累计 %d/%d）：%s", outcome.Candidate.Email, riskHits, riskBreaker, fallback(riskDetail, "unusual activity / rate limited")),
+				"warning", map[string]any{"session_id": outcome.Candidate.SessionID, "risk_hits": riskHits, "limit": riskBreaker, "error": riskDetail})
+			if riskBreaker > 0 && riskHits >= riskBreaker {
+				riskBreakerOpen = true
+				s.appendTaskEvent(task.ID,
+					fmt.Sprintf("支付探测风控熔断：累计 %d 个账户被 OpenAI 风控标记（unusual activity / checkout_creation_rate_limited），已中止剩余账户探测。继续探测只会抬高账户风险评分并延长冷却窗口，请等待冷却窗口后重试，并优先更换已被标记的出口代理。", riskHits),
+					"log", "warning", map[string]any{"risk_hits": riskHits, "limit": riskBreaker, "processed": task.ProgressCurrent, "total": task.ProgressTotal})
+			}
+		}
 		items = append(items, item)
 		task.ProgressCurrent++
 		s.persistTaskProgress(task, intValue(result["detected"], 0)+intValue(result["partial"], 0), intValue(result["failed"], 0), now)
@@ -667,8 +855,17 @@ func (s *Server) executeSunnyPaymentProbeTask(task *Task, payload map[string]any
 		s.appendAccountTaskEvent(task.ID, outcome.Candidate.Email, "payment", "payment_probe.completed", progressMessage, progressLevel, map[string]any{
 			"session_id": outcome.Candidate.SessionID, "status": status, "current": task.ProgressCurrent, "total": task.ProgressTotal, "methods": outcome.Methods,
 		})
+		if riskBreakerOpen {
+			cancel()
+			break
+		}
 	}
 	result["items"] = items
+	result["risk_hits"] = riskHits
+	if riskBreakerOpen {
+		result["risk_breaker"] = true
+		result["skipped"] = result["skipped"].(int) + max(0, len(candidates)-task.ProgressCurrent)
+	}
 	if s.finishCancelledTask(task, result, "用户已停止支付探测任务") {
 		return
 	}

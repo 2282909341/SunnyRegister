@@ -399,6 +399,339 @@ func TestSunnyPaymentProbeTasksSkipOverlappingSessions(t *testing.T) {
 	}
 }
 
+func TestSunnyPaymentProbeRiskMarkerClassification(t *testing.T) {
+	risky := []string{
+		`IN: RuntimeError: OpenAI Checkout HTTP 400: {"detail":"Our systems have detected unusual activity. Please try again later."}`,
+		"VN: OpenAI Checkout HTTP 400 检测到异常活动 (账户风控标记)",
+		"VN: OpenAI Checkout HTTP 429 checkout_creation_rate_limited (等待冷却后重试)",
+	}
+	for _, message := range risky {
+		if !sunnyPaymentProbeRiskMessage(message) {
+			t.Fatalf("risk message not detected: %s", message)
+		}
+	}
+	benign := []string{
+		"",
+		"VN: ProxyError: Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.",
+		`IN: RuntimeError: OpenAI Checkout HTTP 500: {"detail":"Internal Server Error"}`,
+		"VN: RuntimeError: OpenAI Checkout HTTP 401: token_revoked",
+	}
+	for _, message := range benign {
+		if sunnyPaymentProbeRiskMessage(message) {
+			t.Fatalf("benign message misclassified as risk: %s", message)
+		}
+	}
+}
+
+func TestSunnyPaymentProbeProxyFailureExcludesCancellation(t *testing.T) {
+	proxyError := sunnyPaymentProbeResponse{Error: "ProxyError: Failed to perform, curl: (56) Proxy CONNECT aborted."}
+	if !sunnyPaymentProbeProxyFailure(proxyError, nil) {
+		t.Fatal("proxy connection failure should be treated as a proxy failure")
+	}
+	if sunnyPaymentProbeProxyFailure(proxyError, context.Canceled) {
+		t.Fatal("a cancelled task must not be treated as a proxy failure")
+	}
+	if sunnyPaymentProbeProxyFailure(sunnyPaymentProbeResponse{Error: "context canceled"}, nil) {
+		t.Fatal("cancellation error must not be treated as a proxy failure")
+	}
+	if sunnyPaymentProbeProxyFailure(sunnyPaymentProbeResponse{HTTP: http.StatusBadRequest, Error: `HTTP 400 unusual activity`}, nil) {
+		t.Fatal("an HTTP response from OpenAI must not be treated as a proxy failure")
+	}
+}
+
+func TestSunnyPaymentProbeCountryProbeFlagsRisk(t *testing.T) {
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		return sunnyPaymentProbeResponse{HTTP: http.StatusTooManyRequests, Error: "OpenAI Checkout HTTP 429 checkout_creation_rate_limited"}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	result := (&Server{}).probeSunnyPaymentCountry(
+		sunnyPaymentProbeCandidate{AccessToken: "token"},
+		"VN",
+		[]SunnyProxy{{ID: 7, Address: "http://vn.example:8080"}},
+	)
+	if !result.Risk || result.HTTP != http.StatusTooManyRequests {
+		t.Fatalf("risk probe result=%#v", result)
+	}
+}
+
+func TestSunnyPaymentProbeCountryProbeFlagsUnreachableProxy(t *testing.T) {
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		return sunnyPaymentProbeResponse{Error: "ProxyError: Failed to perform, curl: (56) Proxy CONNECT aborted."}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	result := (&Server{}).probeSunnyPaymentCountry(
+		sunnyPaymentProbeCandidate{AccessToken: "token"},
+		"VN",
+		[]SunnyProxy{{ID: 9, Address: "http://vn.example:8080"}},
+	)
+	// 代理不可达时请求根本没到达 OpenAI，不构成风控消耗，只需要回写代理健康状态。
+	if !result.ProxyFailed || result.Risk || result.ProxyID != 9 {
+		t.Fatalf("unreachable proxy result=%#v", result)
+	}
+}
+
+func TestSunnyPaymentProbeStaleProxyCountriesDetectsOutdatedHealth(t *testing.T) {
+	now := time.Now()
+	recent := now.Add(-time.Hour)
+	outdated := now.Add(-48 * time.Hour)
+	groups := map[string][]SunnyProxy{
+		"JP": {{ID: 1, Country: "JP", LastCheckOK: true, LastCheckedAt: &recent}},
+		"VN": {{ID: 2, Country: "VN", LastCheckOK: true, LastCheckedAt: &outdated}},
+		"IN": {{ID: 3, Country: "IN", LastCheckOK: false, LastCheckedAt: &recent}},
+		"PH": {{ID: 4, Country: "PH"}},
+	}
+	if got := strings.Join(sunnyPaymentProbeStaleProxyCountries(groups), ","); got != "IN,PH,VN" {
+		t.Fatalf("stale countries=%q", got)
+	}
+}
+
+func TestSunnyPaymentProbeMomoStatusDecision(t *testing.T) {
+	cases := []struct {
+		methods []any
+		promo   bool
+		want    string
+		certain bool
+	}{
+		{[]any{"card", "link", "momo"}, false, "momo_only", true},
+		{[]any{"card", "link", "momo"}, true, "momo_only", true},
+		{[]any{"card", "link"}, false, "unsupported", true},
+		// 带 0 元优惠建单时服务端会剥离 MoMo，无法区分「不满足优惠资格」与
+		// 「优惠剥离了 MoMo」，必须保持 unknown 而不是写入错误结论。
+		{[]any{"card", "link"}, true, "", false},
+	}
+	for _, item := range cases {
+		got, certain := sunnyMomoProbeStatus(map[string]any{"methods": item.methods}, item.promo)
+		if got != item.want || certain != item.certain {
+			t.Fatalf("methods=%v promo=%v status=%q certain=%v, want %q/%v", item.methods, item.promo, got, certain, item.want, item.certain)
+		}
+	}
+}
+
+func TestSunnyPaymentProbeRiskBreakerStopsRemainingAccounts(t *testing.T) {
+	t.Setenv("SUNNY_PAYMENT_PROBE_CONCURRENCY", "1")
+	s := newSunnySessionTestServer(t)
+	sessions := []SunnySession{}
+	var first SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	sessions = append(sessions, first)
+	for index := 1; index < 5; index++ {
+		mailbox := SunnyMailbox{Email: fmt.Sprintf("risk-%d@example.com", index), Status: "已注册", AccountType: "free", Enabled: true}
+		if err := s.db.Create(&mailbox).Error; err != nil {
+			t.Fatal(err)
+		}
+		account := SunnyAccount{MailboxID: mailbox.ID, Email: mailbox.Email, Status: "registered", AccountType: "free", AccessToken: fmt.Sprintf("risk-token-%d", index)}
+		if err := s.db.Create(&account).Error; err != nil {
+			t.Fatal(err)
+		}
+		session := SunnySession{AccountID: account.ID, Email: account.Email, AccessToken: account.AccessToken}
+		if err := s.db.Create(&session).Error; err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, session)
+	}
+	now := time.Now()
+	if err := s.db.Create(&SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true, LastCheckedAt: &now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbePaymentMethods
+	probes := 0
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		probes++
+		return sunnyPaymentProbeResponse{
+			HTTP:  http.StatusBadRequest,
+			Error: `OpenAI Checkout HTTP 400: {"detail":"Our systems have detected unusual activity. Please try again later."}`,
+		}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	ids := make([]uint, 0, len(sessions))
+	for _, session := range sessions {
+		ids = append(ids, session.ID)
+	}
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": ids, "countries": []string{"VN"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+
+	var stored Task
+	if err := s.db.First(&stored, "id = ?", task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	result := jsonMap(stored.ResultJSON)
+	if !boolValue(result["risk_breaker"], false) {
+		t.Fatalf("risk breaker did not open: %s", stored.ResultJSON)
+	}
+	if stored.ProgressCurrent != sunnyPaymentProbeRiskBreakerLimit {
+		t.Fatalf("processed=%d, want %d", stored.ProgressCurrent, sunnyPaymentProbeRiskBreakerLimit)
+	}
+	if probes >= len(sessions) {
+		t.Fatalf("risk breaker kept probing every account: probes=%d accounts=%d", probes, len(sessions))
+	}
+	if got := intValue(result["skipped"], 0); got != len(sessions)-sunnyPaymentProbeRiskBreakerLimit {
+		t.Fatalf("skipped=%d, want %d (result=%s)", got, len(sessions)-sunnyPaymentProbeRiskBreakerLimit, stored.ResultJSON)
+	}
+	var events []TaskEvent
+	if err := s.db.Where("task_id = ? AND action = ?", task.ID, "payment_probe.risk").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != sunnyPaymentProbeRiskBreakerLimit {
+		t.Fatalf("risk events=%d, want %d", len(events), sunnyPaymentProbeRiskBreakerLimit)
+	}
+	// 熔断中止时在途探测会以 context canceled 结束，不能被误记为代理故障。
+	var storedProxy SunnyProxy
+	if err := s.db.Where("country = ?", "VN").First(&storedProxy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !storedProxy.LastCheckOK || storedProxy.LastError != "" {
+		t.Fatalf("risk breaker must not mark a reachable proxy unhealthy: %#v", storedProxy)
+	}
+}
+
+func TestSunnyPaymentProbeMarksUnreachableProxyUnhealthy(t *testing.T) {
+	t.Setenv("SUNNY_PAYMENT_PROBE_CONCURRENCY", "1")
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	proxy := SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true, LastCheckedAt: &now}
+	if err := s.db.Create(&proxy).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		return sunnyPaymentProbeResponse{Error: "ProxyError: Failed to perform, curl: (56) Proxy CONNECT aborted."}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []string{"VN"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+
+	var stored SunnyProxy
+	if err := s.db.First(&stored, "id = ?", proxy.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.LastCheckOK || !strings.Contains(stored.LastError, "Proxy CONNECT aborted") || stored.LastCheckedAt == nil {
+		t.Fatalf("unreachable proxy was not marked unhealthy: %#v", stored)
+	}
+}
+
+func TestSunnyPaymentProbePersistsMomoStatusForVietnam(t *testing.T) {
+	t.Setenv("SUNNY_PAYMENT_PROBE_CONCURRENCY", "1")
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.db.Create(&SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true, LastCheckedAt: &now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		return sunnyPaymentProbeResponse{Methods: []string{"card", "link", "momo"}, HTTP: http.StatusOK}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []string{"VN"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+
+	var account SunnyAccount
+	if err := s.db.Where("email = ?", session.Email).First(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if account.MomoPromoStatus != "momo_only" || account.MomoPromoProbedAt == nil || account.MomoPromoError != "" {
+		t.Fatalf("momo status not persisted: %#v", account)
+	}
+	if !strings.Contains(account.MomoPromoResultJSON, `"momo"`) || !strings.Contains(account.MomoPromoResultJSON, `"VND"`) {
+		t.Fatalf("momo evidence not persisted: %s", account.MomoPromoResultJSON)
+	}
+}
+
+func TestSunnyPaymentProbeKeepsMomoUnknownWhenPromotionHidesMethods(t *testing.T) {
+	t.Setenv("SUNNY_PAYMENT_PROBE_CONCURRENCY", "1")
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.db.Create(&SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true, LastCheckedAt: &now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		return sunnyPaymentProbeResponse{Methods: []string{"card", "link"}, HTTP: http.StatusOK}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []string{"VN"}, "use_trial_promotion": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+
+	var account SunnyAccount
+	if err := s.db.Where("email = ?", session.Email).First(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if account.MomoPromoStatus != "unknown" || account.MomoPromoProbedAt != nil {
+		t.Fatalf("ambiguous promotion probe must not overwrite momo status: %#v", account)
+	}
+}
+
+func TestSunnyPaymentProbeEmitsStaleProxyWarning(t *testing.T) {
+	t.Setenv("SUNNY_PAYMENT_PROBE_CONCURRENCY", "1")
+	s := newSunnySessionTestServer(t)
+	var session SunnySession
+	if err := s.db.Where("email = ?", "session@example.com").First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	outdated := time.Now().Add(-72 * time.Hour)
+	if err := s.db.Create(&SunnyProxy{Address: "http://vn.example:8080", Country: "VN", PurposeTags: sunnyProxyPurposePayment, Status: "enabled", Enabled: true, LastCheckOK: true, LastCheckedAt: &outdated}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := sunnyProbePaymentMethods
+	sunnyProbePaymentMethods = func(_ context.Context, _, _, _, _ string) sunnyPaymentProbeResponse {
+		return sunnyPaymentProbeResponse{Methods: []string{"momo"}, HTTP: http.StatusOK}
+	}
+	t.Cleanup(func() { sunnyProbePaymentMethods = previousProbe })
+
+	task, err := s.createSunnyPaymentProbeTask(map[string]any{"session_ids": []uint{session.ID}, "countries": []string{"VN"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.executeSunnyPaymentProbeTask(&task, jsonMap(task.PayloadJSON))
+
+	var events []TaskEvent
+	if err := s.db.Where("task_id = ? AND level = ?", task.ID, "warning").Find(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if strings.Contains(event.Message, "代理健康数据陈旧告警") && strings.Contains(event.Message, "VN") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stale proxy warning missing: %#v", events)
+	}
+}
+
 func TestSunnyPaymentProbeTaskUsesSelectedCountries(t *testing.T) {
 	s := newSunnySessionTestServer(t)
 	var session SunnySession
