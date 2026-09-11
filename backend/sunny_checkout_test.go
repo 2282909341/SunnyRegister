@@ -77,6 +77,27 @@ func TestNormalizeGoPayRequestUsesIndonesiaCheckout(t *testing.T) {
 	}
 }
 
+func TestNormalizeTeamCheckoutRequestSupportsEgypt(t *testing.T) {
+	normalized, checkout, promotion, err := normalizeCheckoutRequest(sunnyCheckoutRequest{
+		Plan:             "team",
+		LinkType:         "hosted",
+		Country:          "EG",
+		Currency:         "EGP",
+		UsePromo:         true,
+		CheckoutProxies:  "http://eg-checkout.example:8080",
+		PromotionProxies: "http://eg-promotion.example:8080",
+	})
+	if err != nil {
+		t.Fatalf("normalize Egypt Team request: %v", err)
+	}
+	if normalized.Country != "EG" || normalized.Currency != "EGP" {
+		t.Fatalf("unexpected Egypt billing pair: %s/%s", normalized.Country, normalized.Currency)
+	}
+	if len(checkout) != 1 || len(promotion) != 1 {
+		t.Fatalf("checkout=%#v promotion=%#v", checkout, promotion)
+	}
+}
+
 func TestNormalizeGCashRequestUsesSinglePHCheckoutPool(t *testing.T) {
 	in := sunnyCheckoutRequest{
 		Plan:             "plus",
