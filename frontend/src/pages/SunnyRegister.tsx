@@ -1,4 +1,4 @@
-import { Fragment, useDeferredValue, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Fragment, useCallback, useDeferredValue, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { Dispatch, PointerEvent as ReactPointerEvent, ReactNode, SetStateAction } from "react";
 import { useLocation } from "react-router-dom";
 import { Activity, ArrowLeft, ArrowRight, ChevronDown, ChevronUp, CircleHelp, CreditCard, Crown, Download, Eye, EyeOff, Filter, Globe2, Inbox, KeyRound, ListChecks, Loader2, Pencil, Plus, RefreshCw, RotateCw, Save, ScrollText, Search, Settings2, Sparkles, Trash2, Upload, X } from "lucide-react";
@@ -3797,16 +3797,42 @@ function PaymentMethodsBadge({ row }: { row: AnyObj }) {
 type PaymentProbeFilterValue = "" | "unknown";
 function PaymentMethodFilterHeader({t,value,status,options,onChange,onStatusChange}:{t:AnyObj;value:string[];status:PaymentProbeFilterValue;options:string[];onChange:(value:string[])=>void;onStatusChange:(value:PaymentProbeFilterValue)=>void}) {
   const [open,setOpen]=useState(false);
+  const [menuPosition,setMenuPosition]=useState<{left:number;top:number;maxHeight:number}|null>(null);
   const rootRef=useRef<HTMLDivElement|null>(null);
+  const menuRef=useRef<HTMLDivElement|null>(null);
   const methods=Array.from(new Set([...options,...value].map((item)=>String(item).trim().toLowerCase()).filter(Boolean))).sort((left,right)=>paymentMethodLabel(left).localeCompare(paymentMethodLabel(right)));
   const active=status==="unknown"||value.length>0;
   const label=status==="unknown"?t.paymentMethodFilterUnknown:value.length===0?t.paymentMethodFilterAll:value.length===1?paymentMethodLabel(value[0]):`${value.length}`;
+  const updateMenuPosition=useCallback(()=>{
+    const rect=rootRef.current?.getBoundingClientRect();
+    if(!rect) return;
+    const width=Math.min(270,Math.max(200,window.innerWidth-24));
+    const desiredHeight=Math.min(260,82+Math.ceil((methods.length+1)/2)*37);
+    const spaceBelow=window.innerHeight-rect.bottom-12;
+    const spaceAbove=rect.top-12;
+    const openUp=spaceBelow<desiredHeight&&spaceAbove>spaceBelow;
+    const maxHeight=Math.max(120,Math.min(desiredHeight,(openUp?spaceAbove:spaceBelow)-8));
+    const left=Math.max(12,Math.min(window.innerWidth-width-12,rect.left+rect.width/2-width/2));
+    const top=openUp?Math.max(12,rect.top-maxHeight-8):rect.bottom+8;
+    setMenuPosition({left,top,maxHeight});
+  },[methods.length]);
   useEffect(()=>{
     if (!open) return;
-    const close=(event:MouseEvent)=>{if(rootRef.current&&!rootRef.current.contains(event.target as Node))setOpen(false)};
+    updateMenuPosition();
+    const reposition=()=>updateMenuPosition();
+    const close=(event:MouseEvent)=>{
+      const target=event.target as Node;
+      if(!rootRef.current?.contains(target)&&!menuRef.current?.contains(target))setOpen(false);
+    };
+    window.addEventListener("scroll",reposition,true);
+    window.addEventListener("resize",reposition);
     document.addEventListener("mousedown",close);
-    return ()=>document.removeEventListener("mousedown",close);
-  },[open]);
+    return ()=>{
+      window.removeEventListener("scroll",reposition,true);
+      window.removeEventListener("resize",reposition);
+      document.removeEventListener("mousedown",close);
+    };
+  },[open,updateMenuPosition]);
   const toggle=(method:string)=>{
     onStatusChange("");
     onChange(value.includes(method)?value.filter((item)=>item!==method):[...value,method].sort());
@@ -3818,8 +3844,8 @@ function PaymentMethodFilterHeader({t,value,status,options,onChange,onStatusChan
   const clear=()=>{onChange([]);onStatusChange("")};
   return <div ref={rootRef} className="sr-trial-country-header sr-payment-method-header">
     <span>{t.paymentMethods}</span>
-    <button type="button" className={cn("sr-login-secret-filter",active&&"active")} onClick={()=>setOpen((current)=>!current)} title={t.paymentMethodFilterTitle} aria-expanded={open} aria-label={`${t.paymentMethodFilterTitle}: ${label}`}><Filter className="h-3.5 w-3.5"/><span>{label}</span></button>
-    {open&&<div className="sr-trial-country-filter-menu sr-payment-method-filter-menu">
+    <button type="button" className={cn("sr-login-secret-filter",active&&"active")} onClick={()=>{updateMenuPosition();setOpen((current)=>!current)}} title={t.paymentMethodFilterTitle} aria-expanded={open} aria-label={`${t.paymentMethodFilterTitle}: ${label}`}><Filter className="h-3.5 w-3.5"/><span>{label}</span></button>
+    {open&&menuPosition&&<PagePortal><div ref={menuRef} className="sr-trial-country-filter-menu sr-payment-method-filter-menu sr-payment-method-filter-menu-portal" style={{left:menuPosition.left,top:menuPosition.top,maxHeight:menuPosition.maxHeight}}>
       <div className="sr-trial-country-filter-head"><strong>{t.paymentMethodFilterTitle}</strong>{active&&<button type="button" onClick={clear}>{t.paymentMethodFilterClear}</button>}</div>
       <div className="sr-trial-country-filter-options sr-payment-method-filter-options">
         <label className={cn("sr-trial-country-filter-option sr-payment-method-filter-option",status==="unknown"&&"is-selected")}><input type="checkbox" checked={status==="unknown"} onChange={toggleUnknown}/><span>{t.paymentMethodFilterUnknown}</span></label>
@@ -3827,7 +3853,7 @@ function PaymentMethodFilterHeader({t,value,status,options,onChange,onStatusChan
         {!methods.length&&<span className="sr-trial-country-filter-empty">{t.paymentMethodFilterEmpty}</span>}
       </div>
       <p>{t.paymentMethodFilterAndHint}</p>
-    </div>}
+    </div></PagePortal>}
   </div>;
 }
 void CheckoutBadge;
