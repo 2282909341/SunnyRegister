@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,20 +80,79 @@ func sunnyPaymentProbeProxyFailure(probed sunnyPaymentProbeResponse, ctxErr erro
 
 // sunnyMomoProbeStatus 依据一次 VN Checkout 探测结果推导 MoMo 与 0 元优惠的
 // 兼容状态；第二个返回值为 false 表示本次结果不足以给出确定结论，调用方
-// 应保持 unknown 不写库。实测结论（2026-09-01 全库 VN 探测）：MoMo 只在 VN
-// 全价 Checkout 下发布，带 0 元优惠建单时服务端会把 MoMo 剥离成 card/link，
-// 两者无法并存。因此「探到 MoMo」必然是全价，「未探到 MoMo 且未请求优惠」
-// 必然是两者都不支持。而请求了优惠却没探到 MoMo 时，无法区分「不满足优惠
-// 资格」与「优惠剥离了 MoMo」，此时不写库以免污染既有结论。
+// 应保持 unknown 不写库。
+//
+// 判定需要两个独立信号：本次建单是否请求了 0 元优惠（useTrialPromotion），
+// 以及 Checkout 的实际金额（amount/currency）。只有金额落在 MoMo 优惠区间
+// （VND 且 0 <= amount <= sunnyMomoPromoAmountLimitVND）才认定优惠已生效。
+//
+// 注意：早期结论「带 0 元优惠建单时服务端必然把 MoMo 剥离成 card/link」已被
+// 2026-09-02 的落库数据证伪 —— 存在 amount=0、currency=VND 且
+// payment_methods 同时包含 momo 的 Checkout（momo_discounted=true），两者
+// 可以并存。因此不能再凭「探到 momo」直接判为 momo_only。金额未知时保持
+// unknown，避免把「优惠未生效的全价单」误写成 0 元双资格。
 func sunnyMomoProbeStatus(countryDetail map[string]any, useTrialPromotion bool) (string, bool) {
 	methods := normalizeSunnyPaymentMethods(stringSlice(countryDetail["methods"]))
-	if containsString(methods, "momo") {
-		return "momo_only", true
+	hasMomo := containsString(methods, "momo")
+	if !useTrialPromotion {
+		if hasMomo {
+			return "momo_only", true
+		}
+		return "unsupported", true
 	}
-	if useTrialPromotion {
+	amount, known := sunnyProbeAmountMinor(countryDetail["amount"])
+	if !known {
 		return "", false
 	}
-	return "unsupported", true
+	promoApplied := sunnyIsMomoPromoAmount(amount, text(countryDetail["currency"]))
+	switch {
+	case hasMomo && promoApplied:
+		return "supported", true
+	case hasMomo:
+		return "momo_only", true
+	case promoApplied:
+		return "promo_only", true
+	default:
+		return "unsupported", true
+	}
+}
+
+// sunnyMomoPromoAmountLimitVND 与 Python 侧
+// tools/pay153_checkout/provider_checkout.py 的 MOMO_PROMO_AMOUNT_LIMIT_VND 对齐。
+const sunnyMomoPromoAmountLimitVND = 50
+
+// sunnyProbeAmountMinor 读取探测结果里的 Checkout 金额（最小货币单位）。
+// 第二个返回值为 false 表示本次探测没有回传金额，调用方必须按未知处理。
+func sunnyProbeAmountMinor(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case float64:
+		return int64(typed), true
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil {
+			return parsed, true
+		}
+		if parsed, err := typed.Float64(); err == nil {
+			return int64(parsed), true
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+// sunnyIsMomoPromoAmount 与 Python 侧 is_momo_promo_amount 保持一致：
+// 仅 VND 且金额落在 [0, 50] 视为 MoMo 0 元优惠已生效。
+func sunnyIsMomoPromoAmount(amount int64, currency string) bool {
+	if !strings.EqualFold(strings.TrimSpace(currency), "VND") {
+		return false
+	}
+	return amount >= 0 && amount <= sunnyMomoPromoAmountLimitVND
 }
 
 type sunnyPaymentPromotionContextKey struct{}
@@ -112,6 +172,9 @@ type sunnyPaymentCountryProbe struct {
 	ProxyID      uint
 	Attempts     int
 	HTTP         int
+	Amount       int64
+	AmountKnown  bool
+	Currency     string
 	InvalidToken bool
 	Risk         bool
 	ProxyFailed  bool
@@ -135,6 +198,9 @@ type sunnyPaymentProbeResponse struct {
 	Kind         string
 	Methods      []string
 	HTTP         int
+	Amount       int64
+	AmountKnown  bool
+	Currency     string
 	InvalidToken bool
 	Error        string
 	TrafficBytes int64
@@ -294,6 +360,8 @@ func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country
 			PaymentMethods []string `json:"payment_methods"`
 			HTTP           int      `json:"http"`
 			Error          string   `json:"error"`
+			Amount         *int64   `json:"amount"`
+			Currency       string   `json:"currency"`
 		} `json:"checkout"`
 		Traffic struct {
 			TotalBytes int64 `json:"total_bytes"`
@@ -305,6 +373,11 @@ func probeSunnyPaymentMethodsViaWorker(ctx context.Context, accessToken, country
 	result.Kind = normalizeSunnyCheckoutKind(payload.Checkout.Kind)
 	result.Methods = normalizeSunnyPaymentMethods(payload.Checkout.PaymentMethods)
 	result.HTTP = payload.Checkout.HTTP
+	result.Currency = strings.TrimSpace(payload.Checkout.Currency)
+	if payload.Checkout.Amount != nil {
+		result.Amount = *payload.Checkout.Amount
+		result.AmountKnown = true
+	}
 	result.InvalidToken = payload.Checkout.HTTP == http.StatusUnauthorized
 	result.Error = strings.TrimSpace(payload.Checkout.Error)
 	result.TrafficBytes = payload.Traffic.TotalBytes
@@ -552,6 +625,7 @@ func (s *Server) probeSunnyPaymentCountryContext(ctx context.Context, candidate 
 		cancel()
 		result.TrafficBytes += meter.totalBytes() + probed.TrafficBytes
 		result.ProxyID, result.HTTP, result.InvalidToken, result.Error = proxy.ID, probed.HTTP, probed.InvalidToken, probed.Error
+		result.Amount, result.AmountKnown, result.Currency = probed.Amount, probed.AmountKnown, probed.Currency
 		result.Risk = probed.HTTP == http.StatusTooManyRequests || sunnyPaymentProbeRiskMessage(probed.Error)
 		result.ProxyFailed = sunnyPaymentProbeProxyFailure(probed, ctx.Err())
 		if probed.InvalidToken {
@@ -598,6 +672,11 @@ func (s *Server) probeSunnyPaymentAccountContext(ctx context.Context, candidate 
 	for probe := range probes {
 		result.TrafficBytes += probe.TrafficBytes
 		detail := map[string]any{"methods": probe.Methods, "proxy_id": probe.ProxyID, "attempts": probe.Attempts, "http": probe.HTTP}
+		if probe.AmountKnown {
+			detail["amount"] = probe.Amount
+			detail["currency"] = probe.Currency
+			detail["promo_applied"] = sunnyIsMomoPromoAmount(probe.Amount, probe.Currency)
+		}
 		if probe.Error != "" {
 			detail["error"] = probe.Error
 			result.Errors = append(result.Errors, probe.Country+": "+probe.Error)

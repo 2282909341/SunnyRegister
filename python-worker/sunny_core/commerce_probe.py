@@ -142,6 +142,12 @@ def _task_style_checkout_probe(
         create_checkout,
         fetch_custom_checkout_session_with_retry,
     )
+    try:
+        from app import custom_checkout_amount_minor
+    except ImportError:
+        # 探测替身或旧版 worker 可能不带该辅助函数；金额缺失时后端按未知处理，
+        # 不会写出不确定的 0 元 + MoMo 结论。
+        custom_checkout_amount_minor = None
 
     options = _checkout_probe_options(country, currency, use_trial_promotion)
     payload = checkout_payload(options, {})
@@ -162,6 +168,9 @@ def _task_style_checkout_probe(
     session_id = str(data.get("checkout_session_id") or "")
     try:
         methods = _payment_methods(data)
+        # 回传 Checkout 实际金额：后端据此判定 0 元优惠是否真的生效，
+        # 避免把「优惠没生效的全价单」误判成 0 元 + MoMo 双资格。
+        amount_minor: int | None = None
         if session_id.startswith("oaics_"):
             processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
             custom_data = fetch_custom_checkout_session_with_retry(
@@ -174,6 +183,11 @@ def _task_style_checkout_probe(
                 delay_seconds=0.5,
             )
             methods = _merge_payment_methods(methods, _payment_methods(custom_data))
+            if custom_checkout_amount_minor is not None:
+                try:
+                    amount_minor = custom_checkout_amount_minor(custom_data)
+                except Exception:
+                    amount_minor = None
         elif session_id.startswith(("cs_live_", "cs_test_")):
             import stripe_checkout as stripe
 
@@ -197,6 +211,8 @@ def _task_style_checkout_probe(
         return {
             "kind": session_checkout_kind(session_id),
             "payment_methods": methods,
+            "amount": amount_minor,
+            "currency": str(currency or "").strip().upper(),
             "http": 200,
             "error": "",
         }

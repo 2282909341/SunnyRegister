@@ -491,23 +491,51 @@ func TestSunnyPaymentProbeStaleProxyCountriesDetectsOutdatedHealth(t *testing.T)
 
 func TestSunnyPaymentProbeMomoStatusDecision(t *testing.T) {
 	cases := []struct {
-		methods []any
+		name    string
+		detail  map[string]any
 		promo   bool
 		want    string
 		certain bool
 	}{
-		{[]any{"card", "link", "momo"}, false, "momo_only", true},
-		{[]any{"card", "link", "momo"}, true, "momo_only", true},
-		{[]any{"card", "link"}, false, "unsupported", true},
-		// 带 0 元优惠建单时服务端会剥离 MoMo，无法区分「不满足优惠资格」与
-		// 「优惠剥离了 MoMo」，必须保持 unknown 而不是写入错误结论。
-		{[]any{"card", "link"}, true, "", false},
+		{"全价单发布 momo", map[string]any{"methods": []any{"card", "link", "momo"}, "amount": int64(522500), "currency": "VND"}, false, "momo_only", true},
+		{"全价单无 momo", map[string]any{"methods": []any{"card", "link"}, "amount": int64(522500), "currency": "VND"}, false, "unsupported", true},
+		// 0 元优惠真的生效：VND 且 0 <= amount <= 50。此时仍发布 momo 就是
+		// 0 元 + MoMo 双资格（2026-09-02 落库数据已证实两者可以并存）。
+		{"0元优惠生效且发布 momo", map[string]any{"methods": []any{"card", "link", "momo"}, "amount": int64(0), "currency": "VND"}, true, "supported", true},
+		{"0元优惠生效但无 momo", map[string]any{"methods": []any{"card", "link"}, "amount": int64(0), "currency": "VND"}, true, "promo_only", true},
+		{"优惠区间上界 50 VND 且发布 momo", map[string]any{"methods": []any{"momo"}, "amount": int64(50), "currency": "VND"}, true, "supported", true},
+		{"超过优惠区间按全价处理", map[string]any{"methods": []any{"momo"}, "amount": int64(51), "currency": "VND"}, true, "momo_only", true},
+		{"非 VND 不认 0 元", map[string]any{"methods": []any{"momo"}, "amount": int64(0), "currency": "USD"}, true, "momo_only", true},
+		{"金额为字符串也能识别", map[string]any{"methods": []any{"momo"}, "amount": "0", "currency": "VND"}, true, "supported", true},
+		// 金额未知时必须保持 unknown，避免把「优惠未生效的全价单」误写成双资格。
+		{"请求优惠但金额未知 有momo", map[string]any{"methods": []any{"card", "link", "momo"}}, true, "", false},
+		{"请求优惠但金额未知 无momo", map[string]any{"methods": []any{"card", "link"}}, true, "", false},
 	}
 	for _, item := range cases {
-		got, certain := sunnyMomoProbeStatus(map[string]any{"methods": item.methods}, item.promo)
+		got, certain := sunnyMomoProbeStatus(item.detail, item.promo)
 		if got != item.want || certain != item.certain {
-			t.Fatalf("methods=%v promo=%v status=%q certain=%v, want %q/%v", item.methods, item.promo, got, certain, item.want, item.certain)
+			t.Fatalf("%s: status=%q certain=%v, want %q/%v", item.name, got, certain, item.want, item.certain)
 		}
+	}
+}
+
+func TestSunnyPaymentProbeAmountParsing(t *testing.T) {
+	if amount, ok := sunnyProbeAmountMinor(int64(0)); !ok || amount != 0 {
+		t.Fatalf("int64(0) -> %d/%v", amount, ok)
+	}
+	if amount, ok := sunnyProbeAmountMinor(float64(522500)); !ok || amount != 522500 {
+		t.Fatalf("float64 -> %d/%v", amount, ok)
+	}
+	if amount, ok := sunnyProbeAmountMinor("50"); !ok || amount != 50 {
+		t.Fatalf("string -> %d/%v", amount, ok)
+	}
+	for _, value := range []any{nil, "", "abc", true, map[string]any{}} {
+		if _, ok := sunnyProbeAmountMinor(value); ok {
+			t.Fatalf("value %#v should be treated as unknown amount", value)
+		}
+	}
+	if sunnyIsMomoPromoAmount(0, "vnd") != true || sunnyIsMomoPromoAmount(51, "VND") != false {
+		t.Fatal("unexpected momo promo amount boundary")
 	}
 }
 
