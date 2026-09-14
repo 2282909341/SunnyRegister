@@ -222,9 +222,18 @@ func TestAuditCompletedScheduledHealthTaskRecordsFullLifecycle(t *testing.T) {
 func TestAuditRetentionCleanup(t *testing.T) {
 	s := newAuditTestServer(t)
 	now := time.Now()
-	s.db.Create(&AuditSetting{ID: 1, RetentionDays: 7, CleanupHour: now.Hour(), Enabled: true})
+	if err := s.db.Create(&AuditSetting{ID: 1, RetentionDays: 7, CleanupHour: now.Hour(), Enabled: true}).Error; err != nil {
+		t.Fatalf("create audit setting: %v", err)
+	}
 	s.db.Create(&AuditLog{OccurredAt: now.AddDate(0, 0, -8), Summary: "old"})
 	s.db.Create(&AuditLog{OccurredAt: now.AddDate(0, 0, -1), Summary: "recent"})
+	// CleanupHour 带 gorm:"default:3" 标签，Create 会丢弃零值字段：用例在
+	// 00:00~00:59 运行时 now.Hour()==0，落库值被默认值 3 覆盖，
+	// auditRetentionCleanup 因整点不匹配直接返回，断言必然失败。这里用 map
+	// 更新显式写回，并在调用前重新取整点，避免零值覆盖与跨整点漂移。
+	if err := s.db.Model(&AuditSetting{}).Where("id = ?", 1).Updates(map[string]any{"cleanup_hour": time.Now().Hour()}).Error; err != nil {
+		t.Fatalf("pin audit cleanup hour: %v", err)
+	}
 	s.auditRetentionCleanup()
 	var oldCount, recentCount int64
 	s.db.Model(&AuditLog{}).Where("summary = ?", "old").Count(&oldCount)
