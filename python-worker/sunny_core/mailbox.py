@@ -226,7 +226,15 @@ def account_from_row(row: dict[str, Any]) -> MailAccount:
         if access_key.startswith(("http://", "https://")):
             parsed = urlparse(access_key)
             query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc or not query.get("token") or str(query.get("email") or "").strip().lower() != email.lower():
+            # 换绑完成后取件 URL 指向新的换绑邮箱，而登录邮箱仍是原邮箱；
+            # 只要取件邮箱与当前邮箱或 rebind_email 任一一致即为合法凭据。
+            pickup_email = str(query.get("email") or "").strip().lower()
+            accepted_emails = {
+                value
+                for value in (email.lower(), str(row.get("rebind_email") or "").strip().lower())
+                if value
+            }
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or not query.get("token") or pickup_email not in accepted_emails:
                 raise ValueError("Invalid domain mailbox pickup URL")
         else:
             try:

@@ -52,6 +52,33 @@ def test_account_from_row_supports_domain_credentials():
     assert json.loads(account.access_key)["auth_token"] == "token-1"
 
 
+def test_account_from_row_accepts_pickup_url_of_rebound_mailbox():
+    """换绑完成后取件 URL 指向新邮箱，登录邮箱仍是原邮箱，此时不得判为非法凭据。"""
+    rebound = "https://sunny.example/api/sunny/domain-mail/pickup?email=new%40wenrou.asia&token=dmsk_two"
+    account = account_from_row({
+        "email": "old@icloud.com",
+        "rebind_email": "new@wenrou.asia",
+        "mailbox_type": "domain",
+        "mailbox_channel": "domain_api",
+        "access_key": rebound,
+    })
+
+    assert account.email == "old@icloud.com"
+    assert account.mailbox_type == "domain"
+    assert account.access_key == rebound
+
+
+def test_account_from_row_rejects_pickup_url_of_unrelated_mailbox():
+    with pytest.raises(ValueError, match="Invalid domain mailbox pickup URL"):
+        account_from_row({
+            "email": "old@icloud.com",
+            "rebind_email": "new@wenrou.asia",
+            "mailbox_type": "domain",
+            "mailbox_channel": "domain_api",
+            "access_key": "https://sunny.example/api/sunny/domain-mail/pickup?email=other%40wenrou.asia&token=dmsk_three",
+        })
+
+
 def test_domain_reader_uses_latest_message_and_extracts_code(monkeypatch):
     reader = DomainMailReader(
         account_from_row({"email": "user@example.com", "mailbox_type": "domain", "access_key": _credential()}),
