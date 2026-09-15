@@ -6781,6 +6781,13 @@ class JobStore:
                             "MOMO_REDIRECT_MISSING: MoMo OAICS confirmation_token/confirm 未返回有效的 "
                             "pm-redirects.stripe.com 授权链接"
                         )
+                    # MoMo 授权长链本身就是可扫码入口：把它编码成二维码一并返回，
+                    # 否则提链成功表与账户表的「支付二维码」列只会显示「上游未提供
+                    # 免登录二维码」。本机缺少 qrcode 依赖时该函数仅回传 qr_data，
+                    # 由前端内置的 qrcode 渲染器自行出图。
+                    momo_qr_images = generate_payment_qr_images(
+                        redirect_url, lambda message: self.log(job_id, message)
+                    )
                     result.update({
                         "link_type": "momo",
                         "checkout_provider": "open_ai_oaics",
@@ -6796,6 +6803,7 @@ class JobStore:
                         "long_url": redirect_url,
                         "short_link": redirect_url,
                         "checkout_url": redirect_url,
+                        **momo_qr_images,
                         "verification_url": str(confirmed.get("confirm_return_url") or ""),
                         "checkout_amount": custom_amount,
                         "amount_currency": custom_currency,
@@ -6803,7 +6811,11 @@ class JobStore:
                         "promo_applied": momo_discounted if promo_requested else None,
                         "expires_at": int(time.time()) + 600,
                     })
-                    self.log(job_id, "OAICS 原生 MoMo 已返回 Stripe 授权长链；打开该页面后由上游展示支付二维码")
+                    self.log(
+                        job_id,
+                        "OAICS 原生 MoMo 已返回 Stripe 授权长链；已生成可扫码二维码，"
+                        "也可打开该页面由上游展示支付二维码",
+                    )
                     self.update(job_id, percent=100, text="MoMo Stripe 授权链接生成完成", status="done", result=result)
                     return
                 if provider != "hosted":

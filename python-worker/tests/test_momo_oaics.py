@@ -1025,3 +1025,22 @@ def test_momo_intent_poll_reads_redirect_after_approval() -> None:
 
     assert checkout_app.momo_authorization_url(result) == redirect
     assert [call[0] for call in http.calls] == ["GET", "GET"]
+
+
+def test_momo_authorization_url_is_encodable_as_payment_qr() -> None:
+    """提链结果必须带上二维码载荷，否则界面「支付二维码」列只会显示上游未提供。
+
+    走真实提取器产出授权链接，再走提链结果块使用的同一个二维码生成器，
+    确保二维码编码的就是该 MoMo 授权长链本身（前端 QRThumb 直接渲染 qr_data）。
+    """
+    redirect = (
+        "https://pm-redirects.stripe.com/authorize/"
+        "acct_1HOrSwC6h1nxGoI3/sa_nonce_VGPQkzs4yh1dvMHZgEIGLQzVZJ4eF3E"
+    )
+    confirmed = {"next_action": {"redirect_to_url": {"url": redirect}}}
+
+    extracted = checkout_app.momo_authorization_url(confirmed)
+
+    assert extracted == redirect
+    qr_images = provider_checkout_module.generate_payment_qr_images(extracted)
+    assert qr_images["qr_data"] == redirect
