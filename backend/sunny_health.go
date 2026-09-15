@@ -610,6 +610,7 @@ func (s *Server) sunnyAccountHealthScheduleLoop() {
 	for {
 		s.sunnyMaybeScheduleHealthCheck()
 		s.sunnyMaybeScheduleAccessTokenCheck()
+		s.sunnyMaybeRunPlusWatches()
 		select {
 		case <-s.stop:
 			return

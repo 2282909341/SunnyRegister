@@ -94,7 +94,7 @@ func databaseModels() []any {
 		&PlatformCapabilityOverride{}, &TaskLog{}, &Task{}, &TaskEvent{}, &Proxy{}, &SmsPoolBlacklist{},
 		&SunnyMailboxGroup{}, &SunnyMailbox{}, &SunnyPhone{}, &SunnyProxy{}, &SunnyMailboxLease{}, &SunnyAccount{},
 		&SunnySession{}, &SunnyKVConfig{}, &SunnySMSProviderOption{}, &SunnySMSProviderNumber{},
-		&AuditLog{}, &AuditSetting{}, &AuditExportJob{},
+		&AuditLog{}, &AuditSetting{}, &AuditExportJob{}, &SunnyPlusWatch{},
 	}
 }
 

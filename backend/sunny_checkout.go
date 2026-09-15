@@ -789,6 +789,9 @@ func (s *Server) runSunnyCheckoutAttempt(ctx context.Context, task *Task, payloa
 		}
 		s.db.Model(&SunnyAccount{}).Where("id = ? OR email = ?", accountID, email).Update("checkout_result_json", dumpJSON(stored))
 	}
+	// 用户拿链接去付款后，订阅生效发生在 Stripe/MoMo 侧，服务端没有回调；
+	// 这里登记一次观察，由调度循环在 24 小时内轮询确认 Plus 是否到账。
+	s.enqueueSunnyPlusWatch(task.ID, payload, item, email, accountID)
 	return item
 }
 
