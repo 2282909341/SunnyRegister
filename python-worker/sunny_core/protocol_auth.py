@@ -18,6 +18,7 @@ from .browser_traffic import ProxyTrafficMeter, _response_body_bytes, suspend_ht
 from .ca_bundle import ca_bundle_path
 from .mailbox import MailAccount, create_mailbox_reader
 from .proxy import normalize_proxy_url
+from .proxy_relay import apply_relay
 from .sentinel import (
     SENTINEL_FRAME_URL,
     SENTINEL_REQ_URL,
@@ -311,6 +312,10 @@ class ProtocolRegistrationFlow:
             timeout=30,
             verify=ca_bundle_path(),
         )
+        if self.proxy_url:
+            # 住宅代理网关无法直连时先接本机中继：client -> 中继 -> 住宅代理 -> 目标。
+            # 中继未配置或不是 SOCKS 时 apply_relay 返回空串且不改动会话。
+            apply_relay(session)
         session.headers.update(
             {
                 "user-agent": USER_AGENT,

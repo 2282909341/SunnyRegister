@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
+from curl_cffi import CurlOpt
 
 from sunny_core.browser_traffic import ProxyTrafficMeter
 from sunny_core.mailbox import MailAccount
@@ -698,3 +699,48 @@ def test_protocol_at_refresh_rejects_email_otp_route() -> None:
             raise AssertionError("协议 AT 刷新应拒绝邮箱验证码路由")
 
     flow._verify_email.assert_not_called()
+
+
+def _clear_protocol_relay_env(monkeypatch) -> None:
+    for key in ("SUNNY_PROXY_RELAY", "SUNNY_PROBE_RELAY"):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_protocol_session_applies_local_relay_when_proxy_configured(monkeypatch) -> None:
+    """住宅代理无法直连时，协议会话必须先接本机中继（client -> 中继 -> 住宅代理）。"""
+    _clear_protocol_relay_env(monkeypatch)
+    flow = ProtocolRegistrationFlow(
+        MailAccount("user@outlook.com", "password", "client", "refresh", "raw"),
+        "http://user:pass@residential.example:10000",
+    )
+
+    session = flow._new_session()
+
+    assert session.curl_options[CurlOpt.PRE_PROXY] == "socks5h://127.0.0.1:7890"
+    assert session.proxies["https"] == "http://user:pass@residential.example:10000"
+
+
+def test_protocol_session_skips_relay_without_proxy(monkeypatch) -> None:
+    """没有配置住宅代理时不得挂中继，否则请求会经由中继直出而暴露本机出口。"""
+    monkeypatch.setenv("SUNNY_PROXY_RELAY", "socks5h://127.0.0.1:7890")
+    flow = ProtocolRegistrationFlow(
+        MailAccount("user@outlook.com", "password", "client", "refresh", "raw"),
+    )
+
+    session = flow._new_session()
+
+    assert CurlOpt.PRE_PROXY not in (session.curl_options or {})
+
+
+def test_protocol_session_honours_disabled_relay(monkeypatch) -> None:
+    """中继被显式关闭（空串）时保持直连住宅代理。"""
+    monkeypatch.setenv("SUNNY_PROXY_RELAY", "")
+    flow = ProtocolRegistrationFlow(
+        MailAccount("user@outlook.com", "password", "client", "refresh", "raw"),
+        "http://user:pass@residential.example:10000",
+    )
+
+    session = flow._new_session()
+
+    assert CurlOpt.PRE_PROXY not in (session.curl_options or {})
+    assert session.proxies["https"] == "http://user:pass@residential.example:10000"

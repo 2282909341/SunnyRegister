@@ -300,6 +300,23 @@ def account_from_row(row: dict[str, Any]) -> MailAccount:
             chatgpt_password=chatgpt_password,
             totp_secret=totp_secret,
         )
+    if mailbox_type == "mailcom" or str(row.get("mailbox_channel") or "").strip().lower() == "mailcom_code":
+        email = str(row.get("email") or "").strip()
+        access_key = str(row.get("access_key") or "").strip()
+        raw = str(row.get("raw") or "").strip()
+        if raw and (not email or not access_key):
+            parts = [part.strip() for part in raw.split("----", 1)]
+            email = email or (parts[0] if parts else "")
+            access_key = access_key or (parts[1] if len(parts) > 1 else "")
+        if not email or "@" not in email or not access_key:
+            raise ValueError("Invalid Mail.com mailbox row; expected email and code URL")
+        return MailAccount(
+            email=email, password="", client_id="", refresh_token="", raw=raw or f"{email}----{access_key}",
+            account_type=str(row.get("account_type") or "free"), openai_rt=str(row.get("openai_rt") or ""),
+            mailbox_type="mailcom", mailbox_channel="mailcom_code", access_key=access_key,
+            chatgpt_password=str(row.get("chat_gpt_password") or row.get("chatgpt_password") or ""),
+            totp_secret=str(row.get("totp_secret") or "").strip(),
+        )
     raw = row.get("raw") or "----".join([
         row.get("email", ""),
         row.get("password", ""),
