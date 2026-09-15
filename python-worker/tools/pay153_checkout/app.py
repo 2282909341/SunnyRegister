@@ -2654,6 +2654,13 @@ def confirm_oaics_momo_intent(
             "use_stripe_sdk": "true",
             "key": publishable_key,
             "_stripe_version": sc.STRIPE_VERSION_FULL,
+            # MoMo 是需要扣款协议的跳转钱包，Stripe 要求 confirm 时
+            # 必须携带 customer_acceptance，否则直接返回 HTTP 400
+            # parameter_missing "Missing required param: mandate_data."。
+            # 这里与 provider_checkout.py 的 SetupIntent 直连补交保持一致，
+            # 由 Stripe 依据本次请求上下文推断接受协议的时间/IP/UA。
+            "mandate_data[customer_acceptance][type]": "online",
+            "mandate_data[customer_acceptance][online][infer_from_client]": "true",
         },
         headers=sc._stripe_headers(),
         timeout=60,

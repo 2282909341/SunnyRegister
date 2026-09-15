@@ -951,6 +951,56 @@ def test_momo_intent_fallback_confirms_setup_intent_with_created_payment_method(
     assert "confirmation_token" not in request["data"]
 
 
+def test_momo_intent_fallback_sends_customer_acceptance_mandate() -> None:
+    """MoMo 是带扣款协议的跳转钱包，Stripe 要求 confirm 必须携带 mandate_data。
+
+    缺失时报 HTTP 400 parameter_missing "Missing required param: mandate_data."，
+    提链会在最后一步确认 Stripe Intent 时全轮失败。
+    """
+    redirect = (
+        "https://pm-redirects.stripe.com/authorize/"
+        "acct_1HOrSwC6h1nxGoI3/sa_nonce_VA3BRLWr6svCcb3IbJQljuUq2OZpfPW"
+    )
+    http = _RecordingHttp([
+        _FakeResponse({
+            "id": "seti_fixture",
+            "status": "requires_action",
+            "next_action": {"redirect_to_url": {"url": redirect}},
+        }),
+        _FakeResponse({
+            "id": "pi_fixture",
+            "status": "requires_action",
+            "next_action": {"redirect_to_url": {"url": redirect}},
+        }),
+    ])
+
+    checkout_app.confirm_oaics_momo_intent(
+        http,
+        "pk_live_fixture",
+        "pm_fixture",
+        {"setup_intent": {"client_secret": "seti_fixture_secret_value"}},
+        "oaics_fixture",
+        "openai_llc",
+    )
+    checkout_app.confirm_oaics_momo_intent(
+        http,
+        "pk_live_fixture",
+        "pm_fixture",
+        {"client_secret": "pi_fixture_secret_value"},
+        "oaics_fixture",
+        "openai_llc",
+    )
+
+    assert http.calls[0][1].endswith("/v1/setup_intents/seti_fixture/confirm")
+    assert http.calls[1][1].endswith("/v1/payment_intents/pi_fixture/confirm")
+    for _, _, request in http.calls:
+        assert request["data"]["mandate_data[customer_acceptance][type]"] == "online"
+        assert (
+            request["data"]["mandate_data[customer_acceptance][online][infer_from_client]"]
+            == "true"
+        )
+
+
 def test_momo_intent_poll_reads_redirect_after_approval() -> None:
     redirect = (
         "https://pm-redirects.stripe.com/authorize/"
